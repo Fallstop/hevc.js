@@ -335,6 +335,53 @@ static void interpolate_chroma(const Picture& refPic, int cIdx,
 // §8.5.3.3.4.2 — Default weighted sample prediction
 // ============================================================
 
+#ifdef HEVC_SIMD_INTERP
+// out[i] = Clip3(0, maxVal, (a[i] + add) >> sh). 8 int16 lanes/iter, computed in
+// int32 to match the scalar (arithmetic >> on a signed int; sra_epi32 is arithmetic
+// on native and wasm alike), then narrowed and clamped — bit-exact.
+static inline void simd_shift_clip(const int16_t* a, int add, int sh,
+                                   int n, int maxVal, int16_t* out) {
+    const __m128i vadd = _mm_set1_epi32(add);
+    const __m128i vsh = _mm_cvtsi32_si128(sh);
+    const __m128i vmax = _mm_set1_epi16(static_cast<int16_t>(maxVal));
+    const __m128i zero = _mm_setzero_si128();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m128i p = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i));
+        __m128i lo = _mm_sra_epi32(_mm_add_epi32(_mm_srai_epi32(_mm_unpacklo_epi16(p, p), 16), vadd), vsh);
+        __m128i hi = _mm_sra_epi32(_mm_add_epi32(_mm_srai_epi32(_mm_unpackhi_epi16(p, p), 16), vadd), vsh);
+        __m128i v = _mm_max_epi16(_mm_min_epi16(_mm_packs_epi32(lo, hi), vmax), zero);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + i), v);
+    }
+    for (; i < n; i++)
+        out[i] = static_cast<int16_t>(Clip3(0, maxVal, (a[i] + add) >> sh));
+}
+// out[i] = Clip3(0, maxVal, (a[i] + b[i] + add) >> sh). Bi-pred needs the int32
+// intermediate: two ~14-bit signed addends can exceed int16.
+static inline void simd_avg_clip(const int16_t* a, const int16_t* b, int add, int sh,
+                                 int n, int maxVal, int16_t* out) {
+    const __m128i vadd = _mm_set1_epi32(add);
+    const __m128i vsh = _mm_cvtsi32_si128(sh);
+    const __m128i vmax = _mm_set1_epi16(static_cast<int16_t>(maxVal));
+    const __m128i zero = _mm_setzero_si128();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m128i pa = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i));
+        __m128i pb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i));
+        __m128i alo = _mm_srai_epi32(_mm_unpacklo_epi16(pa, pa), 16);
+        __m128i ahi = _mm_srai_epi32(_mm_unpackhi_epi16(pa, pa), 16);
+        __m128i blo = _mm_srai_epi32(_mm_unpacklo_epi16(pb, pb), 16);
+        __m128i bhi = _mm_srai_epi32(_mm_unpackhi_epi16(pb, pb), 16);
+        __m128i lo = _mm_sra_epi32(_mm_add_epi32(_mm_add_epi32(alo, blo), vadd), vsh);
+        __m128i hi = _mm_sra_epi32(_mm_add_epi32(_mm_add_epi32(ahi, bhi), vadd), vsh);
+        __m128i v = _mm_max_epi16(_mm_min_epi16(_mm_packs_epi32(lo, hi), vmax), zero);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + i), v);
+    }
+    for (; i < n; i++)
+        out[i] = static_cast<int16_t>(Clip3(0, maxVal, (a[i] + b[i] + add) >> sh));
+}
+#endif  // HEVC_SIMD_INTERP
+
 static void weighted_pred_default(int16_t* predL0, int16_t* predL1,
                                    bool flagL0, bool flagL1,
                                    int nSamples, int bitDepth,
@@ -346,6 +393,11 @@ static void weighted_pred_default(int16_t* predL0, int16_t* predL1,
     int offset2 = 1 << (shift2 - 1);
     int maxVal = (1 << bitDepth) - 1;
 
+#ifdef HEVC_SIMD_INTERP
+    if (flagL0 && !flagL1)        simd_shift_clip(predL0, offset1, shift1, nSamples, maxVal, output);
+    else if (!flagL0 && flagL1)   simd_shift_clip(predL1, offset1, shift1, nSamples, maxVal, output);
+    else                          simd_avg_clip(predL0, predL1, offset2, shift2, nSamples, maxVal, output);
+#else
     if (flagL0 && !flagL1) {
         // §8.5.3.3.4.2 eq 8-262: uni-pred L0
         for (int i = 0; i < nSamples; i++)
@@ -360,6 +412,7 @@ static void weighted_pred_default(int16_t* predL0, int16_t* predL1,
             output[i] = static_cast<int16_t>(Clip3(0, maxVal,
                 (predL0[i] + predL1[i] + offset2) >> shift2));
     }
+#endif
 }
 
 // ============================================================
