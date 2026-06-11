@@ -114,6 +114,8 @@ public:
 private:
     // DPB storage
     std::vector<std::shared_ptr<Picture>> pictures_;
+    // Recycled pictures — avoids the per-frame multi-MB allocation + zero-fill
+    std::vector<std::shared_ptr<Picture>> picture_pool_;
     Picture* current_pic_ = nullptr;
 
     // POC state (§8.3.1) — "prevTid0Pic" values

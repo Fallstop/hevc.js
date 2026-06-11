@@ -366,15 +366,32 @@ void DPB::derive_colpic(const SliceHeader& sh) {
 
 Picture* DPB::alloc_picture(int width, int height, ChromaFormat fmt,
                              int bd_luma, int bd_chroma) {
-    // Remove pictures that are no longer referenced and not needed for output
-    pictures_.erase(
-        std::remove_if(pictures_.begin(), pictures_.end(),
-            [](const std::shared_ptr<Picture>& p) {
-                return !p->is_reference() && !p->needed_for_output;
-            }),
-        pictures_.end());
+    // Move pictures that are no longer referenced and not needed for output
+    // to the recycling pool (same lifetime as the previous erase-and-free,
+    // but the plane buffers get reused instead of reallocated + zero-filled).
+    for (auto it = pictures_.begin(); it != pictures_.end();) {
+        auto& p = *it;
+        if (!p->is_reference() && !p->needed_for_output) {
+            // Only pool exact-format matches; drop the rest
+            if (p->pic_width_in_luma == width && p->pic_height_in_luma == height &&
+                p->chroma_format == fmt && p->bit_depth_luma == bd_luma &&
+                p->bit_depth_chroma == bd_chroma) {
+                picture_pool_.push_back(std::move(p));
+            }
+            it = pictures_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 
-    auto pic = std::make_shared<Picture>();
+    std::shared_ptr<Picture> pic;
+    if (!picture_pool_.empty()) {
+        pic = std::move(picture_pool_.back());
+        picture_pool_.pop_back();
+        pic->reset_for_reuse();
+    } else {
+        pic = std::make_shared<Picture>();
+    }
     pic->allocate(width, height, fmt, bd_luma, bd_chroma);
     pictures_.push_back(pic);
     current_pic_ = pic.get();

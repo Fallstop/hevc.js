@@ -269,6 +269,10 @@ export class HEVCDecoder {
 function copyPlane(m: EmscriptenModule, ptr: number, width: number, height: number, stride: number): Uint16Array {
   const out = new Uint16Array(width * height);
   const base = ptr >> 1;
+  if (stride === width) {
+    out.set(m.HEAPU16.subarray(base, base + width * height));
+    return out;
+  }
   for (let y = 0; y < height; y++) {
     out.set(m.HEAPU16.subarray(base + y * stride, base + y * stride + width), y * width);
   }

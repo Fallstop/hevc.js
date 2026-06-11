@@ -58,6 +58,19 @@ struct Picture {
     // Allocate planes based on dimensions and chroma format
     void allocate(int width, int height, ChromaFormat fmt, int bd_luma, int bd_chroma);
 
+    // Reset per-picture state when recycling a pooled picture.
+    // Plane buffers are kept (the decoder rewrites every sample).
+    void reset_for_reuse() {
+        conf_win_left = conf_win_right = conf_win_top = conf_win_bottom = 0;
+        poc = 0;
+        cvs_id = 0;
+        used_for_short_term_ref = false;
+        used_for_long_term_ref = false;
+        needed_for_output = false;
+        ref_poc[0].clear();
+        ref_poc[1].clear();
+    }
+
     // Get sample at position (x, y) in plane c
     uint16_t& sample(int c, int x, int y) {
         return planes[c][y * stride[c] + x];

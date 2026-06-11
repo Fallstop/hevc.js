@@ -78,13 +78,19 @@ if(BUILD_WASM)
     else()
         target_compile_options(hevc-wasm PRIVATE -O3 -fexceptions -msimd128)
     endif()
+    # Runtime assertions (bounds checks, API misuse detection) only in Debug —
+    # they cost real decode throughput in Release
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        target_link_options(hevc-wasm PRIVATE "SHELL:-s ASSERTIONS=1")
+    else()
+        target_link_options(hevc-wasm PRIVATE "SHELL:-s ASSERTIONS=0")
+    endif()
     target_link_options(hevc-wasm PRIVATE
         "SHELL:-s WASM=1"
         "SHELL:-s ALLOW_MEMORY_GROWTH=1"
         "SHELL:-s MODULARIZE=1"
         "SHELL:-s EXPORT_NAME=HEVCDecoderModule"
         "SHELL:-s STACK_SIZE=4194304"
-        "SHELL:-s ASSERTIONS=1"
         "SHELL:-s NO_DISABLE_EXCEPTION_CATCHING=1"
         "SHELL:-s EXPORTED_FUNCTIONS=[_hevc_decoder_create,_hevc_decoder_destroy,_hevc_decoder_decode,_hevc_decoder_get_frame_count,_hevc_decoder_get_frame,_hevc_decoder_get_info,_hevc_decoder_feed,_hevc_decoder_drain,_hevc_decoder_get_drained_frame,_hevc_decoder_flush,_malloc,_free]"
         "SHELL:-s EXPORTED_RUNTIME_METHODS=[ccall,cwrap,getValue,HEAPU8,HEAPU16]"

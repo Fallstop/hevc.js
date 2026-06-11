@@ -92,20 +92,28 @@ export class H264Encoder {
     const cSize = cw * ch;
     const i420 = new Uint8Array(ySize + cSize * 2);
 
-    // Y plane
-    for (let i = 0; i < ySize; i++) {
-      const v = frame.y[i]! >> shift;
-      i420[i] = v > 255 ? 255 : v;
-    }
-    // U (Cb) plane
-    for (let i = 0; i < cSize; i++) {
-      const v = frame.cb[i]! >> shift;
-      i420[ySize + i] = v > 255 ? 255 : v;
-    }
-    // V (Cr) plane
-    for (let i = 0; i < cSize; i++) {
-      const v = frame.cr[i]! >> shift;
-      i420[ySize + cSize + i] = v > 255 ? 255 : v;
+    if (shift === 0) {
+      // 8-bit: decoder output is already clipped to [0,255] — bulk typed-array
+      // conversion (engines fast-path this) instead of per-sample clamping
+      i420.set(frame.y, 0);
+      i420.set(frame.cb, ySize);
+      i420.set(frame.cr, ySize + cSize);
+    } else {
+      // Y plane
+      for (let i = 0; i < ySize; i++) {
+        const v = frame.y[i]! >> shift;
+        i420[i] = v > 255 ? 255 : v;
+      }
+      // U (Cb) plane
+      for (let i = 0; i < cSize; i++) {
+        const v = frame.cb[i]! >> shift;
+        i420[ySize + i] = v > 255 ? 255 : v;
+      }
+      // V (Cr) plane
+      for (let i = 0; i < cSize; i++) {
+        const v = frame.cr[i]! >> shift;
+        i420[ySize + cSize + i] = v > 255 ? 255 : v;
+      }
     }
 
     const videoFrame = new VideoFrame(i420, {

@@ -11031,6 +11031,10 @@ var HevcDash = (() => {
   function copyPlane(m, ptr, width, height, stride) {
     const out = new Uint16Array(width * height);
     const base = ptr >> 1;
+    if (stride === width) {
+      out.set(m.HEAPU16.subarray(base, base + width * height));
+      return out;
+    }
     for (let y = 0; y < height; y++) {
       out.set(m.HEAPU16.subarray(base + y * stride, base + y * stride + width), y * width);
     }
@@ -11089,17 +11093,23 @@ var HevcDash = (() => {
       const ySize = w * h;
       const cSize = cw * ch;
       const i420 = new Uint8Array(ySize + cSize * 2);
-      for (let i = 0; i < ySize; i++) {
-        const v = frame.y[i] >> shift;
-        i420[i] = v > 255 ? 255 : v;
-      }
-      for (let i = 0; i < cSize; i++) {
-        const v = frame.cb[i] >> shift;
-        i420[ySize + i] = v > 255 ? 255 : v;
-      }
-      for (let i = 0; i < cSize; i++) {
-        const v = frame.cr[i] >> shift;
-        i420[ySize + cSize + i] = v > 255 ? 255 : v;
+      if (shift === 0) {
+        i420.set(frame.y, 0);
+        i420.set(frame.cb, ySize);
+        i420.set(frame.cr, ySize + cSize);
+      } else {
+        for (let i = 0; i < ySize; i++) {
+          const v = frame.y[i] >> shift;
+          i420[i] = v > 255 ? 255 : v;
+        }
+        for (let i = 0; i < cSize; i++) {
+          const v = frame.cb[i] >> shift;
+          i420[ySize + i] = v > 255 ? 255 : v;
+        }
+        for (let i = 0; i < cSize; i++) {
+          const v = frame.cr[i] >> shift;
+          i420[ySize + cSize + i] = v > 255 ? 255 : v;
+        }
       }
       const videoFrame = new VideoFrame(i420, {
         format: "I420",

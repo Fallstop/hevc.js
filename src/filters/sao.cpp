@@ -1,9 +1,16 @@
 // Sample Adaptive Offset — Spec §8.7.3
 // Transcription directe de la spec ITU-T H.265 v8 (08/2021)
+//
+// Two code paths per CTU:
+//  - Fast path: no PCM/transquant-bypass CUs and no slice/tile boundary
+//    restrictions apply → tight row-pointer loops, no per-pixel checks.
+//  - Slow path: literal spec transcription with per-pixel checks (rare:
+//    multi-slice/tile pictures with loop-filter crossing disabled, or PCM).
 
 #include "filters/sao.h"
 #include "common/types.h"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -16,6 +23,51 @@ namespace hevc {
 // Class 3 (D45):  (1, -1), (-1, 1)
 static const int eo_dx[4][2] = {{-1, 1}, {0, 0}, {-1, 1}, {1, -1}};
 static const int eo_dy[4][2] = {{0, 0}, {-1, 1}, {-1, 1}, {-1, 1}};
+
+// Fast edge-offset: all neighbors in-picture and same slice/tile.
+// Loop bounds are pre-shrunk so neighbor accesses never leave the picture
+// (out-of-picture neighbors → no modification per §8.7.3.2, i.e. skipped).
+static void sao_eo_fast(const uint16_t* orig, uint16_t* dest, int stride,
+                        int xCtb, int yCtb, int nCtbSw, int nCtbSh,
+                        int compW, int compH, int eoClass,
+                        const int* offsets, int maxVal) {
+    int dx0 = eo_dx[eoClass][0], dy0 = eo_dy[eoClass][0];
+    int dx1 = eo_dx[eoClass][1], dy1 = eo_dy[eoClass][1];
+
+    int yA = yCtb, yB = std::min(yCtb + nCtbSh, compH);
+    int xA = xCtb, xB = std::min(xCtb + nCtbSw, compW);
+    if (dy0 < 0 || dy1 < 0) yA = std::max(yA, 1);
+    if (dy0 > 0 || dy1 > 0) yB = std::min(yB, compH - 1);
+    if (dx0 < 0 || dx1 < 0) xA = std::max(xA, 1);
+    if (dx0 > 0 || dx1 > 0) xB = std::min(xB, compW - 1);
+
+    for (int y = yA; y < yB; y++) {
+        const uint16_t* oc = orig + y * stride;
+        const uint16_t* oa = orig + (y + dy0) * stride + dx0;
+        const uint16_t* ob = orig + (y + dy1) * stride + dx1;
+        uint16_t* d = dest + y * stride;
+        for (int x = xA; x < xB; x++) {
+            int c = oc[x];
+            // edgeIdx = 2 + sign(c-a) + sign(c-b), computed branchless
+            int edgeIdx = 2 + ((c > oa[x]) - (c < oa[x])) + ((c > ob[x]) - (c < ob[x]));
+            d[x] = static_cast<uint16_t>(Clip3(0, maxVal, c + offsets[edgeIdx]));
+        }
+    }
+}
+
+// Fast band-offset: applies a per-sample LUT covering the full value range.
+static void sao_bo_fast(const uint16_t* orig, uint16_t* dest, int stride,
+                        int xCtb, int yCtb, int nCtbSw, int nCtbSh,
+                        int compW, int compH, const uint16_t* lut) {
+    int yB = std::min(yCtb + nCtbSh, compH);
+    int xB = std::min(xCtb + nCtbSw, compW);
+    for (int y = yCtb; y < yB; y++) {
+        const uint16_t* oc = orig + y * stride;
+        uint16_t* d = dest + y * stride;
+        for (int x = xCtb; x < xB; x++)
+            d[x] = lut[oc[x]];
+    }
+}
 
 void apply_sao(DecodingContext& ctx) {
     auto& sps = *ctx.sps;
@@ -38,6 +90,19 @@ void apply_sao(DecodingContext& ctx) {
     }
     if (!anySao) return;
 
+    // Per-picture: can slice/tile boundaries restrict filtering anywhere?
+    // Single slice + single tile (the common case) → never.
+    bool multiSlice = false;
+    if (ctx.slice_idx) {
+        for (int i = 1; i < sps.PicSizeInCtbsY; i++) {
+            if (ctx.slice_idx[i] != ctx.slice_idx[0]) { multiSlice = true; break; }
+        }
+    }
+    bool multiTile = !pps.loop_filter_across_tiles_enabled_flag && !pps.TileId.empty() &&
+                     (pps.num_tile_columns_minus1 > 0 || pps.num_tile_rows_minus1 > 0);
+    bool pcmOrBypassPossible =
+        sps.pcm_loop_filter_disabled_flag || pps.transquant_bypass_enabled_flag;
+
     // §8.7.3.1: SAO operates on a copy of the deblocked picture
     // Use persistent backup buffers (avoids heap allocation per frame)
     auto* origPlane = ctx.sao_backup;
@@ -48,6 +113,10 @@ void apply_sao(DecodingContext& ctx) {
         std::memcpy(backup.data(), plane.data(), plane.size() * sizeof(uint16_t));
     }
 
+    // Band-offset LUT, rebuilt only when the CTU's BO params change
+    std::vector<uint16_t> boLut;
+    int lutBandPos = -1, lutOff[4] = {0, 0, 0, 0}, lutCIdx = -1;
+
     // Process each CTU
     for (int ry = 0; ry < sps.PicHeightInCtbsY; ry++) {
         for (int rx = 0; rx < sps.PicWidthInCtbsY; rx++) {
@@ -55,12 +124,6 @@ void apply_sao(DecodingContext& ctx) {
 
             for (int cIdx = 0; cIdx < numComp; cIdx++) {
                 if (sao.sao_type_idx[cIdx] == 0) continue;
-
-                // Check slice SAO flags
-                // Note: we apply SAO globally; per-slice flag check would need
-                // slice index per CTU. For single-slice pictures this is correct.
-                // Multi-slice: the SAO params are already set to type=0 during
-                // parsing if the slice flag was off.
 
                 int bitDepth = (cIdx == 0) ? sps.BitDepthY : sps.BitDepthC;
                 int maxVal = (1 << bitDepth) - 1;
@@ -85,8 +148,7 @@ void apply_sao(DecodingContext& ctx) {
                 // Pre-check: does this CTU have any PCM or transquant_bypass CUs?
                 // If not, skip per-pixel cu_at() checks (common case).
                 bool ctbHasPcmOrBypass = false;
-                if (pcmFilterDisabled || pps.transquant_bypass_enabled_flag) {
-                    // Only scan when PCM or transquant_bypass are possible in this stream
+                if (pcmOrBypassPossible) {
                     int xYctb = rx * ctbSize;
                     int yYctb = ry * ctbSize;
                     int minCb = sps.MinCbSizeY;
@@ -100,13 +162,44 @@ void apply_sao(DecodingContext& ctx) {
                         }
                 }
 
-                // Pre-check: do we need cross-slice/tile boundary checks?
-                // Only needed if neighbors can be in a different slice/tile
-                bool needBoundaryCheck = (ctx.slice_idx != nullptr);
+                bool needBoundaryCheck = multiSlice || multiTile;
 
                 const uint16_t* origData = origPlane[cIdx].data();
                 uint16_t* destData = pic->planes[cIdx].data();
 
+                int offsets[5];
+                for (int k = 0; k < 5; k++) offsets[k] = sao.sao_offset_val[cIdx][k];
+
+                if (sao.sao_type_idx[cIdx] == 2 && !ctbHasPcmOrBypass && !needBoundaryCheck) {
+                    sao_eo_fast(origData, destData, stride, xCtb, yCtb, nCtbSw, nCtbSh,
+                                compW, compH, sao.sao_eo_class[cIdx], offsets, maxVal);
+                    continue;
+                }
+                if (sao.sao_type_idx[cIdx] == 1 && !ctbHasPcmOrBypass) {
+                    // Build/rebuild the LUT only when the BO params change
+                    int bandPos = sao.sao_band_position[cIdx];
+                    bool dirty = (int)boLut.size() != maxVal + 1 || lutCIdx != cIdx ||
+                                 lutBandPos != bandPos;
+                    for (int k = 0; k < 4 && !dirty; k++)
+                        if (lutOff[k] != offsets[k]) dirty = true;
+                    if (dirty) {
+                        int bandShift = bitDepth - 5;
+                        boLut.resize(maxVal + 1);
+                        for (int s = 0; s <= maxVal; s++) {
+                            int bandIdx = (s >> bandShift) - bandPos;
+                            int off = (bandIdx >= 0 && bandIdx < 4) ? offsets[bandIdx] : 0;
+                            boLut[s] = static_cast<uint16_t>(Clip3(0, maxVal, s + off));
+                        }
+                        lutBandPos = bandPos;
+                        lutCIdx = cIdx;
+                        for (int k = 0; k < 4; k++) lutOff[k] = offsets[k];
+                    }
+                    sao_bo_fast(origData, destData, stride, xCtb, yCtb, nCtbSw, nCtbSh,
+                                compW, compH, boLut.data());
+                    continue;
+                }
+
+                // ---- Slow path: literal spec transcription ----
                 if (sao.sao_type_idx[cIdx] == 2) {
                     // Edge offset — §8.7.3.2
                     int eoClass = sao.sao_eo_class[cIdx];
@@ -143,7 +236,7 @@ void apply_sao(DecodingContext& ctx) {
                             // edgeIdx = 0 when neighbor is in a different slice and the
                             // relevant slice_loop_filter_across_slices_enabled_flag == 0
                             bool skipEdge = false;
-                            if (needBoundaryCheck) {
+                            if (needBoundaryCheck && ctx.slice_idx) {
                                 int curAddr = (yY / ctbSize) * sps.PicWidthInCtbsY + (xY / ctbSize);
                                 int si_cur = ctx.slice_idx[curAddr];
                                 for (int nk = 0; nk < 2 && !skipEdge; nk++) {

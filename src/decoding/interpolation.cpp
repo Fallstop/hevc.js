@@ -55,11 +55,6 @@ static void interpolate_luma(const Picture& refPic,
     int stride0 = refPic.stride[0];
     const uint16_t* plane0 = refPic.planes[0].data();
 
-    // Fast direct access (no bounds check) — used for interior PUs
-    auto refDirect = [&](int x, int y) -> int {
-        return plane0[y * stride0 + x];
-    };
-
     // Safe clamped access — used for edge PUs
     auto refClamp = [&](int x, int y) -> int {
         x = std::max(0, std::min(x, picW - 1));
@@ -71,7 +66,70 @@ static void interpolate_luma(const Picture& refPic,
     bool interior = (xInt - 3 >= 0) && (yInt - 3 >= 0) &&
                     (xInt + nPbW + 4 <= picW) && (yInt + nPbH + 4 <= picH);
 
-    // Use a macro to avoid duplicating the filter code for interior vs edge
+    if (interior) {
+        // Hot path: row-pointer loops with fixed-length tap loops the
+        // compiler can unroll and vectorize.
+        const uint16_t* base = plane0 + yInt * stride0 + xInt;
+        if (xFrac == 0 && yFrac == 0) {
+            for (int y = 0; y < nPbH; y++) {
+                const uint16_t* row = base + y * stride0;
+                int16_t* out = pred + y * nPbW;
+                for (int x = 0; x < nPbW; x++)
+                    out[x] = static_cast<int16_t>(row[x] << shift3);
+            }
+        } else if (yFrac == 0) {
+            const int16_t* f = luma_filter[xFrac];
+            for (int y = 0; y < nPbH; y++) {
+                const uint16_t* row = base + y * stride0 - 3;
+                int16_t* out = pred + y * nPbW;
+                for (int x = 0; x < nPbW; x++) {
+                    int sum = 0;
+                    for (int k = 0; k < 8; k++)
+                        sum += f[k] * row[x + k];
+                    out[x] = static_cast<int16_t>(sum >> shift1);
+                }
+            }
+        } else if (xFrac == 0) {
+            const int16_t* f = luma_filter[yFrac];
+            for (int y = 0; y < nPbH; y++) {
+                const uint16_t* col = base + (y - 3) * stride0;
+                int16_t* out = pred + y * nPbW;
+                for (int x = 0; x < nPbW; x++) {
+                    int sum = 0;
+                    for (int k = 0; k < 8; k++)
+                        sum += f[k] * col[x + k * stride0];
+                    out[x] = static_cast<int16_t>(sum >> shift1);
+                }
+            }
+        } else {
+            int tmpH = nPbH + 7;
+            int16_t tmp[64 * 71];
+            const int16_t* fH = luma_filter[xFrac];
+            for (int y = 0; y < tmpH; y++) {
+                const uint16_t* row = base + (y - 3) * stride0 - 3;
+                int16_t* out = tmp + y * nPbW;
+                for (int x = 0; x < nPbW; x++) {
+                    int sum = 0;
+                    for (int k = 0; k < 8; k++)
+                        sum += fH[k] * row[x + k];
+                    out[x] = static_cast<int16_t>(sum >> shift1);
+                }
+            }
+            const int16_t* fV = luma_filter[yFrac];
+            for (int y = 0; y < nPbH; y++) {
+                int16_t* out = pred + y * nPbW;
+                for (int x = 0; x < nPbW; x++) {
+                    int sum = 0;
+                    for (int k = 0; k < 8; k++)
+                        sum += fV[k] * tmp[(y + k) * nPbW + x];
+                    out[x] = static_cast<int16_t>(sum >> shift2);
+                }
+            }
+        }
+        return;
+    }
+
+    // Edge path: clamped access, literal spec transcription
     #define LUMA_INTERP(REF) do { \
         if (xFrac == 0 && yFrac == 0) { \
             for (int y = 0; y < nPbH; y++) \
@@ -117,11 +175,7 @@ static void interpolate_luma(const Picture& refPic,
         } \
     } while(0)
 
-    if (interior) {
-        LUMA_INTERP(refDirect);
-    } else {
-        LUMA_INTERP(refClamp);
-    }
+    LUMA_INTERP(refClamp);
 
     #undef LUMA_INTERP
 }
@@ -142,9 +196,6 @@ static void interpolate_chroma(const Picture& refPic, int cIdx,
     int strideC = refPic.stride[cIdx];
     const uint16_t* planeC = refPic.planes[cIdx].data();
 
-    auto refDirect = [&](int x, int y) -> int {
-        return planeC[y * strideC + x];
-    };
     auto refClamp = [&](int x, int y) -> int {
         x = std::max(0, std::min(x, picW - 1));
         y = std::max(0, std::min(y, picH - 1));
@@ -154,6 +205,68 @@ static void interpolate_chroma(const Picture& refPic, int cIdx,
     // Chroma filter margin is 1 (4-tap: positions -1..+2)
     bool interior = (xInt - 1 >= 0) && (yInt - 1 >= 0) &&
                     (xInt + nPbWC + 2 <= picW) && (yInt + nPbHC + 2 <= picH);
+
+    if (interior) {
+        // Hot path: row-pointer loops (see interpolate_luma)
+        const uint16_t* base = planeC + yInt * strideC + xInt;
+        if (xFrac == 0 && yFrac == 0) {
+            for (int y = 0; y < nPbHC; y++) {
+                const uint16_t* row = base + y * strideC;
+                int16_t* out = pred + y * nPbWC;
+                for (int x = 0; x < nPbWC; x++)
+                    out[x] = static_cast<int16_t>(row[x] << shift3);
+            }
+        } else if (yFrac == 0) {
+            const int16_t* f = chroma_filter[xFrac];
+            for (int y = 0; y < nPbHC; y++) {
+                const uint16_t* row = base + y * strideC - 1;
+                int16_t* out = pred + y * nPbWC;
+                for (int x = 0; x < nPbWC; x++) {
+                    int sum = 0;
+                    for (int k = 0; k < 4; k++)
+                        sum += f[k] * row[x + k];
+                    out[x] = static_cast<int16_t>(sum >> shift1);
+                }
+            }
+        } else if (xFrac == 0) {
+            const int16_t* f = chroma_filter[yFrac];
+            for (int y = 0; y < nPbHC; y++) {
+                const uint16_t* col = base + (y - 1) * strideC;
+                int16_t* out = pred + y * nPbWC;
+                for (int x = 0; x < nPbWC; x++) {
+                    int sum = 0;
+                    for (int k = 0; k < 4; k++)
+                        sum += f[k] * col[x + k * strideC];
+                    out[x] = static_cast<int16_t>(sum >> shift1);
+                }
+            }
+        } else {
+            int tmpH = nPbHC + 3;
+            int16_t tmp[32 * 35];
+            const int16_t* fH = chroma_filter[xFrac];
+            for (int y = 0; y < tmpH; y++) {
+                const uint16_t* row = base + (y - 1) * strideC - 1;
+                int16_t* out = tmp + y * nPbWC;
+                for (int x = 0; x < nPbWC; x++) {
+                    int sum = 0;
+                    for (int k = 0; k < 4; k++)
+                        sum += fH[k] * row[x + k];
+                    out[x] = static_cast<int16_t>(sum >> shift1);
+                }
+            }
+            const int16_t* fV = chroma_filter[yFrac];
+            for (int y = 0; y < nPbHC; y++) {
+                int16_t* out = pred + y * nPbWC;
+                for (int x = 0; x < nPbWC; x++) {
+                    int sum = 0;
+                    for (int k = 0; k < 4; k++)
+                        sum += fV[k] * tmp[(y + k) * nPbWC + x];
+                    out[x] = static_cast<int16_t>(sum >> shift2);
+                }
+            }
+        }
+        return;
+    }
 
     #define CHROMA_INTERP(REF) do { \
         if (xFrac == 0 && yFrac == 0) { \
@@ -200,11 +313,7 @@ static void interpolate_chroma(const Picture& refPic, int cIdx,
         } \
     } while(0)
 
-    if (interior) {
-        CHROMA_INTERP(refDirect);
-    } else {
-        CHROMA_INTERP(refClamp);
-    }
+    CHROMA_INTERP(refClamp);
     #undef CHROMA_INTERP
 }
 
