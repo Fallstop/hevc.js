@@ -38,6 +38,79 @@ static const int16_t chroma_filter[8][4] = {
 };
 
 // ============================================================
+// Portable SSE2 interpolation kernels.
+// SSE2 intrinsics compile natively on x86-64 (baseline, no flags) AND under
+// emscripten -msimd128 (auto-translated to wasm128, integer-identical). One
+// source -> both the oracle-verified native build and the shipped WASM.
+// ============================================================
+// __SSE2__ is set on native x86-64 (baseline) and under emscripten when -msse2 is
+// passed (the WASM build adds it; emscripten lowers SSE2 intrinsics to wasm128).
+#if defined(__SSE2__)
+  #define HEVC_SIMD_INTERP 1
+  #include <emmintrin.h>
+#endif
+
+// o[x] = (Σ_{k<NTAP} coef[k] * src[x + k*step]) >> shift, for x in [0,width).
+// `src` is read as signed int16: picture samples (0..1023) reinterpret losslessly;
+// the H-pass intermediate `tmp` is genuinely signed. Per §8.5.3.3.3 every
+// interpolation intermediate fits int16, so the saturating pack equals the
+// scalar truncating cast — bit-exact with the clamped scalar path.
+template<int NTAP>
+static inline void simd_filter_row(const int16_t* src, int step,
+                                   const int16_t* coef, int shift,
+                                   int width, int16_t* o) {
+    int x = 0;
+#ifdef HEVC_SIMD_INTERP
+    // Pairwise-madd kernel. Each tap-pair (2p,2p+1) is packed into an int32 lane
+    // [c2p | c2p+1<<16]; interleaving two sample loads gives [s_a,s_b,...] so
+    // _mm_madd_epi16 computes c2p*s_a + c2p+1*s_b per output. madd lowers to a single
+    // wasm i32x4.dot_i16x8_s — fast on WASM and native alike (NTAP is 4 or 8, even).
+    static_assert(NTAP % 2 == 0, "NTAP must be even");
+    __m128i cp[NTAP / 2];
+    for (int p = 0; p < NTAP / 2; p++)
+        cp[p] = _mm_set1_epi32(static_cast<uint16_t>(coef[2 * p]) |
+                               (static_cast<int>(coef[2 * p + 1]) << 16));
+    const __m128i vsh = _mm_cvtsi32_si128(shift);
+    for (; x + 8 <= width; x += 8) {
+        __m128i acc_lo = _mm_setzero_si128();  // outputs x..x+3
+        __m128i acc_hi = _mm_setzero_si128();  // outputs x+4..x+7
+        for (int p = 0; p < NTAP / 2; p++) {
+            __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + x + (2 * p) * step));
+            __m128i vb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + x + (2 * p + 1) * step));
+            acc_lo = _mm_add_epi32(acc_lo, _mm_madd_epi16(_mm_unpacklo_epi16(va, vb), cp[p]));
+            acc_hi = _mm_add_epi32(acc_hi, _mm_madd_epi16(_mm_unpackhi_epi16(va, vb), cp[p]));
+        }
+        acc_lo = _mm_sra_epi32(acc_lo, vsh);
+        acc_hi = _mm_sra_epi32(acc_hi, vsh);
+        // Truncating int32->int16 to match scalar static_cast<int16_t> (WRAPS, not
+        // saturates): frac=2 half-pel two-pass V can land just past int16 range.
+        // Sign-extending the low 16 bits turns the saturating pack into a truncation.
+        acc_lo = _mm_srai_epi32(_mm_slli_epi32(acc_lo, 16), 16);
+        acc_hi = _mm_srai_epi32(_mm_slli_epi32(acc_hi, 16), 16);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(o + x), _mm_packs_epi32(acc_lo, acc_hi));
+    }
+#endif
+    for (; x < width; x++) {
+        int sum = 0;
+        for (int k = 0; k < NTAP; k++) sum += coef[k] * src[x + k * step];
+        o[x] = static_cast<int16_t>(sum >> shift);
+    }
+}
+
+// o[x] = src[x] << shift (integer MV / full-pel copy). Fits int16 by spec.
+static inline void simd_copy_row(const uint16_t* src, int shift, int width, int16_t* o) {
+    int x = 0;
+#ifdef HEVC_SIMD_INTERP
+    const __m128i vsh = _mm_cvtsi32_si128(shift);
+    for (; x + 8 <= width; x += 8) {
+        __m128i s = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + x));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(o + x), _mm_sll_epi16(s, vsh));
+    }
+#endif
+    for (; x < width; x++) o[x] = static_cast<int16_t>(src[x] << shift);
+}
+
+// ============================================================
 // Luma interpolation — §8.5.3.3.3
 // Output in extended precision (not clipped to [0, 2^BitDepth-1])
 // ============================================================
@@ -54,11 +127,6 @@ static void interpolate_luma(const Picture& refPic,
     int picH = refPic.height[0];
     int stride0 = refPic.stride[0];
     const uint16_t* plane0 = refPic.planes[0].data();
-
-    // Fast direct access (no bounds check) — used for interior PUs
-    auto refDirect = [&](int x, int y) -> int {
-        return plane0[y * stride0 + x];
-    };
 
     // Safe clamped access — used for edge PUs
     auto refClamp = [&](int x, int y) -> int {
@@ -118,7 +186,34 @@ static void interpolate_luma(const Picture& refPic,
     } while(0)
 
     if (interior) {
-        LUMA_INTERP(refDirect);
+        // Interior fast path: SSE2 separable filter (bit-exact with the scalar
+        // clamped path below). The interior margin (-3 / +4) guarantees the 8-wide
+        // loads stay in-bounds.
+        const uint16_t* base = plane0 + yInt * stride0 + xInt;
+        if (xFrac == 0 && yFrac == 0) {
+            for (int y = 0; y < nPbH; y++)
+                simd_copy_row(base + y * stride0, shift3, nPbW, pred + y * nPbW);
+        } else if (yFrac == 0) {
+            const int16_t* f = luma_filter[xFrac];
+            for (int y = 0; y < nPbH; y++)
+                simd_filter_row<8>(reinterpret_cast<const int16_t*>(base + y * stride0 - 3),
+                                   1, f, shift1, nPbW, pred + y * nPbW);
+        } else if (xFrac == 0) {
+            const int16_t* f = luma_filter[yFrac];
+            for (int y = 0; y < nPbH; y++)
+                simd_filter_row<8>(reinterpret_cast<const int16_t*>(base + (y - 3) * stride0),
+                                   stride0, f, shift1, nPbW, pred + y * nPbW);
+        } else {
+            int tmpH = nPbH + 7;
+            int16_t tmp[64 * 71];
+            const int16_t* fH = luma_filter[xFrac];
+            for (int y = 0; y < tmpH; y++)
+                simd_filter_row<8>(reinterpret_cast<const int16_t*>(base + (y - 3) * stride0 - 3),
+                                   1, fH, shift1, nPbW, tmp + y * nPbW);
+            const int16_t* fV = luma_filter[yFrac];
+            for (int y = 0; y < nPbH; y++)
+                simd_filter_row<8>(tmp + y * nPbW, nPbW, fV, shift2, nPbW, pred + y * nPbW);
+        }
     } else {
         LUMA_INTERP(refClamp);
     }
@@ -142,9 +237,6 @@ static void interpolate_chroma(const Picture& refPic, int cIdx,
     int strideC = refPic.stride[cIdx];
     const uint16_t* planeC = refPic.planes[cIdx].data();
 
-    auto refDirect = [&](int x, int y) -> int {
-        return planeC[y * strideC + x];
-    };
     auto refClamp = [&](int x, int y) -> int {
         x = std::max(0, std::min(x, picW - 1));
         y = std::max(0, std::min(y, picH - 1));
@@ -201,7 +293,38 @@ static void interpolate_chroma(const Picture& refPic, int cIdx,
     } while(0)
 
     if (interior) {
-        CHROMA_INTERP(refDirect);
+        // Interior fast path: SSE2 separable 4-tap filter (bit-exact). Chroma margin
+        // is only -1 / +2, but the 8-wide load needs +6 of headroom past the last
+        // output column; simd_filter_row only vectorizes blocks of 8 and falls back
+        // to scalar for the remainder, so for widths < 8 (common in chroma) it runs
+        // scalar. For width >= 8, the wide load reaches at most base + nPbWC+2 which
+        // the interior test (xInt+nPbWC+2 <= picW) keeps in-bounds; the extra lanes
+        // read are within the same valid row.
+        const uint16_t* base = planeC + yInt * strideC + xInt;
+        if (xFrac == 0 && yFrac == 0) {
+            for (int y = 0; y < nPbHC; y++)
+                simd_copy_row(base + y * strideC, shift3, nPbWC, pred + y * nPbWC);
+        } else if (yFrac == 0) {
+            const int16_t* f = chroma_filter[xFrac];
+            for (int y = 0; y < nPbHC; y++)
+                simd_filter_row<4>(reinterpret_cast<const int16_t*>(base + y * strideC - 1),
+                                   1, f, shift1, nPbWC, pred + y * nPbWC);
+        } else if (xFrac == 0) {
+            const int16_t* f = chroma_filter[yFrac];
+            for (int y = 0; y < nPbHC; y++)
+                simd_filter_row<4>(reinterpret_cast<const int16_t*>(base + (y - 1) * strideC),
+                                   strideC, f, shift1, nPbWC, pred + y * nPbWC);
+        } else {
+            int tmpH = nPbHC + 3;
+            int16_t tmp[32 * 35];
+            const int16_t* fH = chroma_filter[xFrac];
+            for (int y = 0; y < tmpH; y++)
+                simd_filter_row<4>(reinterpret_cast<const int16_t*>(base + (y - 1) * strideC - 1),
+                                   1, fH, shift1, nPbWC, tmp + y * nPbWC);
+            const int16_t* fV = chroma_filter[yFrac];
+            for (int y = 0; y < nPbHC; y++)
+                simd_filter_row<4>(tmp + y * nPbWC, nPbWC, fV, shift2, nPbWC, pred + y * nPbWC);
+        }
     } else {
         CHROMA_INTERP(refClamp);
     }

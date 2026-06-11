@@ -197,11 +197,14 @@ void apply_sao(DecodingContext& ctx) {
                             edgeIdx = 2 + signC_A + signC_B;
                             // Map: 0=valley(both<), 1=concave(one<), 2=flat, 3=convex(one>), 4=peak(both>)
 
+                            // Store unconditionally (no per-pixel offset!=0 branch):
+                            // c_val is already in [0,maxVal] and destData holds c_val from
+                            // the pre-SAO backup, so offset==0 is a bit-exact self-write.
+                            // This removes the decoder's single worst branch (~16% of all
+                            // mispredicts; edgeIdx is high-entropy and unpredictable).
                             int offset = sao.sao_offset_val[cIdx][edgeIdx];
-                            if (offset != 0) {
-                                destData[ySj * stride + xSi] =
-                                    static_cast<uint16_t>(Clip3(0, maxVal, c_val + offset));
-                            }
+                            destData[ySj * stride + xSi] =
+                                static_cast<uint16_t>(Clip3(0, maxVal, c_val + offset));
                         }
                     }
                 } else {
@@ -229,10 +232,8 @@ void apply_sao(DecodingContext& ctx) {
                             int bandIdx = band - bandPos;
                             if (bandIdx >= 0 && bandIdx < 4) {
                                 int offset = sao.sao_offset_val[cIdx][bandIdx];
-                                if (offset != 0) {
-                                    destData[ySj * stride + xSi] =
-                                        static_cast<uint16_t>(Clip3(0, maxVal, sample + offset));
-                                }
+                                destData[ySj * stride + xSi] =
+                                    static_cast<uint16_t>(Clip3(0, maxVal, sample + offset));
                             }
                         }
                     }

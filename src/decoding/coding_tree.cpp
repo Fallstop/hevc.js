@@ -1277,9 +1277,14 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
 
     // Luma residual
     if (cbf_luma) {
-        int16_t coefficients[64 * 64] = {};
-        int16_t scaled[64 * 64] = {};
-        int16_t residual[64 * 64] = {};
+        // Not zero-initialized: decode_residual_coding() memsets `coefficients`,
+        // perform_dequant() fully writes `scaled`, and the inverse transform / bypass
+        // memcpy fully writes `residual` over [0,trSize²) before any read; the unused
+        // tail is never read. Dropping these per-TU 8 KB zero-fills removes the bulk
+        // of the decoder's L1 write-misses (decode_transform_unit was ~42% of them).
+        int16_t coefficients[64 * 64];
+        int16_t scaled[64 * 64];
+        int16_t residual[64 * 64];
 
         bool transform_skip = false;
         if (pps.transform_skip_enabled_flag && !cu.cu_transquant_bypass &&
@@ -1304,7 +1309,7 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
         }
 
         // Prediction for luma
-        int16_t pred_samples[64 * 64] = {};
+        int16_t pred_samples[64 * 64];  // fully written by intra-pred / inter-copy
         if (cu.pred_mode == PredMode::MODE_INTRA) {
             int intra_mode = ctx.intra_mode_at(x0, y0);
             perform_intra_prediction(ctx, x0, y0, log2TrafoSize, 0, intra_mode,
@@ -1323,7 +1328,7 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
     } else if (cu.pred_mode == PredMode::MODE_INTRA) {
         // No residual but still need intra prediction
         int intra_mode = ctx.intra_mode_at(x0, y0);
-        int16_t pred_samples[64 * 64] = {};
+        int16_t pred_samples[64 * 64];  // fully written by intra-pred / inter-copy
         perform_intra_prediction(ctx, x0, y0, log2TrafoSize, 0, intra_mode,
                                  pred_samples);
 
@@ -1349,9 +1354,10 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
             for (int cIdx = 1; cIdx <= 2; cIdx++) {
                 bool cbf_c = (cIdx == 1) ? cbf_cb : cbf_cr;
                 if (cbf_c) {
-                    int16_t coefficients[32 * 32] = {};
-                    int16_t scaled[32 * 32] = {};
-                    int16_t residual[32 * 32] = {};
+                    // Same as luma: consumers fully overwrite [0,trSize²) first.
+                    int16_t coefficients[32 * 32];
+                    int16_t scaled[32 * 32];
+                    int16_t residual[32 * 32];
 
                     bool transform_skip = false;
                     if (pps.transform_skip_enabled_flag &&
@@ -1387,7 +1393,7 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
                     }
 
                     // Chroma prediction
-                    int16_t pred_samples[32 * 32] = {};
+                    int16_t pred_samples[32 * 32];  // fully written before read
                     if (cu.pred_mode == PredMode::MODE_INTRA) {
                         int chroma_mode = ctx.chroma_mode_at(xC, yC);
                         perform_intra_prediction(ctx, xC, yC, log2TrafoSizeC, cIdx,
@@ -1406,7 +1412,7 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
                                      pred_samples, residual);
                 } else if (cu.pred_mode == PredMode::MODE_INTRA) {
                     int chroma_mode = ctx.chroma_mode_at(xC, yC);
-                    int16_t pred_samples[32 * 32] = {};
+                    int16_t pred_samples[32 * 32];  // fully written before read
                     perform_intra_prediction(ctx, xC, yC, log2TrafoSizeC, cIdx,
                                             chroma_mode, pred_samples);
                     int16_t zero[32 * 32] = {};

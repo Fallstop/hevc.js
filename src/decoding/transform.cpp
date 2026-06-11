@@ -7,6 +7,11 @@
 #include <cstring>
 #include <algorithm>
 
+// Portable SSE2 (native x86-64 baseline; emscripten lowers to wasm128 with -msse2).
+#if defined(__SSE2__)
+  #include <emmintrin.h>
+#endif
+
 namespace hevc {
 
 // ============================================================
@@ -84,6 +89,77 @@ static void idct8(const int16_t* src, int16_t* dst, int shift, int line) {
     }
 }
 
+#if defined(__SSE2__)
+// Column-parallel SSE2 idct16 (processes 4 columns per iteration). Widening multiply
+// uses _mm_madd_epi16 with [c,0] coefficient pairs (set1_epi32((uint16_t)c)) so each
+// madd yields c*src as int32 — one fast wasm i32x4.dot_i16x8_s, correct for negative
+// src/c. Output narrowing via _mm_packs_epi32 == the scalar Clip3(-32768,32767). The
+// butterfly is the same integer math (additions reassociated → bit-exact).
+static void idct16(const int16_t* src, int16_t* dst, int shift, int line) {
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i vadd = _mm_set1_epi32(1 << (shift - 1));
+    const __m128i vsh = _mm_cvtsi32_si128(shift);
+    for (int j = 0; j < line; j += 4) {
+        const int16_t* s = src + j;
+        auto W = [&](int r) -> __m128i {
+            return _mm_unpacklo_epi16(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + r * line)), zero);
+        };
+        auto MUL = [&](__m128i w, int c) -> __m128i {
+            return _mm_madd_epi16(w, _mm_set1_epi32(static_cast<uint16_t>(c)));
+        };
+        __m128i w0=W(0),w1=W(1),w2=W(2),w3=W(3),w4=W(4),w5=W(5),w6=W(6),w7=W(7);
+        __m128i w8=W(8),w9=W(9),w10=W(10),w11=W(11),w12=W(12),w13=W(13),w14=W(14),w15=W(15);
+
+        // Even-even
+        __m128i m0=MUL(w0,64), m8=MUL(w8,64);
+        __m128i EEE0=_mm_add_epi32(m0,m8), EEE1=_mm_sub_epi32(m0,m8);
+        __m128i EEO0=_mm_add_epi32(MUL(w4,83),MUL(w12,36));
+        __m128i EEO1=_mm_sub_epi32(MUL(w4,36),MUL(w12,83));
+        __m128i EE0=_mm_add_epi32(EEE0,EEO0), EE3=_mm_sub_epi32(EEE0,EEO0);
+        __m128i EE1=_mm_add_epi32(EEE1,EEO1), EE2=_mm_sub_epi32(EEE1,EEO1);
+
+        // Even-odd (rows 2,6,10,14)
+        auto EO=[&](int c2,int c6,int c10,int c14){
+            return _mm_add_epi32(_mm_add_epi32(MUL(w2,c2),MUL(w6,c6)),
+                                 _mm_add_epi32(MUL(w10,c10),MUL(w14,c14)));
+        };
+        __m128i EO0=EO(89,75,50,18), EO1=EO(75,-18,-89,-50);
+        __m128i EO2=EO(50,-89,18,75), EO3=EO(18,-50,75,-89);
+
+        __m128i E0=_mm_add_epi32(EE0,EO0), E7=_mm_sub_epi32(EE0,EO0);
+        __m128i E1=_mm_add_epi32(EE1,EO1), E6=_mm_sub_epi32(EE1,EO1);
+        __m128i E2=_mm_add_epi32(EE2,EO2), E5=_mm_sub_epi32(EE2,EO2);
+        __m128i E3=_mm_add_epi32(EE3,EO3), E4=_mm_sub_epi32(EE3,EO3);
+
+        // Odd (rows 1,3,5,7,9,11,13,15)
+        auto O=[&](int a,int b,int c,int d,int e,int f,int g,int h){
+            return _mm_add_epi32(
+                _mm_add_epi32(_mm_add_epi32(MUL(w1,a),MUL(w3,b)),_mm_add_epi32(MUL(w5,c),MUL(w7,d))),
+                _mm_add_epi32(_mm_add_epi32(MUL(w9,e),MUL(w11,f)),_mm_add_epi32(MUL(w13,g),MUL(w15,h))));
+        };
+        __m128i O0=O(90,87,80,70,57,43,25,9);
+        __m128i O1=O(87,57,9,-43,-80,-90,-70,-25);
+        __m128i O2=O(80,9,-70,-87,-25,57,90,43);
+        __m128i O3=O(70,-43,-87,9,90,25,-80,-57);
+        __m128i O4=O(57,-80,-25,90,-9,-87,43,70);
+        __m128i O5=O(43,-90,57,25,-87,70,9,-80);
+        __m128i O6=O(25,-70,90,-80,43,9,-57,87);
+        __m128i O7=O(9,-25,43,-57,70,-80,87,-90);
+
+        auto OUT=[&](int row, __m128i v){
+            __m128i r=_mm_sra_epi32(_mm_add_epi32(v,vadd),vsh);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + row*line + j), _mm_packs_epi32(r,r));
+        };
+        __m128i Earr[8]={E0,E1,E2,E3,E4,E5,E6,E7};
+        __m128i Oarr[8]={O0,O1,O2,O3,O4,O5,O6,O7};
+        for (int k=0;k<8;k++){
+            OUT(k,      _mm_add_epi32(Earr[k],Oarr[k]));
+            OUT(15-k,   _mm_sub_epi32(Earr[k],Oarr[k]));
+        }
+    }
+}
+#else
 static void idct16(const int16_t* src, int16_t* dst, int shift, int line) {
     static const int16_t g[8][16] = {
         { 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64 },
@@ -143,12 +219,10 @@ static void idct16(const int16_t* src, int16_t* dst, int shift, int line) {
         }
     }
 }
+#endif  // __SSE2__ idct16
 
-static void idct32(const int16_t* src, int16_t* dst, int shift, int line) {
-    int add = 1 << (shift - 1);
-
-    // DCT coefficients from the spec tables
-    static const int16_t tm[32][32] = {
+// DCT-II 32-point basis (spec Table 8-11), shared by the SSE2 and scalar idct32.
+static const int16_t idct32_tm[32][32] = {
         { 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
         { 90, 90, 88, 85, 82, 78, 73, 67, 61, 54, 46, 38, 31, 22, 13,  4, -4,-13,-22,-31,-38,-46,-54,-61,-67,-73,-78,-82,-85,-88,-90,-90},
         { 90, 87, 80, 70, 57, 43, 25,  9, -9,-25,-43,-57,-70,-80,-87,-90,-90,-87,-80,-70,-57,-43,-25, -9,  9, 25, 43, 57, 70, 80, 87, 90},
@@ -182,6 +256,71 @@ static void idct32(const int16_t* src, int16_t* dst, int shift, int line) {
         {  9,-25, 43,-57, 70,-80, 87,-90, 90,-87, 80,-70, 57,-43, 25, -9, -9, 25,-43, 57,-70, 80,-87, 90,-90, 87,-80, 70,-57, 43,-25,  9},
         {  4,-13, 22,-31, 38,-46, 54,-61, 67,-73, 78,-82, 85,-88, 90,-90, 90,-90, 88,-85, 82,-78, 73,-67, 61,-54, 46,-38, 31,-22, 13, -4},
     };
+
+#if defined(__SSE2__)
+// Column-parallel SSE2 idct32 (4 columns/iter), reusing idct32_tm. Same madd widening
+// and packs-narrowing as idct16; bit-exact (reassociated integer butterfly).
+static void idct32(const int16_t* src, int16_t* dst, int shift, int line) {
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i vadd = _mm_set1_epi32(1 << (shift - 1));
+    const __m128i vsh = _mm_cvtsi32_si128(shift);
+    for (int j = 0; j < line; j += 4) {
+        const int16_t* s = src + j;
+        auto W = [&](int r) -> __m128i {
+            return _mm_unpacklo_epi16(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + r * line)), zero);
+        };
+        auto MUL = [&](__m128i w, int c) -> __m128i {
+            return _mm_madd_epi16(w, _mm_set1_epi32(static_cast<uint16_t>(c)));
+        };
+        __m128i w[32];
+        for (int r = 0; r < 32; r++) w[r] = W(r);
+        __m128i O[16], E[16], EO[8], EE[8], EEO[4], EEE[4];
+        for (int k = 0; k < 16; k++) {
+            __m128i a = zero;
+            for (int n = 0; n < 16; n++) a = _mm_add_epi32(a, MUL(w[2*n+1], idct32_tm[2*n+1][k]));
+            O[k] = a;
+        }
+        for (int k = 0; k < 8; k++) {
+            __m128i a = zero;
+            for (int n = 0; n < 8; n++) a = _mm_add_epi32(a, MUL(w[2*(2*n+1)], idct32_tm[2*(2*n+1)][k]));
+            EO[k] = a;
+        }
+        for (int k = 0; k < 4; k++) {
+            __m128i a = zero;
+            for (int n = 0; n < 4; n++) a = _mm_add_epi32(a, MUL(w[4*(2*n+1)], idct32_tm[4*(2*n+1)][k]));
+            EEO[k] = a;
+        }
+        __m128i m0 = MUL(w[0], 64), m16 = MUL(w[16], 64);
+        __m128i EEEE0 = _mm_add_epi32(m0, m16), EEEE1 = _mm_sub_epi32(m0, m16);
+        __m128i EEEO0 = _mm_add_epi32(MUL(w[8], 83), MUL(w[24], 36));
+        __m128i EEEO1 = _mm_sub_epi32(MUL(w[8], 36), MUL(w[24], 83));
+        EEE[0] = _mm_add_epi32(EEEE0, EEEO0);
+        EEE[1] = _mm_add_epi32(EEEE1, EEEO1);
+        EEE[2] = _mm_sub_epi32(EEEE1, EEEO1);
+        EEE[3] = _mm_sub_epi32(EEEE0, EEEO0);
+        EE[0]=_mm_add_epi32(EEE[0],EEO[0]); EE[7]=_mm_sub_epi32(EEE[0],EEO[0]);
+        EE[1]=_mm_add_epi32(EEE[1],EEO[1]); EE[6]=_mm_sub_epi32(EEE[1],EEO[1]);
+        EE[2]=_mm_add_epi32(EEE[2],EEO[2]); EE[5]=_mm_sub_epi32(EEE[2],EEO[2]);
+        EE[3]=_mm_add_epi32(EEE[3],EEO[3]); EE[4]=_mm_sub_epi32(EEE[3],EEO[3]);
+        for (int k = 0; k < 8; k++) {
+            E[k]    = _mm_add_epi32(EE[k], EO[k]);
+            E[15-k] = _mm_sub_epi32(EE[k], EO[k]);
+        }
+        auto OUT = [&](int row, __m128i v) {
+            __m128i r = _mm_sra_epi32(_mm_add_epi32(v, vadd), vsh);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + row*line + j), _mm_packs_epi32(r, r));
+        };
+        for (int k = 0; k < 16; k++) {
+            OUT(k,    _mm_add_epi32(E[k], O[k]));
+            OUT(31-k, _mm_sub_epi32(E[k], O[k]));
+        }
+    }
+}
+#else
+static void idct32(const int16_t* src, int16_t* dst, int shift, int line) {
+    int add = 1 << (shift - 1);
+    const int16_t (&tm)[32][32] = idct32_tm;
 
     for (int j = 0; j < line; j++) {
         int O[16], E[16], EO[8], EE[8], EEO[4], EEE[4];
@@ -231,6 +370,7 @@ static void idct32(const int16_t* src, int16_t* dst, int shift, int line) {
         }
     }
 }
+#endif  // __SSE2__ idct32
 
 // ============================================================
 // 2D inverse transform (§8.6.4.2)

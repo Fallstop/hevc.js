@@ -71,8 +71,11 @@ if(BUILD_WASM)
         OUTPUT_NAME "hevc-decode"
         SUFFIX ".js"
     )
-    # Enable exceptions + SIMD 128-bit for the whole project in WASM mode
-    target_compile_options(hevc-decode-lib PRIVATE -fexceptions -msimd128)
+    # Enable exceptions + SIMD 128-bit for the whole project in WASM mode.
+    # -msse2 lets emscripten lower our portable SSE2 kernels (<emmintrin.h>) to
+    # wasm128 — the same intrinsics compile natively on x86-64, so the oracle
+    # tests verify the exact code that ships to WASM.
+    target_compile_options(hevc-decode-lib PRIVATE -fexceptions -msimd128 -msse2)
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         target_compile_options(hevc-wasm PRIVATE -O0 -g -fexceptions -msimd128)
     else()
