@@ -85,6 +85,14 @@ struct Picture {
     uint16_t& sample(int c, int x, int y) { return sample<uint16_t>(c, x, y); }
     uint16_t sample(int c, int x, int y) const { return sample<uint16_t>(c, x, y); }
 
+    // Width-dispatched single-sample read for cold/scalar paths that must work
+    // for both uint8 and uint16 storage (e.g. intra neighbour fetch).
+    int sample_i(int c, int x, int y) const {
+        size_t off = static_cast<size_t>(y) * stride[c] + x;
+        return bytes_per_sample == 1 ? plane_ptr<uint8_t>(c)[off]
+                                     : plane_ptr<uint16_t>(c)[off];
+    }
+
     // Write to raw YUV file (crops to conformance window if set)
     bool write_yuv(const char* path) const;
 
