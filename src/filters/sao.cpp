@@ -158,10 +158,10 @@ void apply_sao(DecodingContext& ctx) {
     auto* origPlane = ctx.sao_backup;
     for (int c = 0; c < numComp; c++) {
         if (!anySaoComp[c]) continue;  // never read → don't copy
-        auto& plane = pic->planes[c];
+        size_t nSamp = pic->plane_samples(c);
         auto& backup = origPlane[c];
-        backup.resize(plane.size());
-        std::memcpy(backup.data(), plane.data(), plane.size() * sizeof(uint16_t));
+        backup.resize(nSamp);
+        std::memcpy(backup.data(), pic->plane_ptr<uint16_t>(c), nSamp * sizeof(uint16_t));
     }
 
     // Process each CTU
@@ -221,7 +221,7 @@ void apply_sao(DecodingContext& ctx) {
                 bool needBoundaryCheck = saoBoundaryPossible;
 
                 const uint16_t* origData = origPlane[cIdx].data();
-                uint16_t* destData = pic->planes[cIdx].data();
+                uint16_t* destData = pic->plane_ptr<uint16_t>(cIdx);
 
                 if (sao.sao_type_idx[cIdx] == 2) {
                     // Edge offset — §8.7.3.2

@@ -63,9 +63,9 @@ int hevc_decoder_get_frame(HEVCDecoder* dec, int index, HEVCFrame* frame) {
     int c_offset = (pic->conf_win_top / sub_h) * pic->stride[1] +
                    (pic->conf_win_left / sub_w);
 
-    frame->y  = pic->planes[0].data() + y_offset;
-    frame->cb = pic->planes[1].data() + c_offset;
-    frame->cr = pic->planes[2].data() + c_offset;
+    frame->y  = pic->plane_ptr<uint16_t>(0) + y_offset;
+    frame->cb = pic->plane_ptr<uint16_t>(1) + c_offset;
+    frame->cr = pic->plane_ptr<uint16_t>(2) + c_offset;
     frame->width = crop_w;
     frame->height = crop_h;
     frame->stride_y = pic->stride[0];
@@ -119,9 +119,9 @@ int hevc_decoder_get_drained_frame(HEVCDecoder* dec, int index, HEVCFrame* frame
     int c_offset = (pic->conf_win_top / sub_h) * pic->stride[1] +
                    (pic->conf_win_left / sub_w);
 
-    frame->y  = pic->planes[0].data() + y_offset;
-    frame->cb = pic->planes[1].data() + c_offset;
-    frame->cr = pic->planes[2].data() + c_offset;
+    frame->y  = pic->plane_ptr<uint16_t>(0) + y_offset;
+    frame->cb = pic->plane_ptr<uint16_t>(1) + c_offset;
+    frame->cr = pic->plane_ptr<uint16_t>(2) + c_offset;
     frame->width = crop_w;
     frame->height = crop_h;
     frame->stride_y = pic->stride[0];

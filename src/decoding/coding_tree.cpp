@@ -792,7 +792,7 @@ void decode_coding_unit(DecodingContext& ctx, int x0, int y0, int log2CbSize) {
                 mi.mv[0], mi.mv[1], mi.ref_idx[0], mi.ref_idx[1],
                 mi.pred_flag[0], mi.pred_flag[1], pred);
             {
-                uint16_t* dst = ctx.pic->planes[0].data();
+                uint16_t* dst = ctx.pic->plane_ptr<uint16_t>(0);
                 int dstStride = ctx.pic->stride[0];
                 for (int y = 0; y < cbSize; y++) {
                     uint16_t* row = dst + (y0 + y) * dstStride + x0;
@@ -809,7 +809,7 @@ void decode_coding_unit(DecodingContext& ctx, int x0, int y0, int log2CbSize) {
                     perform_inter_prediction(ctx, x0, y0, cbSize, cbSize, c,
                         mi.mv[0], mi.mv[1], mi.ref_idx[0], mi.ref_idx[1],
                         mi.pred_flag[0], mi.pred_flag[1], cpred);
-                    uint16_t* dst = ctx.pic->planes[c].data();
+                    uint16_t* dst = ctx.pic->plane_ptr<uint16_t>(c);
                     int dstStride = ctx.pic->stride[c];
                     for (int y = 0; y < cH; y++) {
                         uint16_t* row = dst + (yC + y) * dstStride + xC;
@@ -890,7 +890,7 @@ void decode_coding_unit(DecodingContext& ctx, int x0, int y0, int log2CbSize) {
                         mi.mv[0], mi.mv[1], mi.ref_idx[0], mi.ref_idx[1],
                         mi.pred_flag[0], mi.pred_flag[1], pred);
                     {
-                        uint16_t* dst = ctx.pic->planes[0].data();
+                        uint16_t* dst = ctx.pic->plane_ptr<uint16_t>(0);
                         int dstStride = ctx.pic->stride[0];
                         for (int y = 0; y < nPbH; y++) {
                             uint16_t* row = dst + (yPb + y) * dstStride + xPb;
@@ -911,7 +911,7 @@ void decode_coding_unit(DecodingContext& ctx, int x0, int y0, int log2CbSize) {
                         perform_inter_prediction(ctx, xPb, yPb, nPbW, nPbH, c,
                             mi.mv[0], mi.mv[1], mi.ref_idx[0], mi.ref_idx[1],
                             mi.pred_flag[0], mi.pred_flag[1], pred);
-                        uint16_t* dst = ctx.pic->planes[c].data();
+                        uint16_t* dst = ctx.pic->plane_ptr<uint16_t>(c);
                         int dstStride = ctx.pic->stride[c];
                         for (int y = 0; y < cH; y++) {
                             uint16_t* row = dst + (yC + y) * dstStride + xC;

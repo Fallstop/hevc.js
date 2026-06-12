@@ -623,11 +623,11 @@ void apply_deblocking(DecodingContext& ctx) {
     }
 
     // Pre-compute plane pointers and strides for direct access
-    uint16_t* lumaPlane = pic->planes[0].data();
+    uint16_t* lumaPlane = pic->plane_ptr<uint16_t>(0);
     int lumaStride = pic->stride[0];
     uint16_t* chromaPlane[3] = { nullptr,
-                                  pic->planes[1].data(),
-                                  pic->planes[2].data() };
+                                  pic->plane_ptr<uint16_t>(1),
+                                  pic->plane_ptr<uint16_t>(2) };
     int chromaStride[3] = { 0, pic->stride[1], pic->stride[2] };
 
     // §8.7.2.1: Process vertical edges first, then horizontal

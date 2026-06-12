@@ -10,11 +10,14 @@ namespace hevc {
 // Picture buffer — planar YUV layout (AD-002)
 // Spec ref: §6.1 (source, coded, decoded picture formats)
 struct Picture {
-    // Plane data
-    std::vector<uint16_t> planes[3];  // 0=Y, 1=Cb, 2=Cr
+    // Plane data — raw byte storage so 8-bit content can be held 1 byte/sample
+    // (uint8) and >8-bit as 2 bytes/sample (uint16). Always access through the
+    // typed plane_ptr<S>() / sample<S>() accessors; bytes_per_sample selects S.
+    std::vector<uint8_t> plane_bytes[3];  // 0=Y, 1=Cb, 2=Cr (raw bytes)
     int width[3]  = {};               // width per plane (in samples)
     int height[3] = {};               // height per plane (in samples)
     int stride[3] = {};               // stride per plane (in samples)
+    int bytes_per_sample = 2;         // 1 = uint8 (8-bit native), 2 = uint16
 
     // Picture properties
     int pic_width_in_luma = 0;
@@ -58,13 +61,29 @@ struct Picture {
     // Allocate planes based on dimensions and chroma format
     void allocate(int width, int height, ChromaFormat fmt, int bd_luma, int bd_chroma);
 
-    // Get sample at position (x, y) in plane c
-    uint16_t& sample(int c, int x, int y) {
-        return planes[c][y * stride[c] + x];
+    // Typed plane pointer (reinterprets the byte storage as S samples).
+    template<class S> S* plane_ptr(int c) {
+        return reinterpret_cast<S*>(plane_bytes[c].data());
     }
-    uint16_t sample(int c, int x, int y) const {
-        return planes[c][y * stride[c] + x];
+    template<class S> const S* plane_ptr(int c) const {
+        return reinterpret_cast<const S*>(plane_bytes[c].data());
     }
+    // Number of samples in plane c.
+    size_t plane_samples(int c) const {
+        return bytes_per_sample ? plane_bytes[c].size() / bytes_per_sample : 0;
+    }
+
+    // Get sample at position (x, y) in plane c.
+    template<class S> S& sample(int c, int x, int y) {
+        return plane_ptr<S>(c)[y * stride[c] + x];
+    }
+    template<class S> S sample(int c, int x, int y) const {
+        return plane_ptr<S>(c)[y * stride[c] + x];
+    }
+    // Non-templated convenience for the uint16 storage path (bytes_per_sample==2);
+    // pixel kernels that must handle uint8 storage use the templated form.
+    uint16_t& sample(int c, int x, int y) { return sample<uint16_t>(c, x, y); }
+    uint16_t sample(int c, int x, int y) const { return sample<uint16_t>(c, x, y); }
 
     // Write to raw YUV file (crops to conformance window if set)
     bool write_yuv(const char* path) const;

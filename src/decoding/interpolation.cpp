@@ -126,7 +126,7 @@ static void interpolate_luma(const Picture& refPic,
     int picW = refPic.width[0];
     int picH = refPic.height[0];
     int stride0 = refPic.stride[0];
-    const uint16_t* plane0 = refPic.planes[0].data();
+    const uint16_t* plane0 = refPic.plane_ptr<uint16_t>(0);
 
     // Safe clamped access — used for edge PUs
     auto refClamp = [&](int x, int y) -> int {
@@ -235,7 +235,7 @@ static void interpolate_chroma(const Picture& refPic, int cIdx,
     int picW = refPic.width[cIdx];
     int picH = refPic.height[cIdx];
     int strideC = refPic.stride[cIdx];
-    const uint16_t* planeC = refPic.planes[cIdx].data();
+    const uint16_t* planeC = refPic.plane_ptr<uint16_t>(cIdx);
 
     auto refClamp = [&](int x, int y) -> int {
         x = std::max(0, std::min(x, picW - 1));

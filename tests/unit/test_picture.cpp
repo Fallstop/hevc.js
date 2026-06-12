@@ -12,14 +12,14 @@ TEST(Picture, Allocate420) {
     EXPECT_EQ(pic.width[0], 64);
     EXPECT_EQ(pic.height[0], 64);
     EXPECT_EQ(pic.stride[0], 64);
-    EXPECT_EQ(pic.planes[0].size(), 64u * 64);
+    EXPECT_EQ(pic.plane_samples(0), 64u * 64);
 
     // Chroma is half in both dimensions for 4:2:0
     EXPECT_EQ(pic.width[1], 32);
     EXPECT_EQ(pic.height[1], 32);
     EXPECT_EQ(pic.stride[1], 32);
-    EXPECT_EQ(pic.planes[1].size(), 32u * 32);
-    EXPECT_EQ(pic.planes[2].size(), 32u * 32);
+    EXPECT_EQ(pic.plane_samples(1), 32u * 32);
+    EXPECT_EQ(pic.plane_samples(2), 32u * 32);
 }
 
 TEST(Picture, Allocate422) {
@@ -42,9 +42,9 @@ TEST(Picture, AllocateMonochrome) {
     Picture pic;
     pic.allocate(64, 64, ChromaFormat::MONOCHROME, 8, 8);
 
-    EXPECT_EQ(pic.planes[0].size(), 64u * 64);
-    EXPECT_TRUE(pic.planes[1].empty());
-    EXPECT_TRUE(pic.planes[2].empty());
+    EXPECT_EQ(pic.plane_samples(0), 64u * 64);
+    EXPECT_TRUE((pic.plane_samples(1) == 0));
+    EXPECT_TRUE((pic.plane_samples(2) == 0));
 }
 
 TEST(Picture, SampleAccess) {
@@ -63,8 +63,10 @@ TEST(Picture, ZeroInitialized) {
     pic.allocate(16, 16, ChromaFormat::YUV420, 8, 8);
 
     for (int c = 0; c < 3; c++) {
-        for (auto val : pic.planes[c]) {
-            EXPECT_EQ(val, 0);
+        const uint16_t* p = pic.plane_ptr<uint16_t>(c);
+        size_t n = pic.plane_samples(c);
+        for (size_t i = 0; i < n; i++) {
+            EXPECT_EQ(p[i], 0);
         }
     }
 }

@@ -30,11 +30,17 @@ void Picture::allocate(int w, int h, ChromaFormat fmt, int bd_luma, int bd_chrom
         stride[1] = stride[2] = w / sub_w;
     }
 
+    // Storage width per sample. Increment 1 keeps uint16 (2 bytes) for every
+    // bit depth so the byte-buffer seam is provably output-neutral; the 8-bit
+    // flip to bytes_per_sample==1 lands in a later step.
+    bytes_per_sample = 2;
+
     for (int c = 0; c < 3; c++) {
         if (width[c] > 0 && height[c] > 0) {
-            planes[c].resize(static_cast<size_t>(stride[c]) * height[c], 0);
+            plane_bytes[c].assign(
+                static_cast<size_t>(stride[c]) * height[c] * bytes_per_sample, 0);
         } else {
-            planes[c].clear();
+            plane_bytes[c].clear();
         }
     }
 }
@@ -70,7 +76,7 @@ bool Picture::write_yuv(const char* path) const {
         }
 
         for (int y = crop_top[c]; y < crop_top[c] + out_height; y++) {
-            const uint16_t* row = &planes[c][y * stride[c]];
+            const uint16_t* row = plane_ptr<uint16_t>(c) + y * stride[c];
 
             if (bd[c] <= 8) {
                 // Write as 8-bit: convert row to uint8_t buffer, write once
