@@ -368,7 +368,8 @@ static int derive_qp_y(DecodingContext& ctx, int xCb, int yCb) {
 // Reconstruction: pred + residual, clipping (§8.6.5)
 // ============================================================
 
-static void reconstruct_block(DecodingContext& ctx, int x0, int y0,
+template<typename Sample>
+static void reconstruct_block_impl(DecodingContext& ctx, int x0, int y0,
                                int log2Size, int cIdx,
                                const int16_t* pred, const int16_t* residual) {
     int size = 1 << log2Size;
@@ -386,13 +387,73 @@ static void reconstruct_block(DecodingContext& ctx, int x0, int y0,
                ctx.sps->pic_height_in_luma_samples / ctx.sps->SubHeightC;
 
     for (int j = 0; j < size; j++) {
+        if (yC + j >= picH) continue;
+        Sample* dstRow = pic.plane_ptr<Sample>(cIdx) + (yC + j) * pic.stride[cIdx];
         for (int i = 0; i < size; i++) {
-            if (xC + i >= picW || yC + j >= picH) continue;
+            if (xC + i >= picW) continue;
             int val = pred[j * size + i] + residual[j * size + i];
             val = Clip3(0, maxVal, val);
-            pic.sample(cIdx, xC + i, yC + j) = static_cast<uint16_t>(val);
+            dstRow[xC + i] = static_cast<Sample>(val);
         }
     }
+}
+
+// Dispatch on plane storage width (uint8 native for 8-bit, uint16 otherwise).
+static void reconstruct_block(DecodingContext& ctx, int x0, int y0,
+                              int log2Size, int cIdx,
+                              const int16_t* pred, const int16_t* residual) {
+    if (ctx.pic->bytes_per_sample == 1)
+        reconstruct_block_impl<uint8_t>(ctx, x0, y0, log2Size, cIdx, pred, residual);
+    else
+        reconstruct_block_impl<uint16_t>(ctx, x0, y0, log2Size, cIdx, pred, residual);
+}
+
+// Copy a w x h prediction block (already clipped int16) into plane cIdx at
+// (xC,yC) — no clip, matching the residual-free inter-prediction store path.
+template<typename Sample>
+static void store_pred_block_impl(Picture& pic, int cIdx, int xC, int yC,
+                                  int w, int h, const int16_t* src) {
+    Sample* dst = pic.plane_ptr<Sample>(cIdx);
+    int st = pic.stride[cIdx];
+    for (int y = 0; y < h; y++) {
+        Sample* row = dst + (yC + y) * st + xC;
+        const int16_t* s = src + y * w;
+        for (int x = 0; x < w; x++) row[x] = static_cast<Sample>(s[x]);
+    }
+}
+static void store_pred_block(Picture& pic, int cIdx, int xC, int yC,
+                             int w, int h, const int16_t* src) {
+    if (pic.bytes_per_sample == 1)
+        store_pred_block_impl<uint8_t>(pic, cIdx, xC, yC, w, h, src);
+    else
+        store_pred_block_impl<uint16_t>(pic, cIdx, xC, yC, w, h, src);
+}
+
+// Single-sample store dispatched on plane width (cold paths, e.g. PCM).
+static inline void put_sample(Picture& pic, int c, int x, int y, int val) {
+    if (pic.bytes_per_sample == 1) pic.sample<uint8_t>(c, x, y) = static_cast<uint8_t>(val);
+    else pic.sample<uint16_t>(c, x, y) = static_cast<uint16_t>(val);
+}
+
+// Read a w x h block from plane cIdx at (xC,yC) into an int16 buffer — used to
+// read PU-level inter prediction back from the picture before adding residual.
+template<typename Sample>
+static void load_block_impl(const Picture& pic, int cIdx, int xC, int yC,
+                            int w, int h, int16_t* dst) {
+    const Sample* src = pic.plane_ptr<Sample>(cIdx);
+    int st = pic.stride[cIdx];
+    for (int y = 0; y < h; y++) {
+        const Sample* row = src + (yC + y) * st + xC;
+        int16_t* d = dst + y * w;
+        for (int x = 0; x < w; x++) d[x] = static_cast<int16_t>(row[x]);
+    }
+}
+static void load_block(const Picture& pic, int cIdx, int xC, int yC,
+                       int w, int h, int16_t* dst) {
+    if (pic.bytes_per_sample == 1)
+        load_block_impl<uint8_t>(pic, cIdx, xC, yC, w, h, dst);
+    else
+        load_block_impl<uint16_t>(pic, cIdx, xC, yC, w, h, dst);
 }
 
 // ============================================================
@@ -791,16 +852,7 @@ void decode_coding_unit(DecodingContext& ctx, int x0, int y0, int log2CbSize) {
             perform_inter_prediction(ctx, x0, y0, cbSize, cbSize, 0,
                 mi.mv[0], mi.mv[1], mi.ref_idx[0], mi.ref_idx[1],
                 mi.pred_flag[0], mi.pred_flag[1], pred);
-            {
-                uint16_t* dst = ctx.pic->plane_ptr<uint16_t>(0);
-                int dstStride = ctx.pic->stride[0];
-                for (int y = 0; y < cbSize; y++) {
-                    uint16_t* row = dst + (y0 + y) * dstStride + x0;
-                    const int16_t* src = pred + y * cbSize;
-                    for (int x = 0; x < cbSize; x++)
-                        row[x] = static_cast<uint16_t>(src[x]);
-                }
-            }
+            store_pred_block(*ctx.pic, 0, x0, y0, cbSize, cbSize, pred);
             if (sps.ChromaArrayType != 0) {
                 int cW = cbSize / sps.SubWidthC, cH = cbSize / sps.SubHeightC;
                 int xC = x0 / sps.SubWidthC, yC = y0 / sps.SubHeightC;
@@ -809,14 +861,7 @@ void decode_coding_unit(DecodingContext& ctx, int x0, int y0, int log2CbSize) {
                     perform_inter_prediction(ctx, x0, y0, cbSize, cbSize, c,
                         mi.mv[0], mi.mv[1], mi.ref_idx[0], mi.ref_idx[1],
                         mi.pred_flag[0], mi.pred_flag[1], cpred);
-                    uint16_t* dst = ctx.pic->plane_ptr<uint16_t>(c);
-                    int dstStride = ctx.pic->stride[c];
-                    for (int y = 0; y < cH; y++) {
-                        uint16_t* row = dst + (yC + y) * dstStride + xC;
-                        const int16_t* src = cpred + y * cW;
-                        for (int x = 0; x < cW; x++)
-                            row[x] = static_cast<uint16_t>(src[x]);
-                    }
+                    store_pred_block(*ctx.pic, c, xC, yC, cW, cH, cpred);
                 }
             }
         }
@@ -889,16 +934,7 @@ void decode_coding_unit(DecodingContext& ctx, int x0, int y0, int log2CbSize) {
                     perform_inter_prediction(ctx, xPb, yPb, nPbW, nPbH, 0,
                         mi.mv[0], mi.mv[1], mi.ref_idx[0], mi.ref_idx[1],
                         mi.pred_flag[0], mi.pred_flag[1], pred);
-                    {
-                        uint16_t* dst = ctx.pic->plane_ptr<uint16_t>(0);
-                        int dstStride = ctx.pic->stride[0];
-                        for (int y = 0; y < nPbH; y++) {
-                            uint16_t* row = dst + (yPb + y) * dstStride + xPb;
-                            const int16_t* src = pred + y * nPbW;
-                            for (int x = 0; x < nPbW; x++)
-                                row[x] = static_cast<uint16_t>(src[x]);
-                        }
-                    }
+                    store_pred_block(*ctx.pic, 0, xPb, yPb, nPbW, nPbH, pred);
                 }
                 // Chroma (4:2:0)
                 if (sps.ChromaArrayType != 0) {
@@ -911,14 +947,7 @@ void decode_coding_unit(DecodingContext& ctx, int x0, int y0, int log2CbSize) {
                         perform_inter_prediction(ctx, xPb, yPb, nPbW, nPbH, c,
                             mi.mv[0], mi.mv[1], mi.ref_idx[0], mi.ref_idx[1],
                             mi.pred_flag[0], mi.pred_flag[1], pred);
-                        uint16_t* dst = ctx.pic->plane_ptr<uint16_t>(c);
-                        int dstStride = ctx.pic->stride[c];
-                        for (int y = 0; y < cH; y++) {
-                            uint16_t* row = dst + (yC + y) * dstStride + xC;
-                            const int16_t* src = pred + y * cW;
-                            for (int x = 0; x < cW; x++)
-                                row[x] = static_cast<uint16_t>(src[x]);
-                        }
+                        store_pred_block(*ctx.pic, c, xC, yC, cW, cH, pred);
                     }
                 }
             };
@@ -1316,10 +1345,7 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
                                      pred_samples);
         } else {
             // Inter: pred already in picture from PU-level MC, read it back
-            for (int y = 0; y < trSize; y++)
-                for (int x = 0; x < trSize; x++)
-                    pred_samples[y * trSize + x] = static_cast<int16_t>(
-                        ctx.pic->sample(0, x0 + x, y0 + y));
+            load_block(*ctx.pic, 0, x0, y0, trSize, trSize, pred_samples);
         }
 
         // Reconstruct
@@ -1402,10 +1428,7 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
                         // Inter: pred already written by PU-level MC
                         int xCC = xC / sps.SubWidthC;
                         int yCC = yC / sps.SubHeightC;
-                        for (int y = 0; y < trSizeC; y++)
-                            for (int x = 0; x < trSizeC; x++)
-                                pred_samples[y * trSizeC + x] = static_cast<int16_t>(
-                                    ctx.pic->sample(cIdx, xCC + x, yCC + y));
+                        load_block(*ctx.pic, cIdx, xCC, yCC, trSizeC, trSizeC, pred_samples);
                     }
 
                     reconstruct_block(ctx, xC, yC, log2TrafoSizeC, cIdx,
@@ -1445,8 +1468,8 @@ void decode_pcm_samples(DecodingContext& ctx, int x0, int y0, int log2CbSize) {
     for (int i = 0; i < numLumaSamples; i++) {
         int y = i / cbSize;
         int x = i % cbSize;
-        uint16_t val = static_cast<uint16_t>(bs->read_bits(lumaBits));
-        ctx.pic->sample(0, x0 + x, y0 + y) = val;
+        int val = static_cast<int>(bs->read_bits(lumaBits));
+        put_sample(*ctx.pic, 0, x0 + x, y0 + y, val);
     }
 
     // Read chroma samples
@@ -1462,8 +1485,8 @@ void decode_pcm_samples(DecodingContext& ctx, int x0, int y0, int log2CbSize) {
             for (int i = 0; i < numChromaSamples; i++) {
                 int y = i / chromaW;
                 int x = i % chromaW;
-                uint16_t val = static_cast<uint16_t>(bs->read_bits(chromaBits));
-                ctx.pic->sample(cIdx, xC + x, yC + y) = val;
+                int val = static_cast<int>(bs->read_bits(chromaBits));
+                put_sample(*ctx.pic, cIdx, xC + x, yC + y, val);
             }
         }
     }
