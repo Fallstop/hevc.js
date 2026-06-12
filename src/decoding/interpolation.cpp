@@ -115,7 +115,8 @@ static inline void simd_copy_row(const uint16_t* src, int shift, int width, int1
 // Output in extended precision (not clipped to [0, 2^BitDepth-1])
 // ============================================================
 
-static void interpolate_luma(const Picture& refPic,
+template<typename Sample>
+static void interpolate_luma_impl(const Picture& refPic,
                               int xInt, int yInt, int xFrac, int yFrac,
                               int nPbW, int nPbH, int bitDepth,
                               int16_t* pred) {
@@ -126,7 +127,7 @@ static void interpolate_luma(const Picture& refPic,
     int picW = refPic.width[0];
     int picH = refPic.height[0];
     int stride0 = refPic.stride[0];
-    const uint16_t* plane0 = refPic.plane_ptr<uint16_t>(0);
+    const Sample* plane0 = refPic.plane_ptr<Sample>(0);
 
     // Safe clamped access — used for edge PUs
     auto refClamp = [&](int x, int y) -> int {
@@ -185,10 +186,12 @@ static void interpolate_luma(const Picture& refPic,
         } \
     } while(0)
 
+    if constexpr (sizeof(Sample) == 2) {
     if (interior) {
         // Interior fast path: SSE2 separable filter (bit-exact with the scalar
         // clamped path below). The interior margin (-3 / +4) guarantees the 8-wide
-        // loads stay in-bounds.
+        // loads stay in-bounds. uint16 storage only — the loads reinterpret the
+        // plane as int16; the uint8 path uses the scalar branch (SIMD-widen TODO).
         const uint16_t* base = plane0 + yInt * stride0 + xInt;
         if (xFrac == 0 && yFrac == 0) {
             for (int y = 0; y < nPbH; y++)
@@ -217,15 +220,30 @@ static void interpolate_luma(const Picture& refPic,
     } else {
         LUMA_INTERP(refClamp);
     }
+    } else {
+        // uint8 storage: scalar separable filter (correct for any plane width).
+        LUMA_INTERP(refClamp);
+    }
 
     #undef LUMA_INTERP
+}
+
+// Dispatch on reference-plane storage width.
+static void interpolate_luma(const Picture& refPic,
+                             int xInt, int yInt, int xFrac, int yFrac,
+                             int nPbW, int nPbH, int bitDepth, int16_t* pred) {
+    if (refPic.bytes_per_sample == 1)
+        interpolate_luma_impl<uint8_t>(refPic, xInt, yInt, xFrac, yFrac, nPbW, nPbH, bitDepth, pred);
+    else
+        interpolate_luma_impl<uint16_t>(refPic, xInt, yInt, xFrac, yFrac, nPbW, nPbH, bitDepth, pred);
 }
 
 // ============================================================
 // Chroma interpolation — §8.5.3.3.3 (chroma part)
 // ============================================================
 
-static void interpolate_chroma(const Picture& refPic, int cIdx,
+template<typename Sample>
+static void interpolate_chroma_impl(const Picture& refPic, int cIdx,
                                 int xInt, int yInt, int xFrac, int yFrac,
                                 int nPbWC, int nPbHC, int bitDepth,
                                 int16_t* pred) {
@@ -235,7 +253,7 @@ static void interpolate_chroma(const Picture& refPic, int cIdx,
     int picW = refPic.width[cIdx];
     int picH = refPic.height[cIdx];
     int strideC = refPic.stride[cIdx];
-    const uint16_t* planeC = refPic.plane_ptr<uint16_t>(cIdx);
+    const Sample* planeC = refPic.plane_ptr<Sample>(cIdx);
 
     auto refClamp = [&](int x, int y) -> int {
         x = std::max(0, std::min(x, picW - 1));
@@ -292,6 +310,7 @@ static void interpolate_chroma(const Picture& refPic, int cIdx,
         } \
     } while(0)
 
+    if constexpr (sizeof(Sample) == 2) {
     if (interior) {
         // Interior fast path: SSE2 separable 4-tap filter (bit-exact). Chroma margin
         // is only -1 / +2, but the 8-wide load needs +6 of headroom past the last
@@ -299,7 +318,7 @@ static void interpolate_chroma(const Picture& refPic, int cIdx,
         // to scalar for the remainder, so for widths < 8 (common in chroma) it runs
         // scalar. For width >= 8, the wide load reaches at most base + nPbWC+2 which
         // the interior test (xInt+nPbWC+2 <= picW) keeps in-bounds; the extra lanes
-        // read are within the same valid row.
+        // read are within the same valid row. uint16 storage only (reinterpret).
         const uint16_t* base = planeC + yInt * strideC + xInt;
         if (xFrac == 0 && yFrac == 0) {
             for (int y = 0; y < nPbHC; y++)
@@ -328,7 +347,21 @@ static void interpolate_chroma(const Picture& refPic, int cIdx,
     } else {
         CHROMA_INTERP(refClamp);
     }
+    } else {
+        // uint8 storage: scalar separable filter.
+        CHROMA_INTERP(refClamp);
+    }
     #undef CHROMA_INTERP
+}
+
+// Dispatch on reference-plane storage width.
+static void interpolate_chroma(const Picture& refPic, int cIdx,
+                               int xInt, int yInt, int xFrac, int yFrac,
+                               int nPbWC, int nPbHC, int bitDepth, int16_t* pred) {
+    if (refPic.bytes_per_sample == 1)
+        interpolate_chroma_impl<uint8_t>(refPic, cIdx, xInt, yInt, xFrac, yFrac, nPbWC, nPbHC, bitDepth, pred);
+    else
+        interpolate_chroma_impl<uint16_t>(refPic, cIdx, xInt, yInt, xFrac, yFrac, nPbWC, nPbHC, bitDepth, pred);
 }
 
 // ============================================================
