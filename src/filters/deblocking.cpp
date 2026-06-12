@@ -9,7 +9,159 @@
 #include <algorithm>
 #include <cstring>
 
+// Portable SSE2 (native x86-64 baseline; emscripten lowers to wasm128 with
+// -msse2). Same single-source strategy as sao.cpp / interpolation.cpp: the
+// native oracle host compiles the exact intrinsics that ship to WASM, so the
+// MD5/SHA gate verifies the vector path bit-for-bit.
+#if defined(__SSE2__)
+  #define HEVC_SIMD_DEBLOCK 1
+  #include <emmintrin.h>
+#endif
+
 namespace hevc {
+
+#ifdef HEVC_SIMD_DEBLOCK
+// All deblocking sample math is int32 (matches the scalar `int` arithmetic
+// exactly). 4 lanes = the 4 lines of a horizontal-edge segment, so a vertical
+// run of one perpendicular sample position loads/stores as 4 contiguous pixels.
+static inline __m128i dbk_min_epi32(__m128i a, __m128i b) {
+    __m128i g = _mm_cmpgt_epi32(a, b);                 // a>b
+    return _mm_or_si128(_mm_and_si128(g, b), _mm_andnot_si128(g, a));
+}
+static inline __m128i dbk_max_epi32(__m128i a, __m128i b) {
+    __m128i g = _mm_cmpgt_epi32(a, b);                 // a>b
+    return _mm_or_si128(_mm_and_si128(g, a), _mm_andnot_si128(g, b));
+}
+static inline __m128i dbk_clip3(__m128i lo, __m128i hi, __m128i x) {
+    return dbk_max_epi32(lo, dbk_min_epi32(hi, x));
+}
+static inline __m128i dbk_abs(__m128i x) {
+    __m128i s = _mm_srai_epi32(x, 31);
+    return _mm_sub_epi32(_mm_xor_si128(x, s), s);
+}
+// mask ? a : b  (mask lanes are all-ones / all-zero)
+static inline __m128i dbk_sel(__m128i mask, __m128i a, __m128i b) {
+    return _mm_or_si128(_mm_and_si128(mask, a), _mm_andnot_si128(mask, b));
+}
+// load 4 contiguous uint16 (one perpendicular position across the 4 lines)
+static inline __m128i dbk_load4(const uint16_t* p) {
+    __m128i v = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+    return _mm_unpacklo_epi16(v, _mm_setzero_si128());
+}
+// store 4 int32 lanes as uint16 (all in [0,maxVal] < 32768, so the signed
+// pack is an exact narrowing — same trick as the interpolation kernels).
+static inline void dbk_store4(uint16_t* p, __m128i v) {
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(p), _mm_packs_epi32(v, v));
+}
+
+// Filter the four lines of one HORIZONTAL-edge luma segment in parallel.
+// Edge at row yQ, columns xQ..xQ+3 (= the 4 lanes); p samples are the rows
+// above (yQ-1..yQ-4), q samples the rows at/below (yQ..yQ+3). dE/dEp/dEq/tC and
+// the decision were already derived scalar from lines 0 and 3 — identical to
+// the per-line path. Bit-exact transcription of filter_luma_sample, 4-wide.
+static inline void deblock_luma_hor_simd(
+        uint16_t* lumaPlane, int lumaStride, int xQ, int yQ,
+        int dE, int dEp, int dEq, int tC, int bitDepthY,
+        bool writeP, bool writeQ) {
+    uint16_t* q0r = lumaPlane + yQ * lumaStride + xQ;
+    __m128i p0 = dbk_load4(q0r - 1 * lumaStride);
+    __m128i p1 = dbk_load4(q0r - 2 * lumaStride);
+    __m128i p2 = dbk_load4(q0r - 3 * lumaStride);
+    __m128i q0 = dbk_load4(q0r);
+    __m128i q1 = dbk_load4(q0r + 1 * lumaStride);
+    __m128i q2 = dbk_load4(q0r + 2 * lumaStride);
+
+    const __m128i v2   = _mm_set1_epi32(2);
+    const __m128i v4   = _mm_set1_epi32(4);
+    uint16_t* pP1 = lumaPlane + (yQ - 2) * lumaStride + xQ;
+    uint16_t* pP0 = lumaPlane + (yQ - 1) * lumaStride + xQ;
+
+    if (dE == 2) {
+        __m128i p3 = dbk_load4(q0r - 4 * lumaStride);
+        __m128i q3 = dbk_load4(q0r + 3 * lumaStride);
+        __m128i tc2 = _mm_set1_epi32(2 * tC);
+        // p0' = (p2 + 2(p1+p0+q0) + q1 + 4) >> 3, clipped to p0 ± 2tC
+        __m128i np0 = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(p2, q1),
+                          _mm_add_epi32(_mm_slli_epi32(_mm_add_epi32(_mm_add_epi32(p1, p0), q0), 1), v4)), 3);
+        np0 = dbk_clip3(_mm_sub_epi32(p0, tc2), _mm_add_epi32(p0, tc2), np0);
+        // p1' = (p2 + p1 + p0 + q0 + 2) >> 2
+        __m128i np1 = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(_mm_add_epi32(p2, p1), _mm_add_epi32(p0, q0)), v2), 2);
+        np1 = dbk_clip3(_mm_sub_epi32(p1, tc2), _mm_add_epi32(p1, tc2), np1);
+        // p2' = (2p3 + 3p2 + p1 + p0 + q0 + 4) >> 3
+        __m128i np2 = _mm_srai_epi32(_mm_add_epi32(
+                          _mm_add_epi32(_mm_slli_epi32(p3, 1), _mm_add_epi32(_mm_add_epi32(p2, _mm_slli_epi32(p2, 1)), p1)),
+                          _mm_add_epi32(_mm_add_epi32(p0, q0), v4)), 3);
+        np2 = dbk_clip3(_mm_sub_epi32(p2, tc2), _mm_add_epi32(p2, tc2), np2);
+        // q0' = (p1 + 2(p0+q0+q1) + q2 + 4) >> 3
+        __m128i nq0 = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(p1, q2),
+                          _mm_add_epi32(_mm_slli_epi32(_mm_add_epi32(_mm_add_epi32(p0, q0), q1), 1), v4)), 3);
+        nq0 = dbk_clip3(_mm_sub_epi32(q0, tc2), _mm_add_epi32(q0, tc2), nq0);
+        // q1' = (p0 + q0 + q1 + q2 + 2) >> 2
+        __m128i nq1 = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(_mm_add_epi32(p0, q0), _mm_add_epi32(q1, q2)), v2), 2);
+        nq1 = dbk_clip3(_mm_sub_epi32(q1, tc2), _mm_add_epi32(q1, tc2), nq1);
+        // q2' = (p0 + q0 + q1 + 3q2 + 2q3 + 4) >> 3
+        __m128i nq2 = _mm_srai_epi32(_mm_add_epi32(
+                          _mm_add_epi32(_mm_add_epi32(p0, q0), _mm_add_epi32(q1, _mm_add_epi32(q2, _mm_slli_epi32(q2, 1)))),
+                          _mm_add_epi32(_mm_slli_epi32(q3, 1), v4)), 3);
+        nq2 = dbk_clip3(_mm_sub_epi32(q2, tc2), _mm_add_epi32(q2, tc2), nq2);
+
+        if (writeP) {
+            dbk_store4(pP0, np0);
+            dbk_store4(pP1, np1);
+            dbk_store4(lumaPlane + (yQ - 3) * lumaStride + xQ, np2);
+        }
+        if (writeQ) {
+            dbk_store4(q0r, nq0);
+            dbk_store4(q0r + 1 * lumaStride, nq1);
+            dbk_store4(q0r + 2 * lumaStride, nq2);
+        }
+        return;
+    }
+
+    // Weak filter (dE == 1). delta = (9(q0-p0) - 3(q1-p1) + 8) >> 4
+    const __m128i vmax = _mm_set1_epi32((1 << bitDepthY) - 1);
+    const __m128i vzero = _mm_setzero_si128();
+    __m128i vtC = _mm_set1_epi32(tC);
+    __m128i t = _mm_sub_epi32(q0, p0);                 // q0-p0
+    __m128i s = _mm_sub_epi32(q1, p1);                 // q1-p1
+    __m128i num = _mm_add_epi32(
+        _mm_sub_epi32(_mm_add_epi32(_mm_slli_epi32(t, 3), t),       // 9t
+                      _mm_add_epi32(_mm_slli_epi32(s, 1), s)),      // 3s
+        _mm_set1_epi32(8));
+    __m128i delta = _mm_srai_epi32(num, 4);
+    // mask: |delta| < tC*10  (per line)
+    __m128i mask = _mm_cmpgt_epi32(_mm_set1_epi32(tC * 10), dbk_abs(delta));
+    __m128i dc = dbk_clip3(_mm_sub_epi32(vzero, vtC), vtC, delta);  // Clip3(-tC,tC,delta)
+
+    __m128i np0 = dbk_sel(mask, dbk_clip3(vzero, vmax, _mm_add_epi32(p0, dc)), p0);
+    __m128i nq0 = dbk_sel(mask, dbk_clip3(vzero, vmax, _mm_sub_epi32(q0, dc)), q0);
+
+    if (writeP) {
+        dbk_store4(pP0, np0);
+        if (dEp == 1) {
+            __m128i tch = _mm_set1_epi32(tC >> 1);
+            // deltaP = Clip3(-tC/2, tC/2, (((p2+p0+1)>>1) - p1 + delta) >> 1)
+            __m128i dP = _mm_srai_epi32(_mm_add_epi32(
+                _mm_sub_epi32(_mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(p2, p0), _mm_set1_epi32(1)), 1), p1), dc), 1);
+            dP = dbk_clip3(_mm_sub_epi32(vzero, tch), tch, dP);
+            __m128i np1 = dbk_sel(mask, dbk_clip3(vzero, vmax, _mm_add_epi32(p1, dP)), p1);
+            dbk_store4(pP1, np1);
+        }
+    }
+    if (writeQ) {
+        dbk_store4(q0r, nq0);
+        if (dEq == 1) {
+            __m128i tch = _mm_set1_epi32(tC >> 1);
+            // deltaQ = Clip3(-tC/2, tC/2, (((q2+q0+1)>>1) - q1 - delta) >> 1)
+            __m128i dQ = _mm_srai_epi32(_mm_sub_epi32(
+                _mm_sub_epi32(_mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(q2, q0), _mm_set1_epi32(1)), 1), q1), dc), 1);
+            dQ = dbk_clip3(_mm_sub_epi32(vzero, tch), tch, dQ);
+            __m128i nq1 = dbk_sel(mask, dbk_clip3(vzero, vmax, _mm_add_epi32(q1, dQ)), q1);
+            dbk_store4(q0r + 1 * lumaStride, nq1);
+        }
+    }
+}
+#endif // HEVC_SIMD_DEBLOCK
 
 // Table 8-12: beta' and tC' from Q
 // Spec §8.7.2.5.3
@@ -352,6 +504,79 @@ static void filter_chroma_sample(int p[2], int q[2], int tC, int bitDepth,
 }
 
 // ============================================================
+// Luma edge filter — §8.7.2.5.3/5.4
+// Decides strong/weak from lines 0 and 3, then filters all four lines.
+// EDGE_HOR (the 4 lines are contiguous columns) takes a 4-wide SSE2/wasm128
+// path that loads/stores each perpendicular sample position as one 4-pixel
+// run; EDGE_VER (already a hoisted contiguous-row scalar load) stays scalar.
+// Bit-exact with the per-line transcription.
+// ============================================================
+static inline void deblock_luma_edge(
+        uint16_t* lumaPlane, int lumaStride,
+        int xQ, int yQ, EdgeType edgeType,
+        int beta, int tC, int bitDepthY,
+        bool pcmP, bool pcmQ, bool bypassP, bool bypassQ,
+        bool pcmFilterDisabled) {
+    // Decision needs p0..p3 / q0..q3 for lines 0 and 3 only (§8.7.2.5.3).
+    int pSamp[4][2], qSamp[4][2]; // [i][kk], kk=0->line0, kk=1->line3
+    for (int kk = 0; kk < 2; kk++) {
+        int k = kk * 3;
+        if (edgeType == EDGE_VER) {
+            const uint16_t* row = lumaPlane + (yQ + k) * lumaStride + xQ;
+            for (int i = 0; i < 4; i++) { qSamp[i][kk] = row[i]; pSamp[i][kk] = row[-i - 1]; }
+        } else {
+            for (int i = 0; i < 4; i++) {
+                qSamp[i][kk] = lumaPlane[(yQ + i) * lumaStride + xQ + k];
+                pSamp[i][kk] = lumaPlane[(yQ - i - 1) * lumaStride + xQ + k];
+            }
+        }
+    }
+
+    int dp0 = std::abs(pSamp[2][0] - 2*pSamp[1][0] + pSamp[0][0]);
+    int dp3 = std::abs(pSamp[2][1] - 2*pSamp[1][1] + pSamp[0][1]);
+    int dq0 = std::abs(qSamp[2][0] - 2*qSamp[1][0] + qSamp[0][0]);
+    int dq3 = std::abs(qSamp[2][1] - 2*qSamp[1][1] + qSamp[0][1]);
+    int dpq0 = dp0 + dq0, dpq3 = dp3 + dq3;
+    int dp = dp0 + dp3, dq = dq0 + dq3, d = dpq0 + dpq3;
+
+    int dE = 0, dEp = 0, dEq = 0;
+    if (d < beta) {
+        int dSam0 = decision_luma_sample(pSamp[0][0], pSamp[3][0], qSamp[0][0], qSamp[3][0], 2*dpq0, beta, tC);
+        int dSam3 = decision_luma_sample(pSamp[0][1], pSamp[3][1], qSamp[0][1], qSamp[3][1], 2*dpq3, beta, tC);
+        dE = 1;
+        if (dSam0 == 1 && dSam3 == 1) dE = 2;
+        if (dp < ((beta + (beta >> 1)) >> 3)) dEp = 1;
+        if (dq < ((beta + (beta >> 1)) >> 3)) dEq = 1;
+    }
+    if (dE == 0) return;
+
+#ifdef HEVC_SIMD_DEBLOCK
+    if (edgeType == EDGE_HOR) {
+        bool writeP = !((pcmFilterDisabled && pcmP) || bypassP);
+        bool writeQ = !((pcmFilterDisabled && pcmQ) || bypassQ);
+        deblock_luma_hor_simd(lumaPlane, lumaStride, xQ, yQ, dE, dEp, dEq, tC,
+                              bitDepthY, writeP, writeQ);
+        return;
+    }
+#endif
+
+    // EDGE_VER scalar: §8.7.2.5.4, filter all 4 lines (contiguous row loads).
+    for (int k = 0; k < 4; k++) {
+        uint16_t* row = lumaPlane + (yQ + k) * lumaStride + xQ;
+        int pLine[4] = { row[-1], row[-2], row[-3], row[-4] };
+        int qLine[4] = { row[0], row[1], row[2], row[3] };
+        int nDp, nDq;
+        int pOut[3] = { pLine[0], pLine[1], pLine[2] };
+        int qOut[3] = { qLine[0], qLine[1], qLine[2] };
+        filter_luma_sample(pLine, qLine, dE, dEp, dEq, tC, bitDepthY,
+                           pcmP, pcmQ, bypassP, bypassQ, pcmFilterDisabled,
+                           &nDp, &nDq, pOut, qOut);
+        for (int i = 0; i < nDp; i++) row[-1 - i] = static_cast<uint16_t>(pOut[i]);
+        for (int j = 0; j < nDq; j++) row[j]      = static_cast<uint16_t>(qOut[j]);
+    }
+}
+
+// ============================================================
 // Main deblocking entry point — §8.7.2.1
 // ============================================================
 void apply_deblocking(DecodingContext& ctx) {
@@ -443,94 +668,10 @@ void apply_deblocking(DecodingContext& ctx) {
                         int tcPrime = tc_table[Q_tc];
                         int tC = tcPrime * (1 << (bitDepthY - 8)); // eq 8-351
 
-
-                        // Decision process — §8.7.2.5.3
-                        // Read p0..p3 and q0..q3 for lines k=0 and k=3
-                        int pSamp[4][2], qSamp[4][2]; // [i][k] k=0,1 maps to line 0 and 3
-
-                        for (int kk = 0; kk < 2; kk++) {
-                            int k = kk * 3; // k = 0 and 3
-                            if (edgeType == EDGE_VER) {
-                                uint16_t* rowQ = lumaPlane + (yQ + k) * lumaStride;
-                                for (int i = 0; i < 4; i++) {
-                                    qSamp[i][kk] = rowQ[xQ + i];
-                                    pSamp[i][kk] = rowQ[xQ - i - 1];
-                                }
-                            } else {
-                                for (int i = 0; i < 4; i++) {
-                                    qSamp[i][kk] = lumaPlane[(yQ + i) * lumaStride + xQ + k];
-                                    pSamp[i][kk] = lumaPlane[(yQ - i - 1) * lumaStride + xQ + k];
-                                }
-                            }
-                        }
-
-                        // dp, dq, d (eq 8-352 to 8-360 / 8-361 to 8-369)
-                        int dp0 = std::abs(pSamp[2][0] - 2*pSamp[1][0] + pSamp[0][0]);
-                        int dp3 = std::abs(pSamp[2][1] - 2*pSamp[1][1] + pSamp[0][1]);
-                        int dq0 = std::abs(qSamp[2][0] - 2*qSamp[1][0] + qSamp[0][0]);
-                        int dq3 = std::abs(qSamp[2][1] - 2*qSamp[1][1] + qSamp[0][1]);
-                        int dpq0 = dp0 + dq0;
-                        int dpq3 = dp3 + dq3;
-                        int dp = dp0 + dp3;
-                        int dq = dq0 + dq3;
-                        int d = dpq0 + dpq3;
-
-                        int dE = 0, dEp = 0, dEq = 0;
-                        if (d < beta) {
-                            // §8.7.2.5.6 for line 0
-                            int dSam0 = decision_luma_sample(
-                                pSamp[0][0], pSamp[3][0], qSamp[0][0], qSamp[3][0],
-                                2 * dpq0, beta, tC);
-                            // §8.7.2.5.6 for line 3
-                            int dSam3 = decision_luma_sample(
-                                pSamp[0][1], pSamp[3][1], qSamp[0][1], qSamp[3][1],
-                                2 * dpq3, beta, tC);
-
-                            dE = 1;
-                            if (dSam0 == 1 && dSam3 == 1) dE = 2;
-                            if (dp < ((beta + (beta >> 1)) >> 3)) dEp = 1;
-                            if (dq < ((beta + (beta >> 1)) >> 3)) dEq = 1;
-                        }
-
-                        // §8.7.2.5.4: Filter all 4 luma lines (only if dE > 0)
-                        if (dE > 0)
-                        for (int k = 0; k < 4; k++) {
-                            int pLine[4], qLine[4];
-                            if (edgeType == EDGE_VER) {
-                                uint16_t* row = lumaPlane + (yQ + k) * lumaStride;
-                                for (int i = 0; i < 4; i++) {
-                                    qLine[i] = row[xQ + i];
-                                    pLine[i] = row[xQ - i - 1];
-                                }
-                            } else {
-                                for (int i = 0; i < 4; i++) {
-                                    qLine[i] = lumaPlane[(yQ + i) * lumaStride + xQ + k];
-                                    pLine[i] = lumaPlane[(yQ - i - 1) * lumaStride + xQ + k];
-                                }
-                            }
-
-                            int nDp, nDq;
-                            int pOut[3] = {pLine[0], pLine[1], pLine[2]};
-                            int qOut[3] = {qLine[0], qLine[1], qLine[2]};
-                            filter_luma_sample(pLine, qLine, dE, dEp, dEq, tC, bitDepthY,
-                                               pcmP, pcmQ, bypassP, bypassQ,
-                                               pcmFilterDisabled,
-                                               &nDp, &nDq, pOut, qOut);
-
-                            // Write back filtered samples
-                            if (edgeType == EDGE_VER) {
-                                uint16_t* row = lumaPlane + (yQ + k) * lumaStride;
-                                for (int i = 0; i < nDp; i++)
-                                    row[xQ - i - 1] = static_cast<uint16_t>(pOut[i]);
-                                for (int j = 0; j < nDq; j++)
-                                    row[xQ + j] = static_cast<uint16_t>(qOut[j]);
-                            } else {
-                                for (int i = 0; i < nDp; i++)
-                                    lumaPlane[(yQ - i - 1) * lumaStride + xQ + k] = static_cast<uint16_t>(pOut[i]);
-                                for (int j = 0; j < nDq; j++)
-                                    lumaPlane[(yQ + j) * lumaStride + xQ + k] = static_cast<uint16_t>(qOut[j]);
-                            }
-                        }
+                        deblock_luma_edge(lumaPlane, lumaStride, xQ, yQ, edgeType,
+                                          beta, tC, bitDepthY,
+                                          pcmP, pcmQ, bypassP, bypassQ,
+                                          pcmFilterDisabled);
                     }
 
                     // ---- CHROMA ----
