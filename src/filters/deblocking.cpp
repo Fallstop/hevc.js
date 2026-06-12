@@ -200,7 +200,8 @@ enum EdgeType { EDGE_VER = 0, EDGE_HOR = 1 };
 // Returns true if filtering should NOT cross this boundary.
 // ============================================================
 static bool is_boundary_excluded(const DecodingContext& ctx,
-                                  int x, int y, EdgeType edgeType) {
+                                  int x, int y, EdgeType edgeType,
+                                  bool complexBound) {
     auto& sps = *ctx.sps;
     auto& pps = *ctx.pps;
     int picW = sps.pic_width_in_luma_samples;
@@ -211,6 +212,12 @@ static bool is_boundary_excluded(const DecodingContext& ctx,
     if (edgeType == EDGE_HOR && y == 0) return true;
     if (edgeType == EDGE_VER && x >= picW) return true;
     if (edgeType == EDGE_HOR && y >= picH) return true;
+
+    // Fast path: no tiles, single slice, no slice with deblocking or
+    // across-slices disabled → only the picture boundary can exclude an edge,
+    // so skip the per-CTB addr / slice-header / tile / slice-boundary work
+    // (precomputed once per picture in apply_deblocking).
+    if (!complexBound) return false;
 
     // §8.7.2.1: slice_deblocking_filter_disabled_flag for the slice containing Q-side
     int ctbSize = 1 << sps.CtbLog2SizeY;
@@ -274,7 +281,9 @@ static bool is_boundary_excluded(const DecodingContext& ctx,
 // ============================================================
 // Boundary Strength derivation — §8.7.2.4
 // ============================================================
-static int derive_bs(const DecodingContext& ctx, int xP, int yP, int xQ, int yQ) {
+static int derive_bs(const DecodingContext& ctx, int xP, int yP, int xQ, int yQ,
+                     const int32_t* pocL0, int nL0,
+                     const int32_t* pocL1, int nL1) {
     auto& sps = *ctx.sps;
     int picW = sps.pic_width_in_luma_samples;
     int picH = sps.pic_height_in_luma_samples;
@@ -331,18 +340,14 @@ static int derive_bs(const DecodingContext& ctx, int xP, int yP, int xQ, int yQ)
 
     if (nRefP != nRefQ) return 1;
 
-    // Get reference picture POCs for comparison (not index-based, picture-based)
+    // Reference-picture POCs (precomputed once per picture — the spec compares
+    // by picture, not ref index; the per-edge dpb->ref_pic_listX(idx)->poc chase
+    // is a pointer-indirect cache-miss source, so it is hoisted to apply_deblocking).
     auto get_ref_poc = [&](const PUMotionInfo& mi, int list) -> int32_t {
         if (!mi.pred_flag[list] || mi.ref_idx[list] < 0) return -999999;
-        if (list == 0 && mi.ref_idx[0] < ctx.dpb->num_ref_list0()) {
-            auto* rp = ctx.dpb->ref_pic_list0(mi.ref_idx[0]);
-            return rp ? rp->poc : -999999;
-        }
-        if (list == 1 && mi.ref_idx[1] < ctx.dpb->num_ref_list1()) {
-            auto* rp = ctx.dpb->ref_pic_list1(mi.ref_idx[1]);
-            return rp ? rp->poc : -999999;
-        }
-        return -999999;
+        int idx = mi.ref_idx[list];
+        if (list == 0) return (idx < nL0) ? pocL0[idx] : -999999;
+        return (idx < nL1) ? pocL1[idx] : -999999;
     };
 
     if (nRefP == 1) {
@@ -592,6 +597,31 @@ void apply_deblocking(DecodingContext& ctx) {
     int subW = sps.SubWidthC;
     int subH = sps.SubHeightC;
 
+    // Reference-picture POCs, picture-constant — precompute once so derive_bs's
+    // Bs comparison (§8.7.2.4.5) indexes a hot 16-entry array instead of chasing
+    // dpb->ref_pic_listX(idx)->poc (vector + Picture* indirections) per edge.
+    int32_t pocL0[16], pocL1[16];
+    int nL0 = std::min(ctx.dpb->num_ref_list0(), 16);
+    int nL1 = std::min(ctx.dpb->num_ref_list1(), 16);
+    for (int i = 0; i < nL0; i++) { Picture* rp = ctx.dpb->ref_pic_list0(i); pocL0[i] = rp ? rp->poc : -999999; }
+    for (int i = 0; i < nL1; i++) { Picture* rp = ctx.dpb->ref_pic_list1(i); pocL1[i] = rp ? rp->poc : -999999; }
+
+    // Does any edge need the per-CTB tile/slice exclusion logic? For the common
+    // case (no tiles, single slice, deblocking enabled everywhere) only the
+    // picture boundary can exclude an edge, so is_boundary_excluded takes a fast
+    // path. Decide it once here instead of re-deriving per 4-sample segment.
+    bool complexBound = (!pps.loop_filter_across_tiles_enabled_flag && !pps.TileId.empty());
+    if (ctx.slice_headers && ctx.num_slices > 0) {
+        for (int s = 0; s < ctx.num_slices; s++) {
+            const SliceHeader* shp = ctx.slice_headers[s];
+            if (!shp) { complexBound = true; break; }
+            if (shp->slice_deblocking_filter_disabled_flag) complexBound = true;
+            if (ctx.num_slices > 1 && !shp->slice_loop_filter_across_slices_enabled_flag) complexBound = true;
+        }
+    } else if (ctx.sh && ctx.sh->slice_deblocking_filter_disabled_flag) {
+        complexBound = true;
+    }
+
     // Pre-compute plane pointers and strides for direct access
     uint16_t* lumaPlane = pic->planes[0].data();
     int lumaStride = pic->stride[0];
@@ -627,7 +657,7 @@ void apply_deblocking(DecodingContext& ctx) {
                     if (!hasE) continue;
 
                     // Check boundary exclusions
-                    bool excl = is_boundary_excluded(ctx, x, y, edgeType);
+                    bool excl = is_boundary_excluded(ctx, x, y, edgeType, complexBound);
                     if (excl) continue;
 
                     // Derive Bs
@@ -637,7 +667,7 @@ void apply_deblocking(DecodingContext& ctx) {
                     } else {
                         xP = x; yP = y - 1; xQ = x; yQ = y;
                     }
-                    int bS = derive_bs(ctx, xP, yP, xQ, yQ);
+                    int bS = derive_bs(ctx, xP, yP, xQ, yQ, pocL0, nL0, pocL1, nL1);
                     if (bS == 0) continue;
 
                     // Get QP for both sides
