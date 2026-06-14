@@ -331,4 +331,16 @@ std::vector<Picture*> Decoder::output_pictures() {
     return out;
 }
 
+void Decoder::reset(bool clear_parameter_sets) {
+    dpb_.reset();
+    if (clear_parameter_sets) ps_mgr_.reset();
+    cvs_id_ = 0;
+    // The per-picture scratch buffers (cu_info_buf_, intra/chroma/motion,
+    // cbf/log2/edge grids, sao_params_buf_, sao_backup_, slice_idx_buf_) are
+    // intentionally left alone: every one is resize()+fill()'d at the top of
+    // decode_picture(), so they carry no cross-stream meaning and retaining
+    // their capacity is exactly the "reuse the allocated memory" win. The
+    // thread pool is persistent infrastructure and must not be torn down.
+}
+
 } // namespace hevc

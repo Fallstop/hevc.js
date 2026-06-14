@@ -263,8 +263,15 @@ export class SegmentTranscoder {
       this._decoder.feed(nalBuffer);
     }
 
-    // 4. Drain decoded YUV frames (display order)
-    const frames = this._decoder.drain();
+    // 4. Drain decoded YUV frames (display order) as zero-copy heap views.
+    //    SAFETY: drainViews() planes alias the WASM heap and are only valid
+    //    until the next decoder call. The encode loop below is fully
+    //    synchronous (no await) and consumes every view before the first
+    //    `await this._encoder.flush()`, so no concurrent feed/drain/destroy can
+    //    run while the views are live. Do NOT add an await inside the encode
+    //    loop — the batched streaming path, which awaits between batches, uses
+    //    the copying drain() for exactly this reason.
+    const frames = this._decoder.drainViews();
     const tDecodeEnd = performance.now();
     if (frames.length === 0) {
       this.lastPerfStats = null;
@@ -430,7 +437,12 @@ export class SegmentTranscoder {
       this._decoder.feed(nalBuffer);
     }
 
-    // Drain frames in display order
+    // Drain frames in display order as OWNED COPIES (not zero-copy views).
+    // The batched encode loop below awaits encoder.flush()/onChunk() between
+    // batches; a concurrent seek/abort during those awaits can destroy the
+    // decoder or grow the WASM heap, which would invalidate any heap-aliased
+    // view mid-loop. Copies are immune to that. (The synchronous, single-await
+    // processMediaSegment path above uses the zero-copy drainViews() instead.)
     const frames = this._decoder.drain();
     const tDecodeEnd = performance.now();
     if (frames.length === 0) return;

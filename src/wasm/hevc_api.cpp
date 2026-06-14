@@ -145,6 +145,22 @@ int hevc_decoder_flush(HEVCDecoder* dec) {
     }
 }
 
+int hevc_decoder_reset(HEVCDecoder* dec, int clear_parameter_sets) {
+    if (!dec) return HEVC_ERROR;
+
+    try {
+        // Drop the cached frame lists first: they hold raw Picture* into the
+        // DPB pool that decoder.reset() is about to free.
+        dec->output.clear();
+        dec->drained.clear();
+        dec->last_sps = nullptr;
+        dec->decoder.reset(clear_parameter_sets != 0);
+        return HEVC_OK;
+    } catch (...) {
+        return HEVC_ERROR;
+    }
+}
+
 int hevc_decoder_get_info(HEVCDecoder* dec, HEVCStreamInfo* info) {
     if (!dec || !info || dec->output.empty()) return HEVC_ERROR;
 

@@ -85,6 +85,18 @@ int hevc_decoder_get_drained_frame(HEVCDecoder* dec, int index, HEVCFrame* frame
 // After flush, drain to get the remaining frames.
 int hevc_decoder_flush(HEVCDecoder* dec);
 
+// Reset the decoder so the same handle can decode a new, independent stream
+// without destroy()/create(). Drops the DPB and POC state and, when
+// clear_parameter_sets is non-zero, the stored VPS/SPS/PPS. The decoder's
+// internal allocations (thread pool, per-picture scratch) are retained, so
+// this is much cheaper than recreating the instance — use it for seeks/scrubs.
+//
+// Pass clear_parameter_sets=0 only when seeking within a stream whose
+// parameter sets are sent once out-of-band; otherwise pass non-zero.
+// All frame pointers from a prior drain/flush are invalidated by this call.
+// Returns HEVC_OK on success, HEVC_ERROR on failure.
+int hevc_decoder_reset(HEVCDecoder* dec, int clear_parameter_sets);
+
 #ifdef __cplusplus
 }
 #endif

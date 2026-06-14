@@ -43,6 +43,18 @@ public:
     const SPS* active_sps() const { return (active_sps_id_ >= 0) ? get_sps(active_sps_id_) : nullptr; }
     const PPS* active_pps() const { return (active_pps_id_ >= 0) ? get_pps(active_pps_id_) : nullptr; }
 
+    // Forget all stored parameter sets and the active selection. Use when
+    // switching to a stream that supplies its own VPS/SPS/PPS; do NOT call
+    // when seeking within a stream whose parameter sets were sent once,
+    // out-of-band (the next slice would have no active SPS/PPS).
+    void reset() {
+        for (auto& v : vps_) v.reset();
+        for (auto& s : sps_) s.reset();
+        for (auto& p : pps_) p.reset();
+        active_sps_id_ = -1;
+        active_pps_id_ = -1;
+    }
+
 private:
     std::array<std::optional<VPS>, 16> vps_;
     std::array<std::optional<SPS>, 16> sps_;

@@ -563,4 +563,34 @@ Picture* DPB::find_by_poc_lsb(int32_t poc_lsb, int32_t max_poc_lsb) const {
     return nullptr;
 }
 
+void DPB::reset() {
+    // Drop all decoded pictures. These shared_ptrs are the sole owners of the
+    // Picture pixel buffers, so clearing frees that memory; any raw Picture*
+    // handed out by a prior drain()/flush() is invalidated here (callers must
+    // copy out frames they still need before reset).
+    pictures_.clear();
+    current_pic_ = nullptr;
+
+    // §8.3.1 POC carry-over ("prevTid0Pic"). first_picture_ must go back to
+    // true so the first IRAP of the new stream gets NoRaslOutputFlag and a
+    // POC MSB of 0 — leaving these stale corrupts POCs (and therefore
+    // reference selection) silently, with no crash.
+    prev_poc_lsb_ = 0;
+    prev_poc_msb_ = 0;
+    first_picture_ = true;
+
+    // Cached RPS / reference / collocated state holds dangling Picture* into
+    // the pool we just cleared. They are rebuilt per picture, but clearing
+    // matches the freshly-constructed state and removes the dangling hazard.
+    ref_pic_set_st_curr_before_.clear();
+    ref_pic_set_st_curr_after_.clear();
+    ref_pic_set_st_foll_.clear();
+    ref_pic_set_lt_curr_.clear();
+    ref_pic_set_lt_foll_.clear();
+    ref_pic_list0_.clear();
+    ref_pic_list1_.clear();
+    col_pic_ = nullptr;
+    no_backward_pred_flag_ = false;
+}
+
 } // namespace hevc
