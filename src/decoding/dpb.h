@@ -91,6 +91,13 @@ public:
     // §C.5.2.4 step 3 + §C.5.2.2
     void evict_unused();
 
+    // Reset all decode state to a freshly-constructed condition: drops every
+    // stored picture (freeing pixel memory), clears the POC carry-over used by
+    // §8.3.1 (prevTid0Pic) and the first-picture flag, and clears the cached
+    // RPS / reference / collocated state. Reuse the same DPB to decode a new,
+    // independent stream without re-allocating the object.
+    void reset();
+
     // Get all stored pictures (for external access)
     const std::vector<std::shared_ptr<Picture>>& pictures() const { return pictures_; }
 

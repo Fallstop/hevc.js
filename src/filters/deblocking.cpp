@@ -9,7 +9,178 @@
 #include <algorithm>
 #include <cstring>
 
+// Portable SSE2 (native x86-64 baseline; emscripten lowers to wasm128 with
+// -msse2). Same single-source strategy as sao.cpp / interpolation.cpp: the
+// native oracle host compiles the exact intrinsics that ship to WASM, so the
+// MD5/SHA gate verifies the vector path bit-for-bit.
+#if defined(__SSE2__)
+  #define HEVC_SIMD_DEBLOCK 1
+  #include <emmintrin.h>
+#endif
+
 namespace hevc {
+
+#ifdef HEVC_SIMD_DEBLOCK
+// All deblocking sample math is int32 (matches the scalar `int` arithmetic
+// exactly). 4 lanes = the 4 lines of a horizontal-edge segment, so a vertical
+// run of one perpendicular sample position loads/stores as 4 contiguous pixels.
+static inline __m128i dbk_min_epi32(__m128i a, __m128i b) {
+    __m128i g = _mm_cmpgt_epi32(a, b);                 // a>b
+    return _mm_or_si128(_mm_and_si128(g, b), _mm_andnot_si128(g, a));
+}
+static inline __m128i dbk_max_epi32(__m128i a, __m128i b) {
+    __m128i g = _mm_cmpgt_epi32(a, b);                 // a>b
+    return _mm_or_si128(_mm_and_si128(g, a), _mm_andnot_si128(g, b));
+}
+static inline __m128i dbk_clip3(__m128i lo, __m128i hi, __m128i x) {
+    return dbk_max_epi32(lo, dbk_min_epi32(hi, x));
+}
+static inline __m128i dbk_abs(__m128i x) {
+    __m128i s = _mm_srai_epi32(x, 31);
+    return _mm_sub_epi32(_mm_xor_si128(x, s), s);
+}
+// mask ? a : b  (mask lanes are all-ones / all-zero)
+static inline __m128i dbk_sel(__m128i mask, __m128i a, __m128i b) {
+    return _mm_or_si128(_mm_and_si128(mask, a), _mm_andnot_si128(mask, b));
+}
+// load 4 contiguous samples (one perpendicular position across the 4 lines)
+// into 4 int32 lanes. uint8 storage reads 4 bytes and zero-extends; uint16 reads
+// 8 bytes — both produce the identical int32 lanes for 8-bit values.
+template<typename Sample>
+static inline __m128i dbk_load4(const Sample* p) {
+    if constexpr (sizeof(Sample) == 2) {
+        __m128i v = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+        return _mm_unpacklo_epi16(v, _mm_setzero_si128());
+    } else {
+        int32_t v32;
+        std::memcpy(&v32, p, 4);  // exactly 4 contiguous uint8
+        __m128i v16 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(v32), _mm_setzero_si128());
+        return _mm_unpacklo_epi16(v16, _mm_setzero_si128());
+    }
+}
+// store 4 int32 lanes (all in [0,maxVal]) as 4 samples. uint16: signed pack is an
+// exact narrowing since maxVal < 32768. uint8: packs to int16 then unsigned-pack
+// to bytes (exact for [0,255]).
+template<typename Sample>
+static inline void dbk_store4(Sample* p, __m128i v) {
+    if constexpr (sizeof(Sample) == 2) {
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(p), _mm_packs_epi32(v, v));
+    } else {
+        __m128i u8 = _mm_packus_epi16(_mm_packs_epi32(v, v), _mm_setzero_si128());
+        int32_t out = _mm_cvtsi128_si32(u8);
+        std::memcpy(p, &out, 4);  // exactly 4 contiguous uint8
+    }
+}
+
+// Filter the four lines of one HORIZONTAL-edge luma segment in parallel.
+// Edge at row yQ, columns xQ..xQ+3 (= the 4 lanes); p samples are the rows
+// above (yQ-1..yQ-4), q samples the rows at/below (yQ..yQ+3). dE/dEp/dEq/tC and
+// the decision were already derived scalar from lines 0 and 3 — identical to
+// the per-line path. Bit-exact transcription of filter_luma_sample, 4-wide.
+template<typename Sample>
+static inline void deblock_luma_hor_simd(
+        Sample* lumaPlane, int lumaStride, int xQ, int yQ,
+        int dE, int dEp, int dEq, int tC, int bitDepthY,
+        bool writeP, bool writeQ) {
+    Sample* q0r = lumaPlane + yQ * lumaStride + xQ;
+    __m128i p0 = dbk_load4(q0r - 1 * lumaStride);
+    __m128i p1 = dbk_load4(q0r - 2 * lumaStride);
+    __m128i p2 = dbk_load4(q0r - 3 * lumaStride);
+    __m128i q0 = dbk_load4(q0r);
+    __m128i q1 = dbk_load4(q0r + 1 * lumaStride);
+    __m128i q2 = dbk_load4(q0r + 2 * lumaStride);
+
+    const __m128i v2   = _mm_set1_epi32(2);
+    const __m128i v4   = _mm_set1_epi32(4);
+    Sample* pP1 = lumaPlane + (yQ - 2) * lumaStride + xQ;
+    Sample* pP0 = lumaPlane + (yQ - 1) * lumaStride + xQ;
+
+    if (dE == 2) {
+        __m128i p3 = dbk_load4(q0r - 4 * lumaStride);
+        __m128i q3 = dbk_load4(q0r + 3 * lumaStride);
+        __m128i tc2 = _mm_set1_epi32(2 * tC);
+        // p0' = (p2 + 2(p1+p0+q0) + q1 + 4) >> 3, clipped to p0 ± 2tC
+        __m128i np0 = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(p2, q1),
+                          _mm_add_epi32(_mm_slli_epi32(_mm_add_epi32(_mm_add_epi32(p1, p0), q0), 1), v4)), 3);
+        np0 = dbk_clip3(_mm_sub_epi32(p0, tc2), _mm_add_epi32(p0, tc2), np0);
+        // p1' = (p2 + p1 + p0 + q0 + 2) >> 2
+        __m128i np1 = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(_mm_add_epi32(p2, p1), _mm_add_epi32(p0, q0)), v2), 2);
+        np1 = dbk_clip3(_mm_sub_epi32(p1, tc2), _mm_add_epi32(p1, tc2), np1);
+        // p2' = (2p3 + 3p2 + p1 + p0 + q0 + 4) >> 3
+        __m128i np2 = _mm_srai_epi32(_mm_add_epi32(
+                          _mm_add_epi32(_mm_slli_epi32(p3, 1), _mm_add_epi32(_mm_add_epi32(p2, _mm_slli_epi32(p2, 1)), p1)),
+                          _mm_add_epi32(_mm_add_epi32(p0, q0), v4)), 3);
+        np2 = dbk_clip3(_mm_sub_epi32(p2, tc2), _mm_add_epi32(p2, tc2), np2);
+        // q0' = (p1 + 2(p0+q0+q1) + q2 + 4) >> 3
+        __m128i nq0 = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(p1, q2),
+                          _mm_add_epi32(_mm_slli_epi32(_mm_add_epi32(_mm_add_epi32(p0, q0), q1), 1), v4)), 3);
+        nq0 = dbk_clip3(_mm_sub_epi32(q0, tc2), _mm_add_epi32(q0, tc2), nq0);
+        // q1' = (p0 + q0 + q1 + q2 + 2) >> 2
+        __m128i nq1 = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(_mm_add_epi32(p0, q0), _mm_add_epi32(q1, q2)), v2), 2);
+        nq1 = dbk_clip3(_mm_sub_epi32(q1, tc2), _mm_add_epi32(q1, tc2), nq1);
+        // q2' = (p0 + q0 + q1 + 3q2 + 2q3 + 4) >> 3
+        __m128i nq2 = _mm_srai_epi32(_mm_add_epi32(
+                          _mm_add_epi32(_mm_add_epi32(p0, q0), _mm_add_epi32(q1, _mm_add_epi32(q2, _mm_slli_epi32(q2, 1)))),
+                          _mm_add_epi32(_mm_slli_epi32(q3, 1), v4)), 3);
+        nq2 = dbk_clip3(_mm_sub_epi32(q2, tc2), _mm_add_epi32(q2, tc2), nq2);
+
+        if (writeP) {
+            dbk_store4(pP0, np0);
+            dbk_store4(pP1, np1);
+            dbk_store4(lumaPlane + (yQ - 3) * lumaStride + xQ, np2);
+        }
+        if (writeQ) {
+            dbk_store4(q0r, nq0);
+            dbk_store4(q0r + 1 * lumaStride, nq1);
+            dbk_store4(q0r + 2 * lumaStride, nq2);
+        }
+        return;
+    }
+
+    // Weak filter (dE == 1). delta = (9(q0-p0) - 3(q1-p1) + 8) >> 4
+    const __m128i vmax = _mm_set1_epi32((1 << bitDepthY) - 1);
+    const __m128i vzero = _mm_setzero_si128();
+    __m128i vtC = _mm_set1_epi32(tC);
+    __m128i t = _mm_sub_epi32(q0, p0);                 // q0-p0
+    __m128i s = _mm_sub_epi32(q1, p1);                 // q1-p1
+    __m128i num = _mm_add_epi32(
+        _mm_sub_epi32(_mm_add_epi32(_mm_slli_epi32(t, 3), t),       // 9t
+                      _mm_add_epi32(_mm_slli_epi32(s, 1), s)),      // 3s
+        _mm_set1_epi32(8));
+    __m128i delta = _mm_srai_epi32(num, 4);
+    // mask: |delta| < tC*10  (per line)
+    __m128i mask = _mm_cmpgt_epi32(_mm_set1_epi32(tC * 10), dbk_abs(delta));
+    __m128i dc = dbk_clip3(_mm_sub_epi32(vzero, vtC), vtC, delta);  // Clip3(-tC,tC,delta)
+
+    __m128i np0 = dbk_sel(mask, dbk_clip3(vzero, vmax, _mm_add_epi32(p0, dc)), p0);
+    __m128i nq0 = dbk_sel(mask, dbk_clip3(vzero, vmax, _mm_sub_epi32(q0, dc)), q0);
+
+    if (writeP) {
+        dbk_store4(pP0, np0);
+        if (dEp == 1) {
+            __m128i tch = _mm_set1_epi32(tC >> 1);
+            // deltaP = Clip3(-tC/2, tC/2, (((p2+p0+1)>>1) - p1 + delta) >> 1)
+            __m128i dP = _mm_srai_epi32(_mm_add_epi32(
+                _mm_sub_epi32(_mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(p2, p0), _mm_set1_epi32(1)), 1), p1), dc), 1);
+            dP = dbk_clip3(_mm_sub_epi32(vzero, tch), tch, dP);
+            __m128i np1 = dbk_sel(mask, dbk_clip3(vzero, vmax, _mm_add_epi32(p1, dP)), p1);
+            dbk_store4(pP1, np1);
+        }
+    }
+    if (writeQ) {
+        dbk_store4(q0r, nq0);
+        if (dEq == 1) {
+            __m128i tch = _mm_set1_epi32(tC >> 1);
+            // deltaQ = Clip3(-tC/2, tC/2, (((q2+q0+1)>>1) - q1 - delta) >> 1)
+            __m128i dQ = _mm_srai_epi32(_mm_sub_epi32(
+                _mm_sub_epi32(_mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(q2, q0), _mm_set1_epi32(1)), 1), q1), dc), 1);
+            dQ = dbk_clip3(_mm_sub_epi32(vzero, tch), tch, dQ);
+            __m128i nq1 = dbk_sel(mask, dbk_clip3(vzero, vmax, _mm_add_epi32(q1, dQ)), q1);
+            dbk_store4(q0r + 1 * lumaStride, nq1);
+        }
+    }
+}
+#endif // HEVC_SIMD_DEBLOCK
 
 // Table 8-12: beta' and tC' from Q
 // Spec §8.7.2.5.3
@@ -48,7 +219,8 @@ enum EdgeType { EDGE_VER = 0, EDGE_HOR = 1 };
 // Returns true if filtering should NOT cross this boundary.
 // ============================================================
 static bool is_boundary_excluded(const DecodingContext& ctx,
-                                  int x, int y, EdgeType edgeType) {
+                                  int x, int y, EdgeType edgeType,
+                                  bool complexBound) {
     auto& sps = *ctx.sps;
     auto& pps = *ctx.pps;
     int picW = sps.pic_width_in_luma_samples;
@@ -59,6 +231,12 @@ static bool is_boundary_excluded(const DecodingContext& ctx,
     if (edgeType == EDGE_HOR && y == 0) return true;
     if (edgeType == EDGE_VER && x >= picW) return true;
     if (edgeType == EDGE_HOR && y >= picH) return true;
+
+    // Fast path: no tiles, single slice, no slice with deblocking or
+    // across-slices disabled → only the picture boundary can exclude an edge,
+    // so skip the per-CTB addr / slice-header / tile / slice-boundary work
+    // (precomputed once per picture in apply_deblocking).
+    if (!complexBound) return false;
 
     // §8.7.2.1: slice_deblocking_filter_disabled_flag for the slice containing Q-side
     int ctbSize = 1 << sps.CtbLog2SizeY;
@@ -122,7 +300,9 @@ static bool is_boundary_excluded(const DecodingContext& ctx,
 // ============================================================
 // Boundary Strength derivation — §8.7.2.4
 // ============================================================
-static int derive_bs(const DecodingContext& ctx, int xP, int yP, int xQ, int yQ) {
+static int derive_bs(const DecodingContext& ctx, int xP, int yP, int xQ, int yQ,
+                     const int32_t* pocL0, int nL0,
+                     const int32_t* pocL1, int nL1) {
     auto& sps = *ctx.sps;
     int picW = sps.pic_width_in_luma_samples;
     int picH = sps.pic_height_in_luma_samples;
@@ -179,18 +359,14 @@ static int derive_bs(const DecodingContext& ctx, int xP, int yP, int xQ, int yQ)
 
     if (nRefP != nRefQ) return 1;
 
-    // Get reference picture POCs for comparison (not index-based, picture-based)
+    // Reference-picture POCs (precomputed once per picture — the spec compares
+    // by picture, not ref index; the per-edge dpb->ref_pic_listX(idx)->poc chase
+    // is a pointer-indirect cache-miss source, so it is hoisted to apply_deblocking).
     auto get_ref_poc = [&](const PUMotionInfo& mi, int list) -> int32_t {
         if (!mi.pred_flag[list] || mi.ref_idx[list] < 0) return -999999;
-        if (list == 0 && mi.ref_idx[0] < ctx.dpb->num_ref_list0()) {
-            auto* rp = ctx.dpb->ref_pic_list0(mi.ref_idx[0]);
-            return rp ? rp->poc : -999999;
-        }
-        if (list == 1 && mi.ref_idx[1] < ctx.dpb->num_ref_list1()) {
-            auto* rp = ctx.dpb->ref_pic_list1(mi.ref_idx[1]);
-            return rp ? rp->poc : -999999;
-        }
-        return -999999;
+        int idx = mi.ref_idx[list];
+        if (list == 0) return (idx < nL0) ? pocL0[idx] : -999999;
+        return (idx < nL1) ? pocL1[idx] : -999999;
     };
 
     if (nRefP == 1) {
@@ -352,9 +528,98 @@ static void filter_chroma_sample(int p[2], int q[2], int tC, int bitDepth,
 }
 
 // ============================================================
+// Luma edge filter — §8.7.2.5.3/5.4
+// Decides strong/weak from lines 0 and 3, then filters all four lines.
+// EDGE_HOR (the 4 lines are contiguous columns) takes a 4-wide SSE2/wasm128
+// path that loads/stores each perpendicular sample position as one 4-pixel
+// run; EDGE_VER (already a hoisted contiguous-row scalar load) stays scalar.
+// Bit-exact with the per-line transcription.
+// ============================================================
+template<typename Sample>
+static inline void deblock_luma_edge(
+        Sample* lumaPlane, int lumaStride,
+        int xQ, int yQ, EdgeType edgeType,
+        int beta, int tC, int bitDepthY,
+        bool pcmP, bool pcmQ, bool bypassP, bool bypassQ,
+        bool pcmFilterDisabled) {
+    // Decision needs p0..p3 / q0..q3 for lines 0 and 3 only (§8.7.2.5.3).
+    int pSamp[4][2], qSamp[4][2]; // [i][kk], kk=0->line0, kk=1->line3
+    for (int kk = 0; kk < 2; kk++) {
+        int k = kk * 3;
+        if (edgeType == EDGE_VER) {
+            const Sample* row = lumaPlane + (yQ + k) * lumaStride + xQ;
+            for (int i = 0; i < 4; i++) { qSamp[i][kk] = row[i]; pSamp[i][kk] = row[-i - 1]; }
+        } else {
+            for (int i = 0; i < 4; i++) {
+                qSamp[i][kk] = lumaPlane[(yQ + i) * lumaStride + xQ + k];
+                pSamp[i][kk] = lumaPlane[(yQ - i - 1) * lumaStride + xQ + k];
+            }
+        }
+    }
+
+    int dp0 = std::abs(pSamp[2][0] - 2*pSamp[1][0] + pSamp[0][0]);
+    int dp3 = std::abs(pSamp[2][1] - 2*pSamp[1][1] + pSamp[0][1]);
+    int dq0 = std::abs(qSamp[2][0] - 2*qSamp[1][0] + qSamp[0][0]);
+    int dq3 = std::abs(qSamp[2][1] - 2*qSamp[1][1] + qSamp[0][1]);
+    int dpq0 = dp0 + dq0, dpq3 = dp3 + dq3;
+    int dp = dp0 + dp3, dq = dq0 + dq3, d = dpq0 + dpq3;
+
+    int dE = 0, dEp = 0, dEq = 0;
+    if (d < beta) {
+        int dSam0 = decision_luma_sample(pSamp[0][0], pSamp[3][0], qSamp[0][0], qSamp[3][0], 2*dpq0, beta, tC);
+        int dSam3 = decision_luma_sample(pSamp[0][1], pSamp[3][1], qSamp[0][1], qSamp[3][1], 2*dpq3, beta, tC);
+        dE = 1;
+        if (dSam0 == 1 && dSam3 == 1) dE = 2;
+        if (dp < ((beta + (beta >> 1)) >> 3)) dEp = 1;
+        if (dq < ((beta + (beta >> 1)) >> 3)) dEq = 1;
+    }
+    if (dE == 0) return;
+
+#ifdef HEVC_SIMD_DEBLOCK
+    // SIMD horizontal-edge kernel, templated on plane storage width (uint8 loads
+    // 4 bytes / widens to int32, uint16 loads 8 bytes — same int32 lanes).
+    if (edgeType == EDGE_HOR) {
+        bool writeP = !((pcmFilterDisabled && pcmP) || bypassP);
+        bool writeQ = !((pcmFilterDisabled && pcmQ) || bypassQ);
+        deblock_luma_hor_simd(lumaPlane, lumaStride, xQ, yQ, dE, dEp, dEq, tC,
+                              bitDepthY, writeP, writeQ);
+        return;
+    }
+#endif
+
+    // Scalar filter for all 4 lines (§8.7.2.5.4). EDGE_VER reads perpendicular
+    // samples along the row (stride 1); EDGE_HOR reads them down the column
+    // (stride = lumaStride). EDGE_HOR is reached here only when SIMD is disabled
+    // (no SSE2/wasm128) — otherwise it returns early via the SIMD kernel above.
+    const int perp = (edgeType == EDGE_VER) ? 1 : lumaStride;
+    for (int k = 0; k < 4; k++) {
+        Sample* line = (edgeType == EDGE_VER)
+            ? lumaPlane + (yQ + k) * lumaStride + xQ
+            : lumaPlane + yQ * lumaStride + (xQ + k);
+        int pLine[4] = { line[-perp], line[-2*perp], line[-3*perp], line[-4*perp] };
+        int qLine[4] = { line[0], line[perp], line[2*perp], line[3*perp] };
+        int nDp, nDq;
+        int pOut[3] = { pLine[0], pLine[1], pLine[2] };
+        int qOut[3] = { qLine[0], qLine[1], qLine[2] };
+        filter_luma_sample(pLine, qLine, dE, dEp, dEq, tC, bitDepthY,
+                           pcmP, pcmQ, bypassP, bypassQ, pcmFilterDisabled,
+                           &nDp, &nDq, pOut, qOut);
+        for (int i = 0; i < nDp; i++) line[(-1 - i) * perp] = static_cast<Sample>(pOut[i]);
+        for (int j = 0; j < nDq; j++) line[j * perp]        = static_cast<Sample>(qOut[j]);
+    }
+}
+
+// ============================================================
 // Main deblocking entry point — §8.7.2.1
 // ============================================================
-void apply_deblocking(DecodingContext& ctx) {
+// Per-picture deblock, templated on plane storage width. The picture-constant
+// metadata (ref-pic POCs, complexBound) is computed once by the apply_deblocking
+// dispatcher below and passed in, so the only per-Sample cost is the plane I/O.
+template<typename Sample>
+static void apply_deblocking_impl(DecodingContext& ctx,
+                                  const int32_t* pocL0, int nL0,
+                                  const int32_t* pocL1, int nL1,
+                                  bool complexBound) {
     auto& sps = *ctx.sps;
     auto& pps = *ctx.pps;
     auto* pic = ctx.pic;
@@ -368,11 +633,11 @@ void apply_deblocking(DecodingContext& ctx) {
     int subH = sps.SubHeightC;
 
     // Pre-compute plane pointers and strides for direct access
-    uint16_t* lumaPlane = pic->planes[0].data();
+    Sample* lumaPlane = pic->plane_ptr<Sample>(0);
     int lumaStride = pic->stride[0];
-    uint16_t* chromaPlane[3] = { nullptr,
-                                  pic->planes[1].data(),
-                                  pic->planes[2].data() };
+    Sample* chromaPlane[3] = { nullptr,
+                                  pic->plane_ptr<Sample>(1),
+                                  pic->plane_ptr<Sample>(2) };
     int chromaStride[3] = { 0, pic->stride[1], pic->stride[2] };
 
     // §8.7.2.1: Process vertical edges first, then horizontal
@@ -402,7 +667,7 @@ void apply_deblocking(DecodingContext& ctx) {
                     if (!hasE) continue;
 
                     // Check boundary exclusions
-                    bool excl = is_boundary_excluded(ctx, x, y, edgeType);
+                    bool excl = is_boundary_excluded(ctx, x, y, edgeType, complexBound);
                     if (excl) continue;
 
                     // Derive Bs
@@ -412,7 +677,7 @@ void apply_deblocking(DecodingContext& ctx) {
                     } else {
                         xP = x; yP = y - 1; xQ = x; yQ = y;
                     }
-                    int bS = derive_bs(ctx, xP, yP, xQ, yQ);
+                    int bS = derive_bs(ctx, xP, yP, xQ, yQ, pocL0, nL0, pocL1, nL1);
                     if (bS == 0) continue;
 
                     // Get QP for both sides
@@ -443,94 +708,10 @@ void apply_deblocking(DecodingContext& ctx) {
                         int tcPrime = tc_table[Q_tc];
                         int tC = tcPrime * (1 << (bitDepthY - 8)); // eq 8-351
 
-
-                        // Decision process — §8.7.2.5.3
-                        // Read p0..p3 and q0..q3 for lines k=0 and k=3
-                        int pSamp[4][2], qSamp[4][2]; // [i][k] k=0,1 maps to line 0 and 3
-
-                        for (int kk = 0; kk < 2; kk++) {
-                            int k = kk * 3; // k = 0 and 3
-                            if (edgeType == EDGE_VER) {
-                                uint16_t* rowQ = lumaPlane + (yQ + k) * lumaStride;
-                                for (int i = 0; i < 4; i++) {
-                                    qSamp[i][kk] = rowQ[xQ + i];
-                                    pSamp[i][kk] = rowQ[xQ - i - 1];
-                                }
-                            } else {
-                                for (int i = 0; i < 4; i++) {
-                                    qSamp[i][kk] = lumaPlane[(yQ + i) * lumaStride + xQ + k];
-                                    pSamp[i][kk] = lumaPlane[(yQ - i - 1) * lumaStride + xQ + k];
-                                }
-                            }
-                        }
-
-                        // dp, dq, d (eq 8-352 to 8-360 / 8-361 to 8-369)
-                        int dp0 = std::abs(pSamp[2][0] - 2*pSamp[1][0] + pSamp[0][0]);
-                        int dp3 = std::abs(pSamp[2][1] - 2*pSamp[1][1] + pSamp[0][1]);
-                        int dq0 = std::abs(qSamp[2][0] - 2*qSamp[1][0] + qSamp[0][0]);
-                        int dq3 = std::abs(qSamp[2][1] - 2*qSamp[1][1] + qSamp[0][1]);
-                        int dpq0 = dp0 + dq0;
-                        int dpq3 = dp3 + dq3;
-                        int dp = dp0 + dp3;
-                        int dq = dq0 + dq3;
-                        int d = dpq0 + dpq3;
-
-                        int dE = 0, dEp = 0, dEq = 0;
-                        if (d < beta) {
-                            // §8.7.2.5.6 for line 0
-                            int dSam0 = decision_luma_sample(
-                                pSamp[0][0], pSamp[3][0], qSamp[0][0], qSamp[3][0],
-                                2 * dpq0, beta, tC);
-                            // §8.7.2.5.6 for line 3
-                            int dSam3 = decision_luma_sample(
-                                pSamp[0][1], pSamp[3][1], qSamp[0][1], qSamp[3][1],
-                                2 * dpq3, beta, tC);
-
-                            dE = 1;
-                            if (dSam0 == 1 && dSam3 == 1) dE = 2;
-                            if (dp < ((beta + (beta >> 1)) >> 3)) dEp = 1;
-                            if (dq < ((beta + (beta >> 1)) >> 3)) dEq = 1;
-                        }
-
-                        // §8.7.2.5.4: Filter all 4 luma lines (only if dE > 0)
-                        if (dE > 0)
-                        for (int k = 0; k < 4; k++) {
-                            int pLine[4], qLine[4];
-                            if (edgeType == EDGE_VER) {
-                                uint16_t* row = lumaPlane + (yQ + k) * lumaStride;
-                                for (int i = 0; i < 4; i++) {
-                                    qLine[i] = row[xQ + i];
-                                    pLine[i] = row[xQ - i - 1];
-                                }
-                            } else {
-                                for (int i = 0; i < 4; i++) {
-                                    qLine[i] = lumaPlane[(yQ + i) * lumaStride + xQ + k];
-                                    pLine[i] = lumaPlane[(yQ - i - 1) * lumaStride + xQ + k];
-                                }
-                            }
-
-                            int nDp, nDq;
-                            int pOut[3] = {pLine[0], pLine[1], pLine[2]};
-                            int qOut[3] = {qLine[0], qLine[1], qLine[2]};
-                            filter_luma_sample(pLine, qLine, dE, dEp, dEq, tC, bitDepthY,
-                                               pcmP, pcmQ, bypassP, bypassQ,
-                                               pcmFilterDisabled,
-                                               &nDp, &nDq, pOut, qOut);
-
-                            // Write back filtered samples
-                            if (edgeType == EDGE_VER) {
-                                uint16_t* row = lumaPlane + (yQ + k) * lumaStride;
-                                for (int i = 0; i < nDp; i++)
-                                    row[xQ - i - 1] = static_cast<uint16_t>(pOut[i]);
-                                for (int j = 0; j < nDq; j++)
-                                    row[xQ + j] = static_cast<uint16_t>(qOut[j]);
-                            } else {
-                                for (int i = 0; i < nDp; i++)
-                                    lumaPlane[(yQ - i - 1) * lumaStride + xQ + k] = static_cast<uint16_t>(pOut[i]);
-                                for (int j = 0; j < nDq; j++)
-                                    lumaPlane[(yQ + j) * lumaStride + xQ + k] = static_cast<uint16_t>(qOut[j]);
-                            }
-                        }
+                        deblock_luma_edge(lumaPlane, lumaStride, xQ, yQ, edgeType,
+                                          beta, tC, bitDepthY,
+                                          pcmP, pcmQ, bypassP, bypassQ,
+                                          pcmFilterDisabled);
                     }
 
                     // ---- CHROMA ----
@@ -568,7 +749,7 @@ void apply_deblocking(DecodingContext& ctx) {
 
                                 // Filter 4 chroma lines along the edge
                                 int chromaSegs = (edgeType == EDGE_VER) ? (4 / subH) : (4 / subW);
-                                uint16_t* cPlane = chromaPlane[cIdx];
+                                Sample* cPlane = chromaPlane[cIdx];
                                 int cStride = chromaStride[cIdx];
                                 for (int k = 0; k < chromaSegs; k++) {
                                     int pC[2], qC[2];
@@ -576,7 +757,7 @@ void apply_deblocking(DecodingContext& ctx) {
                                     if (edgeType == EDGE_VER) {
                                         cx = x / subW;
                                         cy = y / subH + k;
-                                        uint16_t* crow = cPlane + cy * cStride;
+                                        Sample* crow = cPlane + cy * cStride;
                                         qC[0] = crow[cx]; qC[1] = crow[cx + 1];
                                         pC[0] = crow[cx - 1]; pC[1] = crow[cx - 2];
                                     } else {
@@ -596,12 +777,12 @@ void apply_deblocking(DecodingContext& ctx) {
                                                          &p0Out, &q0Out);
 
                                     if (edgeType == EDGE_VER) {
-                                        uint16_t* crow = cPlane + cy * cStride;
-                                        crow[cx - 1] = static_cast<uint16_t>(p0Out);
-                                        crow[cx]     = static_cast<uint16_t>(q0Out);
+                                        Sample* crow = cPlane + cy * cStride;
+                                        crow[cx - 1] = static_cast<Sample>(p0Out);
+                                        crow[cx]     = static_cast<Sample>(q0Out);
                                     } else {
-                                        cPlane[(cy - 1) * cStride + cx] = static_cast<uint16_t>(p0Out);
-                                        cPlane[cy * cStride + cx]       = static_cast<uint16_t>(q0Out);
+                                        cPlane[(cy - 1) * cStride + cx] = static_cast<Sample>(p0Out);
+                                        cPlane[cy * cStride + cx]       = static_cast<Sample>(q0Out);
                                     }
                                 }
                             }
@@ -611,6 +792,43 @@ void apply_deblocking(DecodingContext& ctx) {
             }
         }
     }
+}
+
+// Main deblocking entry point — §8.7.2.1. Computes the picture-constant metadata
+// once, then dispatches on plane storage width (uint8 native for 8-bit, uint16
+// otherwise).
+void apply_deblocking(DecodingContext& ctx) {
+    auto& pps = *ctx.pps;
+
+    // Reference-picture POCs, picture-constant — precompute once so derive_bs's
+    // Bs comparison (§8.7.2.4.5) indexes a hot 16-entry array instead of chasing
+    // dpb->ref_pic_listX(idx)->poc (vector + Picture* indirections) per edge.
+    int32_t pocL0[16], pocL1[16];
+    int nL0 = std::min(ctx.dpb->num_ref_list0(), 16);
+    int nL1 = std::min(ctx.dpb->num_ref_list1(), 16);
+    for (int i = 0; i < nL0; i++) { Picture* rp = ctx.dpb->ref_pic_list0(i); pocL0[i] = rp ? rp->poc : -999999; }
+    for (int i = 0; i < nL1; i++) { Picture* rp = ctx.dpb->ref_pic_list1(i); pocL1[i] = rp ? rp->poc : -999999; }
+
+    // Does any edge need the per-CTB tile/slice exclusion logic? For the common
+    // case (no tiles, single slice, deblocking enabled everywhere) only the
+    // picture boundary can exclude an edge, so is_boundary_excluded takes a fast
+    // path. Decide it once here instead of re-deriving per 4-sample segment.
+    bool complexBound = (!pps.loop_filter_across_tiles_enabled_flag && !pps.TileId.empty());
+    if (ctx.slice_headers && ctx.num_slices > 0) {
+        for (int s = 0; s < ctx.num_slices; s++) {
+            const SliceHeader* shp = ctx.slice_headers[s];
+            if (!shp) { complexBound = true; break; }
+            if (shp->slice_deblocking_filter_disabled_flag) complexBound = true;
+            if (ctx.num_slices > 1 && !shp->slice_loop_filter_across_slices_enabled_flag) complexBound = true;
+        }
+    } else if (ctx.sh && ctx.sh->slice_deblocking_filter_disabled_flag) {
+        complexBound = true;
+    }
+
+    if (ctx.pic->bytes_per_sample == 1)
+        apply_deblocking_impl<uint8_t>(ctx, pocL0, nL0, pocL1, nL1, complexBound);
+    else
+        apply_deblocking_impl<uint16_t>(ctx, pocL0, nL0, pocL1, nL1, complexBound);
 }
 
 } // namespace hevc

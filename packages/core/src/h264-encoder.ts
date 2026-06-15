@@ -1,10 +1,10 @@
 /**
  * H264Encoder — Wraps WebCodecs VideoEncoder to transcode YUV frames to H.264.
  *
- * Pipeline: HEVCFrame (Uint16Array YUV planes) → VideoFrame(I420) → VideoEncoder → EncodedVideoChunk
+ * Pipeline: HEVCFrame (Uint8Array|Uint16Array YUV planes) → VideoFrame(I420) → VideoEncoder → EncodedVideoChunk
  */
 
-import type { HEVCFrame } from "./types.js";
+import type { HEVCFrame, HEVCFrameView } from "./types.js";
 
 export interface H264EncoderConfig {
   width: number;
@@ -37,6 +37,9 @@ export class H264Encoder {
   private _height: number;
   private _fps: number;
   private _codecDescription: Uint8Array | null = null;
+  /** Reused I420 scratch buffer — the VideoFrame constructor copies from it
+   *  synchronously, so it is safe to overwrite on the next encode(). */
+  private _i420: Uint8Array | null = null;
 
   /** Callback invoked for each encoded chunk */
   onChunk: ((chunk: EncodedChunk) => void) | null = null;
@@ -77,38 +80,63 @@ export class H264Encoder {
   }
 
   /**
-   * Encode a decoded HEVC frame.
-   * Converts Uint16Array YUV planes to I420 Uint8Array, creates VideoFrame, encodes.
+   * Encode a decoded HEVC frame. Narrows the (possibly >8-bit) YUV planes into
+   * a packed I420 Uint8Array and hands it to the WebCodecs encoder.
+   *
+   * Accepts both a packed {@link HEVCFrame} (copied planes) and a zero-copy
+   * {@link HEVCFrameView} whose planes are strided sub-arrays straight into the
+   * WASM heap — in the latter case no intermediate plane copy is made: the
+   * narrowing reads directly from the heap into the reused I420 scratch.
    */
-  encode(frame: HEVCFrame, timestampUs: number, keyFrame = false): void {
+  encode(frame: HEVCFrame | HEVCFrameView, timestampUs: number, keyFrame = false): void {
     const w = frame.width;
     const h = frame.height;
     const cw = frame.chromaWidth;
     const ch = frame.chromaHeight;
     const shift = frame.bitDepth > 8 ? frame.bitDepth - 8 : 0;
+    // Packed HEVCFrame has no stride (rows are contiguous → stride == width);
+    // a zero-copy HEVCFrameView carries the heap stride.
+    const strideY = "strideY" in frame ? frame.strideY : w;
+    const strideC = "strideC" in frame ? frame.strideC : cw;
 
-    // Build I420 buffer: Y plane + U (Cb) plane + V (Cr) plane
+    // Build I420 buffer: Y plane + U (Cb) plane + V (Cr) plane, reusing a
+    // single scratch buffer across frames (VideoFrame copies it synchronously).
     const ySize = w * h;
     const cSize = cw * ch;
-    const i420 = new Uint8Array(ySize + cSize * 2);
+    const need = ySize + cSize * 2;
+    if (!this._i420 || this._i420.length < need) this._i420 = new Uint8Array(need);
+    const i420 = this._i420;
 
+    let di = 0;
     // Y plane
-    for (let i = 0; i < ySize; i++) {
-      const v = frame.y[i]! >> shift;
-      i420[i] = v > 255 ? 255 : v;
+    const y = frame.y;
+    for (let r = 0; r < h; r++) {
+      const base = r * strideY;
+      for (let c = 0; c < w; c++) {
+        const v = y[base + c]! >> shift;
+        i420[di++] = v > 255 ? 255 : v;
+      }
     }
     // U (Cb) plane
-    for (let i = 0; i < cSize; i++) {
-      const v = frame.cb[i]! >> shift;
-      i420[ySize + i] = v > 255 ? 255 : v;
+    const cb = frame.cb;
+    for (let r = 0; r < ch; r++) {
+      const base = r * strideC;
+      for (let c = 0; c < cw; c++) {
+        const v = cb[base + c]! >> shift;
+        i420[di++] = v > 255 ? 255 : v;
+      }
     }
     // V (Cr) plane
-    for (let i = 0; i < cSize; i++) {
-      const v = frame.cr[i]! >> shift;
-      i420[ySize + cSize + i] = v > 255 ? 255 : v;
+    const cr = frame.cr;
+    for (let r = 0; r < ch; r++) {
+      const base = r * strideC;
+      for (let c = 0; c < cw; c++) {
+        const v = cr[base + c]! >> shift;
+        i420[di++] = v > 255 ? 255 : v;
+      }
     }
 
-    const videoFrame = new VideoFrame(i420, {
+    const videoFrame = new VideoFrame(i420.subarray(0, need), {
       format: "I420",
       codedWidth: w,
       codedHeight: h,

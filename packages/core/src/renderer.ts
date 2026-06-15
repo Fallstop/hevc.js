@@ -191,7 +191,7 @@ function uploadPlane(
   gl: WebGLRenderingContext,
   tex: WebGLTexture,
   unit: number,
-  data: Uint16Array,
+  data: Uint8Array | Uint16Array,
   width: number,
   height: number,
   shift: number,

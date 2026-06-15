@@ -1,4 +1,4 @@
-import type { HEVCFrame, HEVCStreamInfo, DecodeResult, DecoderOptions } from "./types.js";
+import type { HEVCFrame, HEVCFrameView, HEVCStreamInfo, DecodeResult, DecoderOptions } from "./types.js";
 
 /**
  * Emscripten module interface (subset we use)
@@ -23,6 +23,7 @@ interface DecoderAPI {
   drain: (dec: number, countPtr: number) => number;
   getDrainedFrame: (dec: number, index: number, framePtr: number) => number;
   flush: (dec: number) => number;
+  reset: (dec: number, clearParameterSets: number) => number;
 }
 
 /**
@@ -54,6 +55,7 @@ export class HEVCDecoder {
       drain: module.cwrap("hevc_decoder_drain", "number", ["number", "number"]) as (dec: number, countPtr: number) => number,
       getDrainedFrame: module.cwrap("hevc_decoder_get_drained_frame", "number", ["number", "number", "number"]) as (dec: number, index: number, framePtr: number) => number,
       flush: module.cwrap("hevc_decoder_flush", "number", ["number"]) as (dec: number) => number,
+      reset: module.cwrap("hevc_decoder_reset", "number", ["number", "number"]) as (dec: number, clearParameterSets: number) => number,
     };
     this._dec = this._api.create();
     if (!this._dec) throw new Error("Failed to create HEVC decoder");
@@ -157,12 +159,13 @@ export class HEVCDecoder {
     const ch      = m.getValue(framePtr + 32, "i32");
     const bd      = m.getValue(framePtr + 36, "i32");
     const poc     = m.getValue(framePtr + 40, "i32");
+    const bps     = m.getValue(framePtr + 44, "i32");
 
-    const y  = copyPlane(m, yPtr, width, height, strideY);
-    const cb = copyPlane(m, cbPtr, cw, ch, strideC);
-    const cr = copyPlane(m, crPtr, cw, ch, strideC);
+    const y  = copyPlane(m, yPtr, width, height, strideY, bps);
+    const cb = copyPlane(m, cbPtr, cw, ch, strideC, bps);
+    const cr = copyPlane(m, crPtr, cw, ch, strideC, bps);
 
-    return { y, cb, cr, width, height, chromaWidth: cw, chromaHeight: ch, bitDepth: bd, poc };
+    return { y, cb, cr, width, height, chromaWidth: cw, chromaHeight: ch, bitDepth: bd, poc, bytesPerSample: bps };
   }
 
   private _extractInfo(): HEVCStreamInfo | null {
@@ -227,6 +230,85 @@ export class HEVCDecoder {
   }
 
   /**
+   * Zero-copy variant of {@link drain}. Returns frames whose planes are
+   * sub-array views directly into the WASM heap — no per-frame allocation or
+   * copy. Use this in the same thread/worker that consumes the pixels (e.g. a
+   * transcode or render worker) to remove the steady-state plane copy.
+   *
+   * The returned views (and all their planes) are only valid until the next
+   * `feed()`, `drain()`, `drainViews()`, `flush()`, or `destroy()` call on this
+   * decoder — any of which may overwrite or reallocate the heap. Consume every
+   * view (or copy out what you need) before the next such call. The views must
+   * NOT be transferred via postMessage: they alias the module's heap buffer,
+   * not an owned ArrayBuffer.
+   */
+  drainViews(): HEVCFrameView[] {
+    const m = this._m;
+    const countPtr = m._malloc(4);
+    try {
+      const ret = this._api.drain(this._dec, countPtr);
+      if (ret !== 0) return [];
+      const count = m.getValue(countPtr, "i32");
+      const views: HEVCFrameView[] = [];
+      // All drained pictures stay valid until the next feed/drain, so every
+      // view built here is simultaneously live for the caller's loop. The
+      // struct scratch is malloc'd once up front (no heap growth occurs in the
+      // loop below), so the heap views stay attached while we build them.
+      const framePtr = m._malloc(48);
+      try {
+        for (let i = 0; i < count; i++) {
+          const r = this._api.getDrainedFrame(this._dec, i, framePtr);
+          if (r !== 0) continue;
+          views.push(this._readFrameView(framePtr));
+        }
+      } finally {
+        m._free(framePtr);
+      }
+      return views;
+    } finally {
+      m._free(countPtr);
+    }
+  }
+
+  private _readFrameView(framePtr: number): HEVCFrameView {
+    const m = this._m;
+    const yPtr    = m.getValue(framePtr, "*");
+    const cbPtr   = m.getValue(framePtr + 4, "*");
+    const crPtr   = m.getValue(framePtr + 8, "*");
+    const width   = m.getValue(framePtr + 12, "i32");
+    const height  = m.getValue(framePtr + 16, "i32");
+    const strideY = m.getValue(framePtr + 20, "i32");
+    const strideC = m.getValue(framePtr + 24, "i32");
+    const cw      = m.getValue(framePtr + 28, "i32");
+    const ch      = m.getValue(framePtr + 32, "i32");
+    const bd      = m.getValue(framePtr + 36, "i32");
+    const poc     = m.getValue(framePtr + 40, "i32");
+    const bps     = m.getValue(framePtr + 44, "i32");
+
+    // Sub-array spans from the first visible sample through the last visible
+    // sample of the strided plane: (h-1)*stride + w covers every row we read.
+    // Spans are in SAMPLES, valid for both element widths.
+    const ySpan = height > 0 ? strideY * (height - 1) + width : 0;
+    const cSpan = ch > 0 ? strideC * (ch - 1) + cw : 0;
+    let y: Uint8Array | Uint16Array;
+    let cb: Uint8Array | Uint16Array;
+    let cr: Uint8Array | Uint16Array;
+    if (bps === 1) {
+      // Native 8-bit planes: byte base == sample base, view over HEAPU8.
+      y  = m.HEAPU8.subarray(yPtr,  yPtr  + ySpan);
+      cb = m.HEAPU8.subarray(cbPtr, cbPtr + cSpan);
+      cr = m.HEAPU8.subarray(crPtr, crPtr + cSpan);
+    } else {
+      const yBase = yPtr >> 1, cbBase = cbPtr >> 1, crBase = crPtr >> 1;
+      y  = m.HEAPU16.subarray(yBase,  yBase  + ySpan);
+      cb = m.HEAPU16.subarray(cbBase, cbBase + cSpan);
+      cr = m.HEAPU16.subarray(crBase, crBase + cSpan);
+    }
+
+    return { y, cb, cr, width, height, chromaWidth: cw, chromaHeight: ch, strideY, strideC, bitDepth: bd, poc, bytesPerSample: bps };
+  }
+
+  /**
    * Flush all remaining frames from the DPB (call at end of stream).
    * Returns all buffered frames in display order.
    */
@@ -256,6 +338,29 @@ export class HEVCDecoder {
     }
   }
 
+  /**
+   * Reset the decoder so the same instance can decode a new, independent
+   * stream — far cheaper than `destroy()` + `create()` because it reuses the
+   * WASM instance, its memory, and its internal scratch allocations. Drops the
+   * DPB and POC state; clears parameter sets unless `clearParameterSets` is
+   * false.
+   *
+   * Use this between seek/scrub targets, or to recover after a feed failure,
+   * instead of tearing down and recreating the decoder. Any frames or views
+   * from a prior drain/flush are invalidated by this call — copy out anything
+   * you still need first.
+   *
+   * @param clearParameterSets When true (default) the stored VPS/SPS/PPS are
+   *   forgotten, matching per-segment streams that re-supply parameter sets in
+   *   each init segment. Pass false only when seeking within a stream whose
+   *   parameter sets were delivered once, out-of-band.
+   */
+  reset(clearParameterSets = true): void {
+    if (!this._dec) return;
+    const ret = this._api.reset(this._dec, clearParameterSets ? 1 : 0);
+    if (ret !== 0) throw new Error(`Reset failed (code ${ret})`);
+  }
+
   /** Release decoder resources */
   destroy(): void {
     if (this._dec) {
@@ -265,8 +370,17 @@ export class HEVCDecoder {
   }
 }
 
-/** Copy a YUV plane from WASM HEAPU16, handling stride != width */
-function copyPlane(m: EmscriptenModule, ptr: number, width: number, height: number, stride: number): Uint16Array {
+/** Copy a YUV plane out of the WASM heap into a packed array, handling stride !=
+ *  width. bytesPerSample selects the storage width: 1 = uint8 (HEAPU8, byte base
+ *  == sample base), 2 = uint16 (HEAPU16, base = ptr >> 1). */
+function copyPlane(m: EmscriptenModule, ptr: number, width: number, height: number, stride: number, bytesPerSample: number): Uint8Array | Uint16Array {
+  if (bytesPerSample === 1) {
+    const out = new Uint8Array(width * height);
+    for (let y = 0; y < height; y++) {
+      out.set(m.HEAPU8.subarray(ptr + y * stride, ptr + y * stride + width), y * width);
+    }
+    return out;
+  }
   const out = new Uint16Array(width * height);
   const base = ptr >> 1;
   for (let y = 0; y < height; y++) {
