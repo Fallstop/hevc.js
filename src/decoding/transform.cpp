@@ -614,32 +614,45 @@ void perform_dequant(DecodingContext& ctx, int x0, int y0,
                 else if (log2TrafoSize == 4) sizeId = 2;
                 else sizeId = 3;
 
+                // §8.6.3: CuPredMode[xTbY][yTbY] — use current CU, not (0,0)
+                bool inter = ctx.cu_at(x0, y0).pred_mode != PredMode::MODE_INTRA;
                 int matrixId;
+                int listSizeId = sizeId;  // stored scaling-list sizeId to read from
                 if (sizeId < 3) {
                     matrixId = (cIdx == 0) ? 0 : (cIdx == 1 ? 1 : 2);
-                    // §8.6.3: CuPredMode[xTbY][yTbY] — use current CU, not (0,0)
-                    if (ctx.cu_at(x0, y0).pred_mode != PredMode::MODE_INTRA)
-                        matrixId += 3;
+                    if (inter) matrixId += 3;
+                } else if (cIdx == 0) {
+                    // 32x32 luma: matrixId 0 (intra) / 3 (inter).
+                    matrixId = inter ? 3 : 0;
                 } else {
-                    matrixId = (ctx.cu_at(x0, y0).pred_mode == PredMode::MODE_INTRA) ? 0 : 3;
+                    // 32x32 chroma only arises in 4:4:4 (ChromaArrayType == 3). The
+                    // spec defines no dedicated 32x32 chroma scaling matrix; per the
+                    // Range Extensions (§7.4.5, Table 7-4 has matrices only for
+                    // sizeId 3 matrixId 0/3) it reuses the 16x16 chroma matrix and
+                    // its DC. Read sizeId 2 with the component-specific matrixId; the
+                    // 8x8-stored coefficients upscale by 4 below, same as a copied
+                    // 32x32 chroma list would.
+                    matrixId = (cIdx == 1 ? 1 : 2) + (inter ? 3 : 0);
+                    listSizeId = 2;
                 }
 
                 const auto& sl = ctx.pps->pps_scaling_list_data_present_flag ?
                     ctx.pps->scaling_list_data : ctx.sps->scaling_list_data;
 
                 if (sizeId == 0) {
-                    m = sl.scaling_list[sizeId][matrixId][y * trSize + x];
+                    m = sl.scaling_list[0][matrixId][y * trSize + x];
                 } else {
                     // Upscale from 8x8 matrix
                     int ratio = trSize / 8;
                     if (ratio < 1) ratio = 1;
                     int idx = (y / ratio) * 8 + (x / ratio);
                     if (idx > 63) idx = 63;
-                    m = sl.scaling_list[sizeId][matrixId % 6][idx];
+                    m = sl.scaling_list[listSizeId][matrixId][idx];
 
-                    // DC coeff override for 16x16 and 32x32
+                    // DC coeff override for 16x16 and 32x32 (32x32 chroma reuses the
+                    // 16x16 chroma DC via listSizeId-2 == 0).
                     if ((sizeId == 2 || sizeId == 3) && x == 0 && y == 0) {
-                        m = sl.scaling_list_dc[sizeId - 2][matrixId % 6];
+                        m = sl.scaling_list_dc[listSizeId - 2][matrixId];
                         if (m == 0) m = 16;
                     }
                 }

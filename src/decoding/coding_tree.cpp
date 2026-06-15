@@ -1289,10 +1289,28 @@ void decode_prediction_unit_intra(DecodingContext& ctx, int x0, int y0,
         }
     }
 
-    // Chroma mode
-    if (sps.ChromaArrayType != 0) {
+    // Chroma mode(s) — §7.3.8.5 coding_unit
+    if (sps.ChromaArrayType == 3) {
+        // 4:4:4: intra_chroma_pred_mode is signalled per luma PU. For PART_NxN
+        // that is FOUR modes (one per 4x4 PU); for PART_2Nx2N the loop collapses
+        // to a single iteration (pbOffset == cbSize). Each chroma PU derives its
+        // DM from the co-located luma PU's mode. No Table 8-3 remap here — that
+        // applies only to ChromaArrayType == 2 (4:2:2).
+        for (int j = 0; j < cbSize; j += pbOffset) {
+            for (int i = 0; i < cbSize; i += pbOffset) {
+                int px = x0 + i;
+                int py = y0 + j;
+                int coded_chroma = decode_intra_chroma_pred_mode(cabac);
+                int luma_mode = ctx.intra_mode_at(px, py);
+                int chroma_mode = derive_chroma_intra_mode(coded_chroma, luma_mode);
+                ctx.set_chroma_mode(px, py, pbOffset, chroma_mode);
+                HEVC_LOG(INTRA, "PU (%d,%d) chroma_mode=%d (coded=%d luma=%d)",
+                         px, py, chroma_mode, coded_chroma, luma_mode);
+            }
+        }
+    } else if (sps.ChromaArrayType != 0) {
+        // 4:2:0 / 4:2:2: a single chroma mode per CU.
         int coded_chroma = decode_intra_chroma_pred_mode(cabac);
-        // For 4:2:0/4:2:2, one chroma mode per CU
         int luma_mode_for_chroma = ctx.intra_mode_at(x0, y0);
         int chroma_mode = derive_chroma_intra_mode(coded_chroma, luma_mode_for_chroma);
         // §8.4.3 Table 8-3: for 4:2:2, remap the derived chroma intra mode to
@@ -1552,8 +1570,15 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
         int trSizeC = 1 << log2TrafoSizeC;
         int numChromaBlocks = (sps.ChromaArrayType == 2) ? 2 : 1;
 
-        // For 4:2:0/4:2:2 with log2TrafoSize==2, chroma is deferred to blkIdx==3.
-        bool processChroma = (log2TrafoSize > 2) || (blkIdx == 3);
+        // For 4:2:0/4:2:2 with log2TrafoSize==2, chroma is deferred to blkIdx==3
+        // (one chroma TB per 8x8 luma region). For 4:4:4 (ChromaArrayType == 3)
+        // chroma is co-sited at full luma resolution, so every transform leaf —
+        // including each 4x4 leaf of an intra-NxN split — carries its own chroma
+        // TB and must be processed here. Deferring 4:4:4 chroma to blkIdx==3 both
+        // skips reconstruction of the other three sub-blocks AND, when those blocks
+        // are chroma-coded, leaves their residual_coding bins unread → CABAC desync.
+        bool processChroma = (sps.ChromaArrayType == 3) ||
+                             (log2TrafoSize > 2) || (blkIdx == 3);
 
         // §7.3.8.10: chroma position uses xBase/yBase when log2TrafoSize==2.
         int xC = (sps.ChromaArrayType != 3 && log2TrafoSize == 2) ? xBase : x0;

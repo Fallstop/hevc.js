@@ -130,6 +130,7 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
         tests/unit/test_slice_ltrp_sps.cpp
         tests/unit/test_sps_validate_dims.cpp
         tests/unit/test_scaling_list_scan.cpp
+        tests/unit/test_dequant_scaling_444.cpp
         tests/unit/test_random_access.cpp
         tests/unit/test_decoder_resync.cpp
         tests/unit/test_sei.cpp
@@ -250,6 +251,35 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
         COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/i_p_qcif_422_hq_4f.265 176 144
             52162b65507ff80be5b3aa6819071cf6 $<TARGET_FILE:hevc-decode> yuv422p)
     set_tests_properties(oracle_i_p_qcif_422_hq_4f PROPERTIES LABELS "oracle;feature"
+        SKIP_RETURN_CODE 2)
+
+    # 4:4:4 chroma (feature M1 — Main 4:4:4 / Rext). QCIF clip with I + P frames,
+    # SAO on. Guards the 4:4:4 transform path: chroma co-sited at full luma
+    # resolution, so (a) intra_chroma_pred_mode is signalled per luma PU — four
+    # modes for an intra-NxN CU, not one — and (b) every transform leaf carries its
+    # own chroma TB (chroma is NOT deferred to blkIdx==3 as in 4:2:0/4:2:2). The
+    # clip is NxN-heavy (240 intra-NxN CUs) to exercise both paths; before the fix
+    # the per-leaf chroma residual bins went unread and desynced CABAC.
+    add_test(NAME oracle_i_p_qcif_444_4f
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/i_p_qcif_444_4f.265 176 144
+            8a3d86c4a2452f4aa7f3668f6f710679 $<TARGET_FILE:hevc-decode> yuv444p)
+    set_tests_properties(oracle_i_p_qcif_444_4f PROPERTIES LABELS "oracle;feature"
+        SKIP_RETURN_CODE 2)
+
+    # 4:4:4 10-bit (Main 4:4:4 10). Same clip at yuv444p10le — guards the 4:4:4
+    # path on uint16 sample storage / 10-bit output.
+    add_test(NAME oracle_i_p_qcif_444_10b_4f
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/i_p_qcif_444_10b_4f.265 176 144
+            5192c41e701ab377e96e9de2ee3133f4 $<TARGET_FILE:hevc-decode> yuv444p10le)
+    set_tests_properties(oracle_i_p_qcif_444_10b_4f PROPERTIES LABELS "oracle;feature"
+        SKIP_RETURN_CODE 2)
+
+    # 4:4:4 high-quality (qp=6) — maximal intra-NxN and dense per-leaf chroma
+    # residual, the worst case for the per-leaf chroma desync.
+    add_test(NAME oracle_i_p_qcif_444_hq_4f
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/i_p_qcif_444_hq_4f.265 176 144
+            fe6acf6ed144c98e643d7485debe9c62 $<TARGET_FILE:hevc-decode> yuv444p)
+    set_tests_properties(oracle_i_p_qcif_444_hq_4f PROPERTIES LABELS "oracle;feature"
         SKIP_RETURN_CODE 2)
 
     # Phase 5 — P-frames, no filters
