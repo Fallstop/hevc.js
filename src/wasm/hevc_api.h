@@ -27,6 +27,10 @@ typedef struct {
     int chroma_height;     // Chroma plane height
     int bit_depth;         // Bit depth (8 or 10)
     int poc;               // Picture Order Count (display order)
+    int bytes_per_sample;  // Plane storage width: 1 = uint8 planes (native 8-bit),
+                           // 2 = uint16 planes. The y/cb/cr fields are typed
+                           // uint16_t* as an ABI placeholder; reinterpret the raw
+                           // pointer per bytes_per_sample.
 } HEVCFrame;
 
 // Stream info — available after first frame is decoded

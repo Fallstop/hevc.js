@@ -104,16 +104,17 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         const ch      = m.getValue(framePtr + 32, "i32");
         const bd      = m.getValue(framePtr + 36, "i32");
         const poc     = m.getValue(framePtr + 40, "i32");
+        const bps     = m.getValue(framePtr + 44, "i32");
 
-        const y  = copyPlane(m, yPtr, width, height, strideY);
-        const cb = copyPlane(m, cbPtr, cw, ch, strideC);
-        const cr = copyPlane(m, crPtr, cw, ch, strideC);
+        const y  = copyPlane(m, yPtr, width, height, strideY, bps);
+        const cb = copyPlane(m, cbPtr, cw, ch, strideC, bps);
+        const cr = copyPlane(m, crPtr, cw, ch, strideC, bps);
 
         post(
           {
             type: "frame",
             index: i,
-            frame: { y, cb, cr, width, height, chromaWidth: cw, chromaHeight: ch, bitDepth: bd, poc },
+            frame: { y, cb, cr, width, height, chromaWidth: cw, chromaHeight: ch, bitDepth: bd, poc, bytesPerSample: bps },
           },
           [y.buffer, cb.buffer, cr.buffer],
         );
@@ -133,7 +134,14 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
   }
 };
 
-function copyPlane(m: EmscriptenModule, ptr: number, width: number, height: number, stride: number): Uint16Array {
+function copyPlane(m: EmscriptenModule, ptr: number, width: number, height: number, stride: number, bytesPerSample: number): Uint8Array | Uint16Array {
+  if (bytesPerSample === 1) {
+    const out = new Uint8Array(width * height);
+    for (let y = 0; y < height; y++) {
+      out.set(m.HEAPU8.subarray(ptr + y * stride, ptr + y * stride + width), y * width);
+    }
+    return out;
+  }
   const out = new Uint16Array(width * height);
   const base = ptr >> 1;
   for (let y = 0; y < height; y++) {

@@ -89,8 +89,10 @@ private:
     std::vector<uint8_t> edge_flags_h_buf_;
     std::vector<DecodingContext::SaoParams> sao_params_buf_;
 
-    // Phase 9: SAO backup buffers (reused across frames to avoid per-frame allocation)
-    std::vector<uint16_t> sao_backup_[3];
+    // Phase 9: SAO backup buffers (reused across frames to avoid per-frame
+    // allocation). Byte-sized so they hold either uint8 (native 8-bit) or
+    // uint16 plane bytes; apply_sao reinterprets per the plane Sample type.
+    std::vector<uint8_t> sao_backup_[3];
 
     // Phase 10: slice index per CTU
     std::vector<uint8_t> slice_idx_buf_;

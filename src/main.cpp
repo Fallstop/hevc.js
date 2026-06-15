@@ -307,15 +307,23 @@ int main(int argc, char* argv[]) {
                     int cropBottom = pic->conf_win_bottom  / cSubH;
 
                     for (int y = cropTop; y < pic->height[c] - cropBottom; y++) {
-                        const uint16_t* row = pic->plane_ptr<uint16_t>(c) + y * pic->stride[c];
                         int outW = pic->width[c] - cropLeft - cropRight;
 
                         if (bd[c] <= 8) {
-                            for (int x = 0; x < outW; x++) {
-                                uint8_t val = static_cast<uint8_t>(row[cropLeft + x]);
-                                fwrite(&val, 1, 1, f);
+                            // 8-bit output: read native storage directly (uint8) or
+                            // take the low byte of uint16 — identical bytes either way.
+                            if (pic->bytes_per_sample == 1) {
+                                const uint8_t* row = pic->plane_ptr<uint8_t>(c) + y * pic->stride[c];
+                                fwrite(row + cropLeft, 1, outW, f);
+                            } else {
+                                const uint16_t* row = pic->plane_ptr<uint16_t>(c) + y * pic->stride[c];
+                                for (int x = 0; x < outW; x++) {
+                                    uint8_t val = static_cast<uint8_t>(row[cropLeft + x]);
+                                    fwrite(&val, 1, 1, f);
+                                }
                             }
                         } else {
+                            const uint16_t* row = pic->plane_ptr<uint16_t>(c) + y * pic->stride[c];
                             fwrite(row + cropLeft, sizeof(uint16_t), outW, f);
                         }
                     }

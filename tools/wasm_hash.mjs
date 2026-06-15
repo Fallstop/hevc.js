@@ -34,8 +34,8 @@ Module._hevc_decoder_decode(dec, ptr, data.length);
 const frames = Module._hevc_decoder_get_frame_count(dec);
 
 // HEVCFrame: y,cb,cr (3 ptrs) then width,height,stride_y,stride_c,chroma_width,
-// chroma_height,bit_depth,poc (8 ints). 44 bytes in wasm32.
-const fp = Module._malloc(44);
+// chroma_height,bit_depth,poc,bytes_per_sample (9 ints). 48 bytes in wasm32.
+const fp = Module._malloc(48);
 const I32 = (off) => Module.HEAP32[(fp + off) >> 2];
 const hash = createHash('sha256');
 for (let i = 0; i < frames; i++) {
@@ -43,11 +43,19 @@ for (let i = 0; i < frames; i++) {
     const y = I32(0), cb = I32(4), cr = I32(8);
     const w = I32(12), h = I32(16), sy = I32(20), sc = I32(24);
     const cw = I32(28), ch = I32(32);
+    const bps = I32(44);
     // Hash each plane row-by-row (respecting stride, only valid columns).
+    // For native 8-bit planes (bps==1) the bytes hashed equal the low byte the
+    // uint16 build hashed, so the digest stays a valid output-neutrality check.
     for (const [base, pw, ph, st] of [[y, w, h, sy], [cb, cw, ch, sc], [cr, cw, ch, sc]]) {
         for (let row = 0; row < ph; row++) {
-            const start = (base >> 1) + row * st;
-            hash.update(Buffer.from(Module.HEAPU16.buffer, start * 2, pw * 2));
+            if (bps === 1) {
+                const start = base + row * st;
+                hash.update(Buffer.from(Module.HEAPU8.buffer, start, pw));
+            } else {
+                const start = (base >> 1) + row * st;
+                hash.update(Buffer.from(Module.HEAPU16.buffer, start * 2, pw * 2));
+            }
         }
     }
 }

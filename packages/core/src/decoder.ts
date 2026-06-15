@@ -159,12 +159,13 @@ export class HEVCDecoder {
     const ch      = m.getValue(framePtr + 32, "i32");
     const bd      = m.getValue(framePtr + 36, "i32");
     const poc     = m.getValue(framePtr + 40, "i32");
+    const bps     = m.getValue(framePtr + 44, "i32");
 
-    const y  = copyPlane(m, yPtr, width, height, strideY);
-    const cb = copyPlane(m, cbPtr, cw, ch, strideC);
-    const cr = copyPlane(m, crPtr, cw, ch, strideC);
+    const y  = copyPlane(m, yPtr, width, height, strideY, bps);
+    const cb = copyPlane(m, cbPtr, cw, ch, strideC, bps);
+    const cr = copyPlane(m, crPtr, cw, ch, strideC, bps);
 
-    return { y, cb, cr, width, height, chromaWidth: cw, chromaHeight: ch, bitDepth: bd, poc };
+    return { y, cb, cr, width, height, chromaWidth: cw, chromaHeight: ch, bitDepth: bd, poc, bytesPerSample: bps };
   }
 
   private _extractInfo(): HEVCStreamInfo | null {
@@ -282,19 +283,29 @@ export class HEVCDecoder {
     const ch      = m.getValue(framePtr + 32, "i32");
     const bd      = m.getValue(framePtr + 36, "i32");
     const poc     = m.getValue(framePtr + 40, "i32");
+    const bps     = m.getValue(framePtr + 44, "i32");
 
     // Sub-array spans from the first visible sample through the last visible
     // sample of the strided plane: (h-1)*stride + w covers every row we read.
+    // Spans are in SAMPLES, valid for both element widths.
     const ySpan = height > 0 ? strideY * (height - 1) + width : 0;
     const cSpan = ch > 0 ? strideC * (ch - 1) + cw : 0;
-    const yBase  = yPtr  >> 1;
-    const cbBase = cbPtr >> 1;
-    const crBase = crPtr >> 1;
-    const y  = m.HEAPU16.subarray(yBase, yBase + ySpan);
-    const cb = m.HEAPU16.subarray(cbBase, cbBase + cSpan);
-    const cr = m.HEAPU16.subarray(crBase, crBase + cSpan);
+    let y: Uint8Array | Uint16Array;
+    let cb: Uint8Array | Uint16Array;
+    let cr: Uint8Array | Uint16Array;
+    if (bps === 1) {
+      // Native 8-bit planes: byte base == sample base, view over HEAPU8.
+      y  = m.HEAPU8.subarray(yPtr,  yPtr  + ySpan);
+      cb = m.HEAPU8.subarray(cbPtr, cbPtr + cSpan);
+      cr = m.HEAPU8.subarray(crPtr, crPtr + cSpan);
+    } else {
+      const yBase = yPtr >> 1, cbBase = cbPtr >> 1, crBase = crPtr >> 1;
+      y  = m.HEAPU16.subarray(yBase,  yBase  + ySpan);
+      cb = m.HEAPU16.subarray(cbBase, cbBase + cSpan);
+      cr = m.HEAPU16.subarray(crBase, crBase + cSpan);
+    }
 
-    return { y, cb, cr, width, height, chromaWidth: cw, chromaHeight: ch, strideY, strideC, bitDepth: bd, poc };
+    return { y, cb, cr, width, height, chromaWidth: cw, chromaHeight: ch, strideY, strideC, bitDepth: bd, poc, bytesPerSample: bps };
   }
 
   /**
@@ -359,8 +370,17 @@ export class HEVCDecoder {
   }
 }
 
-/** Copy a YUV plane from WASM HEAPU16, handling stride != width */
-function copyPlane(m: EmscriptenModule, ptr: number, width: number, height: number, stride: number): Uint16Array {
+/** Copy a YUV plane out of the WASM heap into a packed array, handling stride !=
+ *  width. bytesPerSample selects the storage width: 1 = uint8 (HEAPU8, byte base
+ *  == sample base), 2 = uint16 (HEAPU16, base = ptr >> 1). */
+function copyPlane(m: EmscriptenModule, ptr: number, width: number, height: number, stride: number, bytesPerSample: number): Uint8Array | Uint16Array {
+  if (bytesPerSample === 1) {
+    const out = new Uint8Array(width * height);
+    for (let y = 0; y < height; y++) {
+      out.set(m.HEAPU8.subarray(ptr + y * stride, ptr + y * stride + width), y * width);
+    }
+    return out;
+  }
   const out = new Uint16Array(width * height);
   const base = ptr >> 1;
   for (let y = 0; y < height; y++) {

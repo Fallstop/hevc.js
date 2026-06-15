@@ -51,22 +51,23 @@ TEST(Picture, SampleAccess) {
     Picture pic;
     pic.allocate(16, 16, ChromaFormat::YUV420, 8, 8);
 
-    pic.sample(0, 5, 3) = 128;
-    EXPECT_EQ(pic.sample(0, 5, 3), 128);
+    // 8-bit content is uint8-backed; use the storage-matching accessor.
+    pic.sample<uint8_t>(0, 5, 3) = 128;
+    EXPECT_EQ(pic.sample<uint8_t>(0, 5, 3), 128);
 
-    pic.sample(1, 2, 1) = 200;
-    EXPECT_EQ(pic.sample(1, 2, 1), 200);
+    pic.sample<uint8_t>(1, 2, 1) = 200;
+    EXPECT_EQ(pic.sample<uint8_t>(1, 2, 1), 200);
 }
 
 TEST(Picture, ZeroInitialized) {
     Picture pic;
     pic.allocate(16, 16, ChromaFormat::YUV420, 8, 8);
 
+    // Storage-agnostic: 8-bit content is uint8-backed (bytes_per_sample == 1),
+    // so check the raw plane bytes are zero rather than assuming a sample width.
     for (int c = 0; c < 3; c++) {
-        const uint16_t* p = pic.plane_ptr<uint16_t>(c);
-        size_t n = pic.plane_samples(c);
-        for (size_t i = 0; i < n; i++) {
-            EXPECT_EQ(p[i], 0);
+        for (uint8_t b : pic.plane_bytes[c]) {
+            EXPECT_EQ(b, 0);
         }
     }
 }
@@ -75,16 +76,16 @@ TEST(Picture, WriteYuv8bit) {
     Picture pic;
     pic.allocate(4, 4, ChromaFormat::YUV420, 8, 8);
 
-    // Fill luma with gradient
+    // Fill luma with gradient (8-bit content is uint8-backed storage)
     for (int y = 0; y < 4; y++)
         for (int x = 0; x < 4; x++)
-            pic.sample(0, x, y) = static_cast<uint16_t>(y * 4 + x);
+            pic.sample<uint8_t>(0, x, y) = static_cast<uint8_t>(y * 4 + x);
 
     // Fill chroma with constants
     for (int y = 0; y < 2; y++)
         for (int x = 0; x < 2; x++) {
-            pic.sample(1, x, y) = 128;
-            pic.sample(2, x, y) = 64;
+            pic.sample<uint8_t>(1, x, y) = 128;
+            pic.sample<uint8_t>(2, x, y) = 64;
         }
 
     const char* path = "/tmp/test_picture.yuv";

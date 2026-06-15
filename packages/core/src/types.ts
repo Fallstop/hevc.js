@@ -1,11 +1,15 @@
-/** Decoded YUV frame — planes are copied out of WASM heap */
+/**
+ * Decoded YUV frame — planes are copied out of the WASM heap. The plane element
+ * type follows `bytesPerSample`: `Uint8Array` for native 8-bit (bytesPerSample
+ * === 1), `Uint16Array` otherwise.
+ */
 export interface HEVCFrame {
   /** Luma plane (packed, no stride) */
-  y: Uint16Array;
+  y: Uint8Array | Uint16Array;
   /** Chroma Cb plane */
-  cb: Uint16Array;
+  cb: Uint8Array | Uint16Array;
   /** Chroma Cr plane */
-  cr: Uint16Array;
+  cr: Uint8Array | Uint16Array;
   /** Luma width (display, after conformance crop) */
   width: number;
   /** Luma height (display) */
@@ -18,6 +22,8 @@ export interface HEVCFrame {
   bitDepth: number;
   /** Picture Order Count (display order) */
   poc: number;
+  /** Plane storage width in bytes: 1 = Uint8Array planes, 2 = Uint16Array planes */
+  bytesPerSample: number;
 }
 
 /**
@@ -32,12 +38,13 @@ export interface HEVCFrame {
  * planes) past the next decoder call; copy out anything you need to keep.
  */
 export interface HEVCFrameView {
-  /** Luma plane view (strided: row r starts at r * strideY) */
-  y: Uint16Array;
+  /** Luma plane view (strided: row r starts at r * strideY). Element type
+   *  follows bytesPerSample (Uint8Array for native 8-bit, else Uint16Array). */
+  y: Uint8Array | Uint16Array;
   /** Chroma Cb plane view (strided by strideC) */
-  cb: Uint16Array;
+  cb: Uint8Array | Uint16Array;
   /** Chroma Cr plane view (strided by strideC) */
-  cr: Uint16Array;
+  cr: Uint8Array | Uint16Array;
   /** Luma width (display, after conformance crop) */
   width: number;
   /** Luma height (display) */
@@ -54,6 +61,8 @@ export interface HEVCFrameView {
   bitDepth: number;
   /** Picture Order Count (display order) */
   poc: number;
+  /** Plane storage width in bytes: 1 = Uint8Array planes, 2 = Uint16Array planes */
+  bytesPerSample: number;
 }
 
 /** Stream metadata — available after first decode */

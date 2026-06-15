@@ -1,7 +1,7 @@
 /**
  * H264Encoder — Wraps WebCodecs VideoEncoder to transcode YUV frames to H.264.
  *
- * Pipeline: HEVCFrame (Uint16Array YUV planes) → VideoFrame(I420) → VideoEncoder → EncodedVideoChunk
+ * Pipeline: HEVCFrame (Uint8Array|Uint16Array YUV planes) → VideoFrame(I420) → VideoEncoder → EncodedVideoChunk
  */
 
 import type { HEVCFrame, HEVCFrameView } from "./types.js";

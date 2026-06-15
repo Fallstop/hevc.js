@@ -104,6 +104,92 @@ static inline void sao_bo_row(const uint16_t* sRow, uint16_t* dRow,
         }
     }
 }
+
+// ---- Native uint8 (8-bit) SAO: true 16-lane epu8, 2x the throughput of the
+// uint16 kernels and half the bytes. maxVal is always 255 for 8-bit, so the
+// Clip3(0,255,c+offset) collapses to saturating adds_epu8 / subs_epu8 — exact.
+
+// Per-byte logical right shift (SSE2 has no epi8 shift): shift 16-bit lanes then
+// mask off the bits that bled in from the adjacent byte.
+static inline __m128i srl_epu8(__m128i v, int sh) {
+    return _mm_and_si128(_mm_srli_epi16(v, sh), _mm_set1_epi8(static_cast<char>(0xFF >> sh)));
+}
+// sign(c - n) as a two's-complement byte in {-1,0,1}, for unsigned bytes.
+static inline __m128i sao_sign8(__m128i c, __m128i n) {
+    const __m128i ones = _mm_cmpeq_epi8(c, c);
+    __m128i isgt = _mm_xor_si128(_mm_cmpeq_epi8(_mm_subs_epu8(c, n), _mm_setzero_si128()), ones); // c>n
+    __m128i islt = _mm_xor_si128(_mm_cmpeq_epi8(_mm_subs_epu8(n, c), _mm_setzero_si128()), ones); // c<n
+    return _mm_sub_epi8(islt, isgt); // c>n -> +1, c<n -> -1, else 0
+}
+// dst = Clip3(0,255, src + off), off a signed-byte vector. One of the two
+// saturating ops is a no-op per lane (off is either >=0 or <0).
+static inline __m128i sao_apply8(__m128i src, __m128i off) {
+    __m128i neg = _mm_cmpgt_epi8(_mm_setzero_si128(), off);          // 0xFF where off<0
+    __m128i posOff = _mm_andnot_si128(neg, off);                    // off if >=0 else 0
+    __m128i negOff = _mm_and_si128(neg, _mm_sub_epi8(_mm_setzero_si128(), off)); // -off if <0 else 0
+    return _mm_subs_epu8(_mm_adds_epu8(src, posOff), negOff);
+}
+
+static inline void sao_eo_row_u8(const uint8_t* cRow, const uint8_t* aRow,
+                                 const uint8_t* bRow, uint8_t* dRow,
+                                 int lo, int hi, int dx0, int dx1,
+                                 const int16_t* offTab) {
+    const __m128i two = _mm_set1_epi8(2);
+    const __m128i o0 = _mm_set1_epi8(static_cast<char>(offTab[0]));
+    const __m128i o1 = _mm_set1_epi8(static_cast<char>(offTab[1]));
+    const __m128i o2 = _mm_set1_epi8(static_cast<char>(offTab[2]));
+    const __m128i o3 = _mm_set1_epi8(static_cast<char>(offTab[3]));
+    const __m128i o4 = _mm_set1_epi8(static_cast<char>(offTab[4]));
+    int x = lo;
+    for (; x + 16 <= hi; x += 16) {
+        __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(cRow + x));
+        __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(aRow + x + dx0));
+        __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bRow + x + dx1));
+        __m128i e = _mm_add_epi8(two, _mm_add_epi8(sao_sign8(c, a), sao_sign8(c, b))); // edgeIdx 0..4
+        __m128i off = _mm_or_si128(
+            _mm_or_si128(_mm_and_si128(_mm_cmpeq_epi8(e, _mm_setzero_si128()), o0),
+                         _mm_and_si128(_mm_cmpeq_epi8(e, _mm_set1_epi8(1)), o1)),
+            _mm_or_si128(_mm_and_si128(_mm_cmpeq_epi8(e, two), o2),
+                _mm_or_si128(_mm_and_si128(_mm_cmpeq_epi8(e, _mm_set1_epi8(3)), o3),
+                             _mm_and_si128(_mm_cmpeq_epi8(e, _mm_set1_epi8(4)), o4))));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dRow + x), sao_apply8(c, off));
+    }
+    for (; x < hi; x++) {
+        int cc = cRow[x], a = aRow[x + dx0], bb = bRow[x + dx1];
+        int e = 2 + ((cc < a) ? -1 : (cc > a) ? 1 : 0) + ((cc < bb) ? -1 : (cc > bb) ? 1 : 0);
+        int v = cc + offTab[e];
+        dRow[x] = static_cast<uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v);
+    }
+}
+
+static inline void sao_bo_row_u8(const uint8_t* sRow, uint8_t* dRow,
+                                 int lo, int hi, int bandShift, int bandPos,
+                                 const int16_t* offTab) {
+    const __m128i vpos = _mm_set1_epi8(static_cast<char>(bandPos));
+    const __m128i o0 = _mm_set1_epi8(static_cast<char>(offTab[0]));
+    const __m128i o1 = _mm_set1_epi8(static_cast<char>(offTab[1]));
+    const __m128i o2 = _mm_set1_epi8(static_cast<char>(offTab[2]));
+    const __m128i o3 = _mm_set1_epi8(static_cast<char>(offTab[3]));
+    int x = lo;
+    for (; x + 16 <= hi; x += 16) {
+        __m128i s = _mm_loadu_si128(reinterpret_cast<const __m128i*>(sRow + x));
+        __m128i bi = _mm_sub_epi8(srl_epu8(s, bandShift), vpos); // bandIdx (signed byte)
+        __m128i off = _mm_or_si128(
+            _mm_or_si128(_mm_and_si128(_mm_cmpeq_epi8(bi, _mm_setzero_si128()), o0),
+                         _mm_and_si128(_mm_cmpeq_epi8(bi, _mm_set1_epi8(1)), o1)),
+            _mm_or_si128(_mm_and_si128(_mm_cmpeq_epi8(bi, _mm_set1_epi8(2)), o2),
+                         _mm_and_si128(_mm_cmpeq_epi8(bi, _mm_set1_epi8(3)), o3)));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dRow + x), sao_apply8(s, off));
+    }
+    for (; x < hi; x++) {
+        int sample = sRow[x];
+        int bandIdx = (sample >> bandShift) - bandPos;
+        if (bandIdx >= 0 && bandIdx < 4) {
+            int v = sample + offTab[bandIdx];
+            dRow[x] = static_cast<uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v);
+        }
+    }
+}
 #endif  // HEVC_SIMD_SAO
 
 // §8.7.3.2: EO class direction offsets
@@ -114,7 +200,8 @@ static inline void sao_bo_row(const uint16_t* sRow, uint16_t* dRow,
 static const int eo_dx[4][2] = {{-1, 1}, {0, 0}, {-1, 1}, {1, -1}};
 static const int eo_dy[4][2] = {{0, 0}, {-1, 1}, {-1, 1}, {-1, 1}};
 
-void apply_sao(DecodingContext& ctx) {
+template<typename Sample>
+static void apply_sao_impl(DecodingContext& ctx) {
     auto& sps = *ctx.sps;
     auto& pps = *ctx.pps;
     auto* pic = ctx.pic;
@@ -159,9 +246,10 @@ void apply_sao(DecodingContext& ctx) {
     for (int c = 0; c < numComp; c++) {
         if (!anySaoComp[c]) continue;  // never read → don't copy
         size_t nSamp = pic->plane_samples(c);
+        size_t nBytes = nSamp * sizeof(Sample);  // == plane_bytes[c].size()
         auto& backup = origPlane[c];
-        backup.resize(nSamp);
-        std::memcpy(backup.data(), pic->plane_ptr<uint16_t>(c), nSamp * sizeof(uint16_t));
+        backup.resize(nBytes);
+        std::memcpy(backup.data(), pic->plane_ptr<Sample>(c), nBytes);
     }
 
     // Process each CTU
@@ -220,8 +308,8 @@ void apply_sao(DecodingContext& ctx) {
                 // Only needed if neighbors can be in a different slice/tile
                 bool needBoundaryCheck = saoBoundaryPossible;
 
-                const uint16_t* origData = origPlane[cIdx].data();
-                uint16_t* destData = pic->plane_ptr<uint16_t>(cIdx);
+                const Sample* origData = reinterpret_cast<const Sample*>(origPlane[cIdx].data());
+                Sample* destData = pic->plane_ptr<Sample>(cIdx);
 
                 if (sao.sao_type_idx[cIdx] == 2) {
                     // Edge offset — §8.7.3.2
@@ -234,8 +322,11 @@ void apply_sao(DecodingContext& ctx) {
                     // boundary checks needed (the common case). Picture-edge columns
                     // and top/bottom rows fall out as no-ops, matching the scalar
                     // `continue`. Bit-exact with the scalar loop below.
-                    const bool sao_simd = !ctbHasPcmOrBypass && !needBoundaryCheck;
-                    const int16_t offTab[5] = {
+                    // sao_simd / offTab are consumed only inside the uint16
+                    // if-constexpr SIMD branch below; the uint8 instantiation
+                    // discards that branch and uses the scalar inner loop.
+                    [[maybe_unused]] const bool sao_simd = !ctbHasPcmOrBypass && !needBoundaryCheck;
+                    [[maybe_unused]] const int16_t offTab[5] = {
                         static_cast<int16_t>(sao.sao_offset_val[cIdx][0]),
                         static_cast<int16_t>(sao.sao_offset_val[cIdx][1]),
                         static_cast<int16_t>(sao.sao_offset_val[cIdx][2]),
@@ -254,12 +345,16 @@ void apply_sao(DecodingContext& ctx) {
                                 int iEnd = std::min(nCtbSw, compW - xCtb);
                                 int gLo = std::max(xCtb, std::max(0, -std::min(dx0, dx1)));
                                 int gHi = std::min(xCtb + iEnd, compW - std::max(0, std::max(dx0, dx1)));
-                                if (gLo < gHi)
-                                    sao_eo_row(origData + static_cast<size_t>(ySj) * stride,
-                                               origData + static_cast<size_t>(yN1) * stride,
-                                               origData + static_cast<size_t>(yN2) * stride,
-                                               destData + static_cast<size_t>(ySj) * stride,
-                                               gLo, gHi, dx0, dx1, offTab, maxVal);
+                                if (gLo < gHi) {
+                                    const Sample* cR = origData + static_cast<size_t>(ySj) * stride;
+                                    const Sample* aR = origData + static_cast<size_t>(yN1) * stride;
+                                    const Sample* bR = origData + static_cast<size_t>(yN2) * stride;
+                                    Sample* dR = destData + static_cast<size_t>(ySj) * stride;
+                                    if constexpr (sizeof(Sample) == 2)
+                                        sao_eo_row(cR, aR, bR, dR, gLo, gHi, dx0, dx1, offTab, maxVal);
+                                    else
+                                        sao_eo_row_u8(cR, aR, bR, dR, gLo, gHi, dx0, dx1, offTab);
+                                }
                             }
                             continue;
                         }
@@ -352,7 +447,7 @@ void apply_sao(DecodingContext& ctx) {
                             // mispredicts; edgeIdx is high-entropy and unpredictable).
                             int offset = sao.sao_offset_val[cIdx][edgeIdx];
                             destData[ySj * stride + xSi] =
-                                static_cast<uint16_t>(Clip3(0, maxVal, c_val + offset));
+                                static_cast<Sample>(Clip3(0, maxVal, c_val + offset));
                         }
                     }
                 } else {
@@ -361,8 +456,8 @@ void apply_sao(DecodingContext& ctx) {
                     int bandPos = sao.sao_band_position[cIdx];
 
 #ifdef HEVC_SIMD_SAO
-                    const bool sao_simd = !ctbHasPcmOrBypass && !needBoundaryCheck;
-                    const int16_t offTab[5] = {
+                    [[maybe_unused]] const bool sao_simd = !ctbHasPcmOrBypass && !needBoundaryCheck;
+                    [[maybe_unused]] const int16_t offTab[5] = {
                         static_cast<int16_t>(sao.sao_offset_val[cIdx][0]),
                         static_cast<int16_t>(sao.sao_offset_val[cIdx][1]),
                         static_cast<int16_t>(sao.sao_offset_val[cIdx][2]),
@@ -376,10 +471,14 @@ void apply_sao(DecodingContext& ctx) {
 #ifdef HEVC_SIMD_SAO
                         if (sao_simd) {
                             int iEnd = std::min(nCtbSw, compW - xCtb);
-                            if (iEnd > 0)
-                                sao_bo_row(origData + static_cast<size_t>(ySj) * stride,
-                                           destData + static_cast<size_t>(ySj) * stride,
-                                           xCtb, xCtb + iEnd, bandShift, bandPos, offTab, maxVal);
+                            if (iEnd > 0) {
+                                const Sample* sR = origData + static_cast<size_t>(ySj) * stride;
+                                Sample* dR = destData + static_cast<size_t>(ySj) * stride;
+                                if constexpr (sizeof(Sample) == 2)
+                                    sao_bo_row(sR, dR, xCtb, xCtb + iEnd, bandShift, bandPos, offTab, maxVal);
+                                else
+                                    sao_bo_row_u8(sR, dR, xCtb, xCtb + iEnd, bandShift, bandPos, offTab);
+                            }
                             continue;
                         }
 #endif
@@ -401,7 +500,7 @@ void apply_sao(DecodingContext& ctx) {
                             if (bandIdx >= 0 && bandIdx < 4) {
                                 int offset = sao.sao_offset_val[cIdx][bandIdx];
                                 destData[ySj * stride + xSi] =
-                                    static_cast<uint16_t>(Clip3(0, maxVal, sample + offset));
+                                    static_cast<Sample>(Clip3(0, maxVal, sample + offset));
                             }
                         }
                     }
@@ -409,6 +508,14 @@ void apply_sao(DecodingContext& ctx) {
             }
         }
     }
+}
+
+// Dispatch on plane storage width (uint8 native for 8-bit, uint16 otherwise).
+void apply_sao(DecodingContext& ctx) {
+    if (ctx.pic->bytes_per_sample == 1)
+        apply_sao_impl<uint8_t>(ctx);
+    else
+        apply_sao_impl<uint16_t>(ctx);
 }
 
 } // namespace hevc

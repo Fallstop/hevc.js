@@ -87,6 +87,7 @@ describe("HEVCDecoder.drainViews", () => {
       2032: 1,     // chromaHeight
       2036: 8,     // bitDepth
       2040: 42,    // poc
+      2044: 2,     // bytesPerSample (uint16 planes)
     };
     const getValue = vi.fn((ptr: number) => values[ptr]!);
 
@@ -111,6 +112,7 @@ describe("HEVCDecoder.drainViews", () => {
     expect(v.strideC).toBe(2);
     expect(v.bitDepth).toBe(8);
     expect(v.poc).toBe(42);
+    expect(v.bytesPerSample).toBe(2);
 
     // Zero-copy: the plane aliases the heap buffer (no copy was made).
     expect(v.y.buffer).toBe(heap.buffer);

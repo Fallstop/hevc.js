@@ -63,9 +63,18 @@ int hevc_decoder_get_frame(HEVCDecoder* dec, int index, HEVCFrame* frame) {
     int c_offset = (pic->conf_win_top / sub_h) * pic->stride[1] +
                    (pic->conf_win_left / sub_w);
 
-    frame->y  = pic->plane_ptr<uint16_t>(0) + y_offset;
-    frame->cb = pic->plane_ptr<uint16_t>(1) + c_offset;
-    frame->cr = pic->plane_ptr<uint16_t>(2) + c_offset;
+    // Offsets are in SAMPLES, so they add correctly to a uint8_t* (1 byte/sample)
+    // or a uint16_t* (2 bytes/sample). For uint8 storage the pointer is reinterpreted
+    // to fit the field type; the consumer re-bases per bytes_per_sample.
+    if (pic->bytes_per_sample == 1) {
+        frame->y  = reinterpret_cast<const uint16_t*>(pic->plane_ptr<uint8_t>(0) + y_offset);
+        frame->cb = reinterpret_cast<const uint16_t*>(pic->plane_ptr<uint8_t>(1) + c_offset);
+        frame->cr = reinterpret_cast<const uint16_t*>(pic->plane_ptr<uint8_t>(2) + c_offset);
+    } else {
+        frame->y  = pic->plane_ptr<uint16_t>(0) + y_offset;
+        frame->cb = pic->plane_ptr<uint16_t>(1) + c_offset;
+        frame->cr = pic->plane_ptr<uint16_t>(2) + c_offset;
+    }
     frame->width = crop_w;
     frame->height = crop_h;
     frame->stride_y = pic->stride[0];
@@ -74,6 +83,7 @@ int hevc_decoder_get_frame(HEVCDecoder* dec, int index, HEVCFrame* frame) {
     frame->chroma_height = crop_h / sub_h;
     frame->bit_depth = pic->bit_depth_luma;
     frame->poc = pic->poc;
+    frame->bytes_per_sample = pic->bytes_per_sample;
 
     return HEVC_OK;
 }
@@ -119,9 +129,15 @@ int hevc_decoder_get_drained_frame(HEVCDecoder* dec, int index, HEVCFrame* frame
     int c_offset = (pic->conf_win_top / sub_h) * pic->stride[1] +
                    (pic->conf_win_left / sub_w);
 
-    frame->y  = pic->plane_ptr<uint16_t>(0) + y_offset;
-    frame->cb = pic->plane_ptr<uint16_t>(1) + c_offset;
-    frame->cr = pic->plane_ptr<uint16_t>(2) + c_offset;
+    if (pic->bytes_per_sample == 1) {
+        frame->y  = reinterpret_cast<const uint16_t*>(pic->plane_ptr<uint8_t>(0) + y_offset);
+        frame->cb = reinterpret_cast<const uint16_t*>(pic->plane_ptr<uint8_t>(1) + c_offset);
+        frame->cr = reinterpret_cast<const uint16_t*>(pic->plane_ptr<uint8_t>(2) + c_offset);
+    } else {
+        frame->y  = pic->plane_ptr<uint16_t>(0) + y_offset;
+        frame->cb = pic->plane_ptr<uint16_t>(1) + c_offset;
+        frame->cr = pic->plane_ptr<uint16_t>(2) + c_offset;
+    }
     frame->width = crop_w;
     frame->height = crop_h;
     frame->stride_y = pic->stride[0];
@@ -130,6 +146,7 @@ int hevc_decoder_get_drained_frame(HEVCDecoder* dec, int index, HEVCFrame* frame
     frame->chroma_height = crop_h / sub_h;
     frame->bit_depth = pic->bit_depth_luma;
     frame->poc = pic->poc;
+    frame->bytes_per_sample = pic->bytes_per_sample;
 
     return HEVC_OK;
 }

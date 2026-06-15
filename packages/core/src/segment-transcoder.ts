@@ -162,6 +162,7 @@ export class SegmentTranscoder {
       y: new Uint16Array(this._width * this._height),
       cb: new Uint16Array(cw * ch).fill(128),
       cr: new Uint16Array(cw * ch).fill(128),
+      bytesPerSample: 2,
       width: this._width,
       height: this._height,
       chromaWidth: cw,

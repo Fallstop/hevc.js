@@ -110,6 +110,63 @@ static inline void simd_copy_row(const uint16_t* src, int shift, int width, int1
     for (; x < width; x++) o[x] = static_cast<int16_t>(src[x] << shift);
 }
 
+// uint8-source variants of the two kernels above: load 8 bytes, zero-extend to
+// int16, then run the identical madd / shift / truncate. 8-bit samples (0..255)
+// zero-extend to exactly the int16 values the uint16 kernel loads, so these are
+// bit-exact with simd_filter_row / simd_copy_row — only the load is half the
+// bytes. (step is in samples == bytes for uint8 planes.)
+template<int NTAP>
+static inline void simd_filter_row_u8(const uint8_t* src, int step,
+                                      const int16_t* coef, int shift,
+                                      int width, int16_t* o) {
+    int x = 0;
+#ifdef HEVC_SIMD_INTERP
+    static_assert(NTAP % 2 == 0, "NTAP must be even");
+    const __m128i zero = _mm_setzero_si128();
+    __m128i cp[NTAP / 2];
+    for (int p = 0; p < NTAP / 2; p++)
+        cp[p] = _mm_set1_epi32(static_cast<uint16_t>(coef[2 * p]) |
+                               (static_cast<int>(coef[2 * p + 1]) << 16));
+    const __m128i vsh = _mm_cvtsi32_si128(shift);
+    for (; x + 8 <= width; x += 8) {
+        __m128i acc_lo = _mm_setzero_si128();
+        __m128i acc_hi = _mm_setzero_si128();
+        for (int p = 0; p < NTAP / 2; p++) {
+            __m128i va = _mm_unpacklo_epi8(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + x + (2 * p) * step)), zero);
+            __m128i vb = _mm_unpacklo_epi8(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + x + (2 * p + 1) * step)), zero);
+            acc_lo = _mm_add_epi32(acc_lo, _mm_madd_epi16(_mm_unpacklo_epi16(va, vb), cp[p]));
+            acc_hi = _mm_add_epi32(acc_hi, _mm_madd_epi16(_mm_unpackhi_epi16(va, vb), cp[p]));
+        }
+        acc_lo = _mm_sra_epi32(acc_lo, vsh);
+        acc_hi = _mm_sra_epi32(acc_hi, vsh);
+        acc_lo = _mm_srai_epi32(_mm_slli_epi32(acc_lo, 16), 16);
+        acc_hi = _mm_srai_epi32(_mm_slli_epi32(acc_hi, 16), 16);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(o + x), _mm_packs_epi32(acc_lo, acc_hi));
+    }
+#endif
+    for (; x < width; x++) {
+        int sum = 0;
+        for (int k = 0; k < NTAP; k++) sum += coef[k] * src[x + k * step];
+        o[x] = static_cast<int16_t>(sum >> shift);
+    }
+}
+
+static inline void simd_copy_row_u8(const uint8_t* src, int shift, int width, int16_t* o) {
+    int x = 0;
+#ifdef HEVC_SIMD_INTERP
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i vsh = _mm_cvtsi32_si128(shift);
+    for (; x + 8 <= width; x += 8) {
+        __m128i s = _mm_unpacklo_epi8(
+            _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + x)), zero);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(o + x), _mm_sll_epi16(s, vsh));
+    }
+#endif
+    for (; x < width; x++) o[x] = static_cast<int16_t>(src[x] << shift);
+}
+
 // ============================================================
 // Luma interpolation — §8.5.3.3.3
 // Output in extended precision (not clipped to [0, 2^BitDepth-1])
@@ -221,8 +278,35 @@ static void interpolate_luma_impl(const Picture& refPic,
         LUMA_INTERP(refClamp);
     }
     } else {
-        // uint8 storage: scalar separable filter (correct for any plane width).
-        LUMA_INTERP(refClamp);
+        // uint8 storage: SIMD interior (loads bytes, widens to int16 — bit-exact
+        // with the uint16 kernel above), scalar clamped path for edge PUs.
+        if (interior) {
+            const uint8_t* base = plane0 + yInt * stride0 + xInt;
+            if (xFrac == 0 && yFrac == 0) {
+                for (int y = 0; y < nPbH; y++)
+                    simd_copy_row_u8(base + y * stride0, shift3, nPbW, pred + y * nPbW);
+            } else if (yFrac == 0) {
+                const int16_t* f = luma_filter[xFrac];
+                for (int y = 0; y < nPbH; y++)
+                    simd_filter_row_u8<8>(base + y * stride0 - 3, 1, f, shift1, nPbW, pred + y * nPbW);
+            } else if (xFrac == 0) {
+                const int16_t* f = luma_filter[yFrac];
+                for (int y = 0; y < nPbH; y++)
+                    simd_filter_row_u8<8>(base + (y - 3) * stride0, stride0, f, shift1, nPbW, pred + y * nPbW);
+            } else {
+                int tmpH = nPbH + 7;
+                int16_t tmp[64 * 71];
+                const int16_t* fH = luma_filter[xFrac];
+                for (int y = 0; y < tmpH; y++)
+                    simd_filter_row_u8<8>(base + (y - 3) * stride0 - 3, 1, fH, shift1, nPbW, tmp + y * nPbW);
+                // V pass reads the int16 intermediate — reuse the int16 kernel.
+                const int16_t* fV = luma_filter[yFrac];
+                for (int y = 0; y < nPbH; y++)
+                    simd_filter_row<8>(tmp + y * nPbW, nPbW, fV, shift2, nPbW, pred + y * nPbW);
+            }
+        } else {
+            LUMA_INTERP(refClamp);
+        }
     }
 
     #undef LUMA_INTERP
@@ -348,8 +432,34 @@ static void interpolate_chroma_impl(const Picture& refPic, int cIdx,
         CHROMA_INTERP(refClamp);
     }
     } else {
-        // uint8 storage: scalar separable filter.
-        CHROMA_INTERP(refClamp);
+        // uint8 storage: SIMD interior (loads bytes, widens to int16 — bit-exact
+        // with the uint16 kernel above), scalar clamped path for edge PUs.
+        if (interior) {
+            const uint8_t* base = planeC + yInt * strideC + xInt;
+            if (xFrac == 0 && yFrac == 0) {
+                for (int y = 0; y < nPbHC; y++)
+                    simd_copy_row_u8(base + y * strideC, shift3, nPbWC, pred + y * nPbWC);
+            } else if (yFrac == 0) {
+                const int16_t* f = chroma_filter[xFrac];
+                for (int y = 0; y < nPbHC; y++)
+                    simd_filter_row_u8<4>(base + y * strideC - 1, 1, f, shift1, nPbWC, pred + y * nPbWC);
+            } else if (xFrac == 0) {
+                const int16_t* f = chroma_filter[yFrac];
+                for (int y = 0; y < nPbHC; y++)
+                    simd_filter_row_u8<4>(base + (y - 1) * strideC, strideC, f, shift1, nPbWC, pred + y * nPbWC);
+            } else {
+                int tmpH = nPbHC + 3;
+                int16_t tmp[32 * 35];
+                const int16_t* fH = chroma_filter[xFrac];
+                for (int y = 0; y < tmpH; y++)
+                    simd_filter_row_u8<4>(base + (y - 1) * strideC - 1, 1, fH, shift1, nPbWC, tmp + y * nPbWC);
+                const int16_t* fV = chroma_filter[yFrac];
+                for (int y = 0; y < nPbHC; y++)
+                    simd_filter_row<4>(tmp + y * nPbWC, nPbWC, fV, shift2, nPbWC, pred + y * nPbWC);
+            }
+        } else {
+            CHROMA_INTERP(refClamp);
+        }
     }
     #undef CHROMA_INTERP
 }

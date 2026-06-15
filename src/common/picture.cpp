@@ -30,10 +30,12 @@ void Picture::allocate(int w, int h, ChromaFormat fmt, int bd_luma, int bd_chrom
         stride[1] = stride[2] = w / sub_w;
     }
 
-    // Storage width per sample. Increment 1 keeps uint16 (2 bytes) for every
-    // bit depth so the byte-buffer seam is provably output-neutral; the 8-bit
-    // flip to bytes_per_sample==1 lands in a later step.
-    bytes_per_sample = 2;
+    // Storage width per sample: native uint8 (1 byte) when every plane is 8-bit
+    // (≈all security-camera HEVC) to halve memory traffic through MC / deblock /
+    // SAO and free a future 2× SIMD lane width; uint16 (2 bytes) for >8-bit.
+    // The pixel kernels are templated on the plane Sample type and dispatch on
+    // this field, so the decoded output is bit-identical either way.
+    bytes_per_sample = (bd_luma <= 8 && bd_chroma <= 8) ? 1 : 2;
 
     for (int c = 0; c < 3; c++) {
         if (width[c] > 0 && height[c] > 0) {
@@ -76,12 +78,20 @@ bool Picture::write_yuv(const char* path) const {
         }
 
         for (int y = crop_top[c]; y < crop_top[c] + out_height; y++) {
-            const uint16_t* row = plane_ptr<uint16_t>(c) + y * stride[c];
-
             if (bd[c] <= 8) {
-                // Write as 8-bit: convert row to uint8_t buffer, write once
-                for (int x = 0; x < out_width; x++) {
-                    row_buf[x] = static_cast<uint8_t>(row[crop_left[c] + x]);
+                // Write as 8-bit. Read native storage directly: uint8 planes need
+                // no conversion; uint16 planes take the low byte. Both yield the
+                // identical byte because the decoder clips 8-bit samples to [0,255].
+                if (bytes_per_sample == 1) {
+                    const uint8_t* row = plane_ptr<uint8_t>(c) + y * stride[c];
+                    for (int x = 0; x < out_width; x++) {
+                        row_buf[x] = row[crop_left[c] + x];
+                    }
+                } else {
+                    const uint16_t* row = plane_ptr<uint16_t>(c) + y * stride[c];
+                    for (int x = 0; x < out_width; x++) {
+                        row_buf[x] = static_cast<uint8_t>(row[crop_left[c] + x]);
+                    }
                 }
                 if (fwrite(row_buf.data(), 1, out_width, fp) !=
                     static_cast<size_t>(out_width)) {
@@ -89,7 +99,8 @@ bool Picture::write_yuv(const char* path) const {
                     return false;
                 }
             } else {
-                // Write as 16-bit little-endian
+                // Write as 16-bit little-endian (>8-bit content is always uint16 storage).
+                const uint16_t* row = plane_ptr<uint16_t>(c) + y * stride[c];
                 const uint16_t* start = row + crop_left[c];
                 if (fwrite(start, sizeof(uint16_t), out_width, fp) !=
                     static_cast<size_t>(out_width)) {
