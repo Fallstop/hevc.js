@@ -247,8 +247,9 @@ static void interpolate_luma_impl(const Picture& refPic,
     if (interior) {
         // Interior fast path: SSE2 separable filter (bit-exact with the scalar
         // clamped path below). The interior margin (-3 / +4) guarantees the 8-wide
-        // loads stay in-bounds. uint16 storage only — the loads reinterpret the
-        // plane as int16; the uint8 path uses the scalar branch (SIMD-widen TODO).
+        // loads stay in-bounds. This is the uint16 storage branch (loads reinterpret
+        // the plane as int16); the uint8 storage branch below has its own SIMD
+        // interior kernel (simd_filter_row_u8 / simd_copy_row_u8).
         const uint16_t* base = plane0 + yInt * stride0 + xInt;
         if (xFrac == 0 && yFrac == 0) {
             for (int y = 0; y < nPbH; y++)
@@ -644,8 +645,15 @@ void perform_inter_prediction(DecodingContext& ctx,
     int16_t* predL0 = predL0_buf;
     int16_t* predL1 = predL1_buf;
 
+    // Concealment of lost references (RTSP packet loss / mid-GOP join):
+    // on valid streams a flagged list always resolves to a non-null refPic,
+    // so this never fires; when it does, a missing ref must drop its predFlag
+    // so weighted_pred_* below never blends the uninitialized predLx_buf.
+    if (predFlagL0 && refIdxL0 < 0) predFlagL0 = false;
+    if (predFlagL1 && refIdxL1 < 0) predFlagL1 = false;
+
     // L0 prediction
-    if (predFlagL0 && refIdxL0 >= 0) {
+    if (predFlagL0) {
         Picture* refPic = ctx.dpb->ref_pic_list0(refIdxL0);
         if (refPic) {
             if (cIdx == 0) {
@@ -657,22 +665,15 @@ void perform_inter_prediction(DecodingContext& ctx,
                 interpolate_luma(*refPic, xInt, yInt, xFrac, yFrac,
                                   compW, compH, bitDepth, predL0);
             } else {
-                // §8.5.3.3.2: chroma MV derivation from luma MV
-                // mvC = (mvL * SubWidth/Height + 2) >> 2... actually:
-                // xFracC and yFracC in 1/8 pel
-                int mvCx = mvL0.x;
-                int mvCy = mvL0.y;
-                // §8.5.3.3: chroma MV = luma MV for 4:2:0, but at 1/8 pel precision
-                // xIntC = (xPb/SubWidthC) + (mvCx >> (1 + cShiftX))
-                // Wait, for 4:2:0: the chroma MV is just luma MV / 2 in full units,
-                // and the fractional part is at 1/8 pel
+                // §8.5.3.3.2: chroma MV derivation from luma MV.
+                // mvCLX = mvLX * 2 / SubWidthC (resp. SubHeightC); chroma samples are
+                // interpolated at 1/8-pel. For 4:2:0 (Sub=2) mvCLX == mvLX. For 4:2:2
+                // (SubWidthC=2, SubHeightC=1) the vertical component is doubled, so the
+                // vertical interpolation runs at full (luma) sampling density.
+                int mvCx = mvL0.x * 2 / subW;
+                int mvCy = mvL0.y * 2 / subH;
                 int xPbC = xPb / subW;
                 int yPbC = yPb / subH;
-                // Chroma MV derivation: spec §8.5.3.3.2
-                // For 4:2:0: mvC_x = mvL_x, mvC_y = mvL_y (same quarter-pel values)
-                // But chroma positions: xIntC = xPbC + (mvCx >> 3), xFracC = mvCx & 7
-                // because for 4:2:0, the luma MV at 1/4 pel maps to chroma at 1/8 pel
-                // (2x downsampling means 1/4 luma pel = 1/8 chroma pel)
                 int xInt = xPbC + (mvCx >> 3);
                 int yInt = yPbC + (mvCy >> 3);
                 int xFrac = mvCx & 7;
@@ -680,11 +681,14 @@ void perform_inter_prediction(DecodingContext& ctx,
                 interpolate_chroma(*refPic, cIdx, xInt, yInt, xFrac, yFrac,
                                     compW, compH, bitDepth, predL0);
             }
+        } else {
+            // Lost L0 reference: drop the flag so predL0_buf is never blended.
+            predFlagL0 = false;
         }
     }
 
     // L1 prediction
-    if (predFlagL1 && refIdxL1 >= 0) {
+    if (predFlagL1) {
         Picture* refPic = ctx.dpb->ref_pic_list1(refIdxL1);
         if (refPic) {
             if (cIdx == 0) {
@@ -695,16 +699,30 @@ void perform_inter_prediction(DecodingContext& ctx,
                 interpolate_luma(*refPic, xInt, yInt, xFrac, yFrac,
                                   compW, compH, bitDepth, predL1);
             } else {
+                int mvCx = mvL1.x * 2 / subW;
+                int mvCy = mvL1.y * 2 / subH;
                 int xPbC = xPb / subW;
                 int yPbC = yPb / subH;
-                int xInt = xPbC + (mvL1.x >> 3);
-                int yInt = yPbC + (mvL1.y >> 3);
-                int xFrac = mvL1.x & 7;
-                int yFrac = mvL1.y & 7;
+                int xInt = xPbC + (mvCx >> 3);
+                int yInt = yPbC + (mvCy >> 3);
+                int xFrac = mvCx & 7;
+                int yFrac = mvCy & 7;
                 interpolate_chroma(*refPic, cIdx, xInt, yInt, xFrac, yFrac,
                                     compW, compH, bitDepth, predL1);
             }
+        } else {
+            // Lost L1 reference: drop the flag so predL1_buf is never blended.
+            predFlagL1 = false;
         }
+    }
+
+    // Both lists lost their reference: conceal the PU with neutral mid-gray
+    // rather than blending uninitialized prediction buffers (UB on lost refs).
+    if (!predFlagL0 && !predFlagL1) {
+        int16_t neutral = static_cast<int16_t>(1 << (bitDepth - 1));
+        for (int i = 0; i < nSamples; i++)
+            pred_samples[i] = neutral;
+        return;
     }
 
     // §8.5.3.3.4.1: Determine weightedPredFlag

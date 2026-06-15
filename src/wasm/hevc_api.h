@@ -70,6 +70,15 @@ int hevc_decoder_get_frame(HEVCDecoder* dec, int index, HEVCFrame* frame);
 // Returns HEVC_OK on success, HEVC_ERROR if no stream decoded yet
 int hevc_decoder_get_info(HEVCDecoder* dec, HEVCStreamInfo* info);
 
+// Recovery-point SEI query (gradual decoding refresh — spec D.3.8).
+// For non-IDR random-access tune-in (e.g. camera periodic intra-refresh), this
+// reports when decoded output becomes reliable. After feeding/decoding, returns
+// HEVC_OK and sets *recovery_poc to the POC at which output is usable (the
+// recovery point's associated-picture POC + recovery_poc_cnt). Returns
+// HEVC_ERROR if no recovery_point SEI has been seen since the last reset/start.
+// recovery_poc may be NULL if the caller only wants the present/absent signal.
+int hevc_decoder_get_recovery_point(HEVCDecoder* dec, int* recovery_poc);
+
 // --- Incremental API (streaming) ---
 
 // Feed a chunk of data (one or more complete NAL units with start codes)

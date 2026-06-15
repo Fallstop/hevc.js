@@ -1,6 +1,7 @@
 export { HEVCDecoder } from "./decoder.js";
 export type {
   HEVCFrame,
+  HEVCFrameView,
   HEVCStreamInfo,
   DecodeResult,
   DecoderOptions,

@@ -14,6 +14,65 @@ struct HEVCDecoder {
     const hevc::SPS* last_sps = nullptr;
 };
 
+namespace {
+
+// Populate a HEVCFrame from a decoded Picture (conformance-window cropped).
+// Shared by the batch and incremental get-frame entry points.
+void fill_frame(const hevc::Picture* pic, HEVCFrame* frame) {
+    const bool monochrome = (pic->chroma_format == hevc::ChromaFormat::MONOCHROME);
+    int sub_w = hevc::SubWidthC(pic->chroma_format);
+    int sub_h = hevc::SubHeightC(pic->chroma_format);
+
+    // Cropped luma dimensions
+    int crop_w = pic->pic_width_in_luma - pic->conf_win_left - pic->conf_win_right;
+    int crop_h = pic->pic_height_in_luma - pic->conf_win_top - pic->conf_win_bottom;
+
+    // Luma plane pointer offset by the conformance window (offsets are in SAMPLES,
+    // so they add correctly to a uint8_t* (1 byte/sample) or uint16_t* (2 bytes)).
+    int y_offset = pic->conf_win_top * pic->stride[0] + pic->conf_win_left;
+
+    if (pic->bytes_per_sample == 1) {
+        frame->y = reinterpret_cast<const uint16_t*>(pic->plane_ptr<uint8_t>(0) + y_offset);
+    } else {
+        frame->y = pic->plane_ptr<uint16_t>(0) + y_offset;
+    }
+    frame->width = crop_w;
+    frame->height = crop_h;
+    frame->stride_y = pic->stride[0];
+    frame->bit_depth = pic->bit_depth_luma;
+    frame->poc = pic->poc;
+    frame->bytes_per_sample = pic->bytes_per_sample;
+
+    if (monochrome) {
+        // 4:0:0 has no chroma planes — the chroma buffers are zero-length, so the
+        // pointers must stay null and the dimensions/stride must be 0. Pointing into
+        // the empty buffers (and reporting non-zero chroma dims) would hand the
+        // consumer an out-of-bounds read.
+        frame->cb = nullptr;
+        frame->cr = nullptr;
+        frame->stride_c = 0;
+        frame->chroma_width = 0;
+        frame->chroma_height = 0;
+        return;
+    }
+
+    // Chroma plane pointers offset by the conformance window (scaled to chroma grid)
+    int c_offset = (pic->conf_win_top / sub_h) * pic->stride[1] +
+                   (pic->conf_win_left / sub_w);
+    if (pic->bytes_per_sample == 1) {
+        frame->cb = reinterpret_cast<const uint16_t*>(pic->plane_ptr<uint8_t>(1) + c_offset);
+        frame->cr = reinterpret_cast<const uint16_t*>(pic->plane_ptr<uint8_t>(2) + c_offset);
+    } else {
+        frame->cb = pic->plane_ptr<uint16_t>(1) + c_offset;
+        frame->cr = pic->plane_ptr<uint16_t>(2) + c_offset;
+    }
+    frame->stride_c = pic->stride[1];
+    frame->chroma_width = crop_w / sub_w;
+    frame->chroma_height = crop_h / sub_h;
+}
+
+} // namespace
+
 extern "C" {
 
 HEVCDecoder* hevc_decoder_create(void) {
@@ -51,40 +110,7 @@ int hevc_decoder_get_frame(HEVCDecoder* dec, int index, HEVCFrame* frame) {
         return HEVC_ERROR;
 
     const auto* pic = dec->output[index];
-    int sub_w = hevc::SubWidthC(pic->chroma_format);
-    int sub_h = hevc::SubHeightC(pic->chroma_format);
-
-    // Cropped dimensions
-    int crop_w = pic->pic_width_in_luma - pic->conf_win_left - pic->conf_win_right;
-    int crop_h = pic->pic_height_in_luma - pic->conf_win_top - pic->conf_win_bottom;
-
-    // Plane pointers offset by conformance window
-    int y_offset = pic->conf_win_top * pic->stride[0] + pic->conf_win_left;
-    int c_offset = (pic->conf_win_top / sub_h) * pic->stride[1] +
-                   (pic->conf_win_left / sub_w);
-
-    // Offsets are in SAMPLES, so they add correctly to a uint8_t* (1 byte/sample)
-    // or a uint16_t* (2 bytes/sample). For uint8 storage the pointer is reinterpreted
-    // to fit the field type; the consumer re-bases per bytes_per_sample.
-    if (pic->bytes_per_sample == 1) {
-        frame->y  = reinterpret_cast<const uint16_t*>(pic->plane_ptr<uint8_t>(0) + y_offset);
-        frame->cb = reinterpret_cast<const uint16_t*>(pic->plane_ptr<uint8_t>(1) + c_offset);
-        frame->cr = reinterpret_cast<const uint16_t*>(pic->plane_ptr<uint8_t>(2) + c_offset);
-    } else {
-        frame->y  = pic->plane_ptr<uint16_t>(0) + y_offset;
-        frame->cb = pic->plane_ptr<uint16_t>(1) + c_offset;
-        frame->cr = pic->plane_ptr<uint16_t>(2) + c_offset;
-    }
-    frame->width = crop_w;
-    frame->height = crop_h;
-    frame->stride_y = pic->stride[0];
-    frame->stride_c = pic->stride[1];
-    frame->chroma_width = crop_w / sub_w;
-    frame->chroma_height = crop_h / sub_h;
-    frame->bit_depth = pic->bit_depth_luma;
-    frame->poc = pic->poc;
-    frame->bytes_per_sample = pic->bytes_per_sample;
-
+    fill_frame(pic, frame);
     return HEVC_OK;
 }
 
@@ -119,35 +145,7 @@ int hevc_decoder_get_drained_frame(HEVCDecoder* dec, int index, HEVCFrame* frame
         return HEVC_ERROR;
 
     const auto* pic = dec->drained[index];
-    int sub_w = hevc::SubWidthC(pic->chroma_format);
-    int sub_h = hevc::SubHeightC(pic->chroma_format);
-
-    int crop_w = pic->pic_width_in_luma - pic->conf_win_left - pic->conf_win_right;
-    int crop_h = pic->pic_height_in_luma - pic->conf_win_top - pic->conf_win_bottom;
-
-    int y_offset = pic->conf_win_top * pic->stride[0] + pic->conf_win_left;
-    int c_offset = (pic->conf_win_top / sub_h) * pic->stride[1] +
-                   (pic->conf_win_left / sub_w);
-
-    if (pic->bytes_per_sample == 1) {
-        frame->y  = reinterpret_cast<const uint16_t*>(pic->plane_ptr<uint8_t>(0) + y_offset);
-        frame->cb = reinterpret_cast<const uint16_t*>(pic->plane_ptr<uint8_t>(1) + c_offset);
-        frame->cr = reinterpret_cast<const uint16_t*>(pic->plane_ptr<uint8_t>(2) + c_offset);
-    } else {
-        frame->y  = pic->plane_ptr<uint16_t>(0) + y_offset;
-        frame->cb = pic->plane_ptr<uint16_t>(1) + c_offset;
-        frame->cr = pic->plane_ptr<uint16_t>(2) + c_offset;
-    }
-    frame->width = crop_w;
-    frame->height = crop_h;
-    frame->stride_y = pic->stride[0];
-    frame->stride_c = pic->stride[1];
-    frame->chroma_width = crop_w / sub_w;
-    frame->chroma_height = crop_h / sub_h;
-    frame->bit_depth = pic->bit_depth_luma;
-    frame->poc = pic->poc;
-    frame->bytes_per_sample = pic->bytes_per_sample;
-
+    fill_frame(pic, frame);
     return HEVC_OK;
 }
 
@@ -189,6 +187,13 @@ int hevc_decoder_get_info(HEVCDecoder* dec, HEVCStreamInfo* info) {
     info->profile = 0;
     info->level = 0;
 
+    return HEVC_OK;
+}
+
+int hevc_decoder_get_recovery_point(HEVCDecoder* dec, int* recovery_poc) {
+    if (!dec || !dec->decoder.has_recovery_point()) return HEVC_ERROR;
+    if (recovery_poc)
+        *recovery_poc = static_cast<int>(dec->decoder.recovery_point_poc());
     return HEVC_OK;
 }
 

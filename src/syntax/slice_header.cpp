@@ -199,6 +199,13 @@ bool SliceHeader::parse(BitstreamReader& bs, const SPS& sps, const PPS& pps,
                     if (sps.num_long_term_ref_pics_sps > 1) {
                         lt_idx_sps[i] = bs.read_bits(lt_sps_bits);
                     }
+                    // §7.4.7.1: resolve SPS-indexed LTRP entries. When
+                    // num_long_term_ref_pics_sps == 1, lt_idx_sps[i] is inferred 0
+                    // (not coded). derive_rps reads poc_lsb_lt/used_by_curr_pic_lt_flag
+                    // for every i, so these must be populated from the SPS here.
+                    poc_lsb_lt[i] = sps.lt_ref_pic_poc_lsb_sps[lt_idx_sps[i]];
+                    used_by_curr_pic_lt_flag[i] =
+                        sps.used_by_curr_pic_lt_sps_flag[lt_idx_sps[i]];
                 } else {
                     poc_lsb_lt[i] = bs.read_bits(poc_lsb_bits);
                     used_by_curr_pic_lt_flag[i] = bs.read_flag();
@@ -239,6 +246,13 @@ bool SliceHeader::parse(BitstreamReader& bs, const SPS& sps, const PPS& pps,
             num_ref_idx_l0_active_minus1 = pps.num_ref_idx_l0_default_active_minus1;
             num_ref_idx_l1_active_minus1 = pps.num_ref_idx_l1_default_active_minus1;
         }
+
+        // num_ref_idx_l*_active_minus1 is an unbounded ue(v); the spec range is
+        // [0,14] (15 active refs). list_entry_l0/l1 are std::array<...,16>, so an
+        // oversized value from a corrupt/lossy camera stream would overrun the
+        // stack array. Clamp to <=15 (one slot of headroom) for memory safety.
+        if (num_ref_idx_l0_active_minus1 > 15) num_ref_idx_l0_active_minus1 = 15;
+        if (num_ref_idx_l1_active_minus1 > 15) num_ref_idx_l1_active_minus1 = 15;
 
         // NumPicTotalCurr — derived from active RPS
         // For ref_pic_lists_modification: need NumPicTotalCurr > 1

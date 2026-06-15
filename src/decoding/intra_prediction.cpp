@@ -76,9 +76,13 @@ static void build_reference_samples(const DecodingContext& ctx, int x0, int y0,
     // but preceding in Z-scan order. Simplified: available if before current TU
     // in raster scan (ry < yC) or (ry == yC..yC+nTbS-1 and rx < xC)
     // or the sample is in a CTU that precedes the current CTU.
-    int ctbSize = (cIdx > 0) ? sps.CtbSizeY / sps.SubWidthC : sps.CtbSizeY;
-    int curCtbX = xC / ctbSize;
-    int curCtbY = yC / ctbSize;
+    // §6.4.1 availability is defined in luma sample space, where the CTB is square
+    // (CtbSizeY). Doing all CTB / Z-scan arithmetic in luma coordinates makes it
+    // correct for any chroma format (4:2:2 chroma rows map 1:1 to luma rows, so a
+    // chroma row of 32 is still in luma CTB row 0 for a 64-wide CTB).
+    int ctbSize = static_cast<int>(sps.CtbSizeY);
+    int curCtbX = x0 / ctbSize;
+    int curCtbY = y0 / ctbSize;
 
     // Z-scan address from min-CB coordinates within a CTU
     // Interleave bits: x in even positions, y in odd positions
@@ -93,8 +97,8 @@ static void build_reference_samples(const DecodingContext& ctx, int x0, int y0,
 
     // Use min-TB granularity (4x4) for Z-scan to handle NxN sub-PU correctly
     int minBlkSize = sps.MinTbSizeY;
-    int ctbOriginX = curCtbX * static_cast<int>(sps.CtbSizeY);
-    int ctbOriginY = curCtbY * static_cast<int>(sps.CtbSizeY);
+    int ctbOriginX = curCtbX * ctbSize;
+    int ctbOriginY = curCtbY * ctbSize;
     // Current TU's Z-scan address (in min-TB units within CTU)
     uint32_t curZScan = zscan_addr((x0 - ctbOriginX) / minBlkSize,
                                     (y0 - ctbOriginY) / minBlkSize);
@@ -102,8 +106,12 @@ static void build_reference_samples(const DecodingContext& ctx, int x0, int y0,
     auto is_reconstructed = [&](int rx, int ry) -> bool {
         if (rx < 0 || ry < 0 || rx >= picW || ry >= picH) return false;
 
-        int refCtbX = rx / ctbSize;
-        int refCtbY = ry / ctbSize;
+        // Map component coords back to luma for the luma-space availability checks.
+        int lumaRx = (cIdx > 0) ? rx * sps.SubWidthC : rx;
+        int lumaRy = (cIdx > 0) ? ry * sps.SubHeightC : ry;
+
+        int refCtbX = lumaRx / ctbSize;
+        int refCtbY = lumaRy / ctbSize;
 
         // Different CTU: available if CTU was already decoded AND in same slice/tile (§6.4.1)
         if (refCtbX != curCtbX || refCtbY != curCtbY) {
@@ -124,9 +132,6 @@ static void build_reference_samples(const DecodingContext& ctx, int x0, int y0,
         }
 
         // Same CTU: compare Z-scan addresses at min-TB granularity
-        int lumaRx = (cIdx > 0) ? rx * sps.SubWidthC : rx;
-        int lumaRy = (cIdx > 0) ? ry * sps.SubHeightC : ry;
-
         uint32_t refZScan = zscan_addr((lumaRx - ctbOriginX) / minBlkSize,
                                         (lumaRy - ctbOriginY) / minBlkSize);
         return refZScan < curZScan;

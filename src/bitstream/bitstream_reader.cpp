@@ -49,7 +49,15 @@ void BitstreamReader::refill() {
 }
 
 uint32_t BitstreamReader::read_bits(int n) {
-    assert(n >= 0 && n <= 32);
+    // A corrupt bitstream can drive the requested width out of range (e.g. a
+    // bogus Exp-Golomb leading-zero count). This is a DATA error, not a
+    // programmer error, so it must be catchable — a hard assert() would abort the
+    // whole process in debug/ASan builds and defeat per-picture error resync.
+    // Throw the same way the read-past-end guard below does, so the decoder can
+    // contain the failure, drop the picture, and resync at the next IRAP.
+    if (n < 0 || n > 32) {
+        throw std::runtime_error("BitstreamReader: invalid read width");
+    }
     if (n == 0) return 0;
 
     if (bit_pos_ + static_cast<size_t>(n) > size_ * 8) {

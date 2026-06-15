@@ -1,4 +1,5 @@
 import type { WorkerRequest, WorkerResponse, HEVCFrame, HEVCStreamInfo } from "./types.js";
+import { FRAME_STRUCT, copyPlane, readFrameStruct } from "./frame-layout.js";
 
 /**
  * Emscripten module interface
@@ -88,34 +89,29 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 
       // Frames
       const count = api.getFrameCount(dec);
-      const framePtr = m._malloc(48);
+      const framePtr = m._malloc(FRAME_STRUCT.SIZE);
 
       for (let i = 0; i < count; i++) {
         if (api.getFrame(dec, i, framePtr) !== 0) continue;
 
-        const yPtr    = m.getValue(framePtr, "*");
-        const cbPtr   = m.getValue(framePtr + 4, "*");
-        const crPtr   = m.getValue(framePtr + 8, "*");
-        const width   = m.getValue(framePtr + 12, "i32");
-        const height  = m.getValue(framePtr + 16, "i32");
-        const strideY = m.getValue(framePtr + 20, "i32");
-        const strideC = m.getValue(framePtr + 24, "i32");
-        const cw      = m.getValue(framePtr + 28, "i32");
-        const ch      = m.getValue(framePtr + 32, "i32");
-        const bd      = m.getValue(framePtr + 36, "i32");
-        const poc     = m.getValue(framePtr + 40, "i32");
-        const bps     = m.getValue(framePtr + 44, "i32");
+        const s = readFrameStruct(m, framePtr);
+        const y  = copyPlane(m, s.yPtr,  s.width, s.height, s.strideY, s.bytesPerSample);
+        const cb = copyPlane(m, s.cbPtr, s.chromaWidth, s.chromaHeight, s.strideC, s.bytesPerSample);
+        const cr = copyPlane(m, s.crPtr, s.chromaWidth, s.chromaHeight, s.strideC, s.bytesPerSample);
 
-        const y  = copyPlane(m, yPtr, width, height, strideY, bps);
-        const cb = copyPlane(m, cbPtr, cw, ch, strideC, bps);
-        const cr = copyPlane(m, crPtr, cw, ch, strideC, bps);
+        // `bytesPerSample` discriminates the plane element type; build the
+        // matching union member so the transferred HEVCFrame stays well-typed.
+        const meta = {
+          width: s.width, height: s.height,
+          chromaWidth: s.chromaWidth, chromaHeight: s.chromaHeight,
+          bitDepth: s.bitDepth, poc: s.poc,
+        };
+        const frame: HEVCFrame = s.bytesPerSample === 1
+          ? { ...meta, bytesPerSample: 1, y: y as Uint8Array, cb: cb as Uint8Array, cr: cr as Uint8Array }
+          : { ...meta, bytesPerSample: 2, y: y as Uint16Array, cb: cb as Uint16Array, cr: cr as Uint16Array };
 
         post(
-          {
-            type: "frame",
-            index: i,
-            frame: { y, cb, cr, width, height, chromaWidth: cw, chromaHeight: ch, bitDepth: bd, poc, bytesPerSample: bps },
-          },
+          { type: "frame", index: i, frame },
           [y.buffer, cb.buffer, cr.buffer],
         );
       }
@@ -133,19 +129,3 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
     post({ type: "error", message: err instanceof Error ? err.message : String(err) });
   }
 };
-
-function copyPlane(m: EmscriptenModule, ptr: number, width: number, height: number, stride: number, bytesPerSample: number): Uint8Array | Uint16Array {
-  if (bytesPerSample === 1) {
-    const out = new Uint8Array(width * height);
-    for (let y = 0; y < height; y++) {
-      out.set(m.HEAPU8.subarray(ptr + y * stride, ptr + y * stride + width), y * width);
-    }
-    return out;
-  }
-  const out = new Uint16Array(width * height);
-  const base = ptr >> 1;
-  for (let y = 0; y < height; y++) {
-    out.set(m.HEAPU16.subarray(base + y * stride, base + y * stride + width), y * width);
-  }
-  return out;
-}

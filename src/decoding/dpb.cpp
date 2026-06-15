@@ -12,22 +12,17 @@ namespace hevc {
 // ============================================================
 
 int32_t DPB::derive_poc(const SliceHeader& sh, const SPS& sps,
-                         NalUnitType nal_type, uint8_t nuh_temporal_id) {
+                         NalUnitType nal_type, uint8_t nuh_temporal_id,
+                         bool no_rasl_output_flag) {
     int32_t MaxPicOrderCntLsb = 1 << (sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
     int32_t PicOrderCntMsb;
 
-    // §8.3.1: IRAP with NoRaslOutputFlag = 1 → reset
+    // §8.3.1: IRAP with NoRaslOutputFlag = 1 → reset. NoRaslOutputFlag (§8.1)
+    // is supplied by the decoder: it is 1 for IDR/BLA and for a CRA that is the
+    // first picture of the bitstream / first after EOS / first after reset(),
+    // but 0 for a mid-stream CRA (whose RASL pictures are decodable and output).
     bool isIRAP = is_irap(nal_type);
-    // Simplified NoRaslOutputFlag: true for IDR, BLA, first picture
-    bool NoRaslOutputFlag = false;
-    if (nal_type == NalUnitType::IDR_W_RADL || nal_type == NalUnitType::IDR_N_LP) {
-        NoRaslOutputFlag = true;
-    } else if (nal_type == NalUnitType::BLA_W_LP || nal_type == NalUnitType::BLA_W_RADL ||
-               nal_type == NalUnitType::BLA_N_LP) {
-        NoRaslOutputFlag = true;
-    } else if (isIRAP && first_picture_) {
-        NoRaslOutputFlag = true;  // §8.1: first picture in bitstream
-    }
+    bool NoRaslOutputFlag = isIRAP && no_rasl_output_flag;
 
     if (isIRAP && NoRaslOutputFlag) {
         // §8.3.1: "PicOrderCntMsb is set equal to 0"
@@ -68,8 +63,6 @@ int32_t DPB::derive_poc(const SliceHeader& sh, const SPS& sps,
         prev_poc_msb_ = 0;
     }
 
-    first_picture_ = false;
-
     HEVC_LOG(PARSE, "POC derived: %d (lsb=%d, msb=%d)",
              PicOrderCntVal, sh.slice_pic_order_cnt_lsb, PicOrderCntMsb);
 
@@ -81,17 +74,16 @@ int32_t DPB::derive_poc(const SliceHeader& sh, const SPS& sps,
 // ============================================================
 
 void DPB::derive_rps(const SliceHeader& sh, const SPS& sps,
-                      NalUnitType nal_type, int32_t picOrderCntVal) {
+                      NalUnitType nal_type, int32_t picOrderCntVal,
+                      bool no_rasl_output_flag) {
     int32_t MaxPicOrderCntLsb = 1 << (sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
     bool isIRAP = is_irap(nal_type);
     bool isIDR = (nal_type == NalUnitType::IDR_W_RADL || nal_type == NalUnitType::IDR_N_LP);
 
-    // §8.3.2: IRAP with NoRaslOutputFlag → mark all as unused
-    bool NoRaslOutputFlag = (nal_type == NalUnitType::IDR_W_RADL ||
-                              nal_type == NalUnitType::IDR_N_LP ||
-                              nal_type == NalUnitType::BLA_W_LP ||
-                              nal_type == NalUnitType::BLA_W_RADL ||
-                              nal_type == NalUnitType::BLA_N_LP);
+    // §8.3.2: IRAP with NoRaslOutputFlag → mark all as unused. The flag is the
+    // decoder-level NoRaslOutputFlag (see derive_poc); a mid-stream CRA has it 0
+    // and therefore keeps its prior references alive for the RASL pictures.
+    bool NoRaslOutputFlag = isIRAP && no_rasl_output_flag;
     if (isIRAP && NoRaslOutputFlag) {
         for (auto& pic : pictures_) {
             if (pic.get() != current_pic_) {
@@ -242,67 +234,83 @@ void DPB::derive_rps(const SliceHeader& sh, const SPS& sps,
 // §8.3.4 — Reference picture list construction
 // ============================================================
 
+// §8.3.4 — pure helper shared by L0/L1. Builds RefPicListTempX (eq 8-8 / 8-10)
+// from the three RPS sets in the supplied iteration order, then derives the
+// final RefPicListX (eq 8-9 / 8-11). Extracted as a free function so the
+// robustness guards (all-empty-RPS hang, out-of-range list_entry) are unit
+// testable without exposing the DPB's private RPS state.
+//
+// Robustness on untrusted/lossy camera streams:
+//   - all-empty RPS: break out of the temp loop instead of spinning forever.
+//   - out-of-range list_entry: a raw bitstream index past the temp list maps
+//     to nullptr (concealed) rather than reading out of bounds.
+std::vector<Picture*> DPB::build_ref_pic_list(
+        const std::vector<Picture*>& rps_first,
+        const std::vector<Picture*>& rps_second,
+        const std::vector<Picture*>& rps_lt,
+        int num_ref_idx_active_minus1,
+        bool modification_flag,
+        const uint32_t* list_entry, size_t list_entry_count) {
+    int NumPicTotalCurr = static_cast<int>(rps_first.size() + rps_second.size() + rps_lt.size());
+    int NumRpsCurrTempList = std::max<int>(num_ref_idx_active_minus1 + 1, NumPicTotalCurr);
+
+    // eq 8-8 / 8-10: RefPicListTempX
+    std::vector<Picture*> temp;
+    {
+        int rIdx = 0;
+        while (rIdx < NumRpsCurrTempList) {
+            // Guarantee advancement: if every RPS set is empty, rIdx would never
+            // increment below -> infinite loop. Break instead (concealed).
+            if (rps_first.empty() && rps_second.empty() && rps_lt.empty()) break;
+            for (int i = 0; i < static_cast<int>(rps_first.size())  && rIdx < NumRpsCurrTempList; rIdx++, i++)
+                temp.push_back(rps_first[i]);
+            for (int i = 0; i < static_cast<int>(rps_second.size()) && rIdx < NumRpsCurrTempList; rIdx++, i++)
+                temp.push_back(rps_second[i]);
+            for (int i = 0; i < static_cast<int>(rps_lt.size())     && rIdx < NumRpsCurrTempList; rIdx++, i++)
+                temp.push_back(rps_lt[i]);
+        }
+    }
+
+    // eq 8-9 / 8-11: RefPicListX
+    std::vector<Picture*> out;
+    for (int rIdx = 0; rIdx <= num_ref_idx_active_minus1; rIdx++) {
+        Picture* pic = nullptr;
+        if (modification_flag) {
+            int e = (rIdx < static_cast<int>(list_entry_count)) ? static_cast<int>(list_entry[rIdx]) : -1;
+            pic = (e >= 0 && e < static_cast<int>(temp.size())) ? temp[e] : nullptr;
+        } else {
+            pic = (rIdx < static_cast<int>(temp.size())) ? temp[rIdx] : nullptr;
+        }
+        out.push_back(pic);
+    }
+    return out;
+}
+
 void DPB::construct_ref_pic_lists(const SliceHeader& sh, const SPS& /*sps*/,
                                    const PPS& /*pps*/) {
     if (sh.slice_type == SliceType::I) return;  // No ref lists for I slices
 
-    int NumPocStCurrBefore = static_cast<int>(ref_pic_set_st_curr_before_.size());
-    int NumPocStCurrAfter  = static_cast<int>(ref_pic_set_st_curr_after_.size());
-    int NumPocLtCurr       = static_cast<int>(ref_pic_set_lt_curr_.size());
-    int NumPicTotalCurr    = NumPocStCurrBefore + NumPocStCurrAfter + NumPocLtCurr;
-
-    // §8.3.4 eq 8-8: Build RefPicListTemp0
-    int NumRpsCurrTempList0 = std::max<int>(sh.num_ref_idx_l0_active_minus1 + 1, NumPicTotalCurr);
-    std::vector<Picture*> RefPicListTemp0;
+    // §8.3.4 eq 8-8/8-9: RefPicList0 — order: StCurrBefore, StCurrAfter, LtCurr
     {
-        int rIdx = 0;
-        while (rIdx < NumRpsCurrTempList0) {
-            for (int i = 0; i < NumPocStCurrBefore && rIdx < NumRpsCurrTempList0; rIdx++, i++)
-                RefPicListTemp0.push_back(ref_pic_set_st_curr_before_[i]);
-            for (int i = 0; i < NumPocStCurrAfter && rIdx < NumRpsCurrTempList0; rIdx++, i++)
-                RefPicListTemp0.push_back(ref_pic_set_st_curr_after_[i]);
-            for (int i = 0; i < NumPocLtCurr && rIdx < NumRpsCurrTempList0; rIdx++, i++)
-                RefPicListTemp0.push_back(ref_pic_set_lt_curr_[i]);
-        }
+        auto l0 = build_ref_pic_list(
+            ref_pic_set_st_curr_before_, ref_pic_set_st_curr_after_, ref_pic_set_lt_curr_,
+            static_cast<int>(sh.num_ref_idx_l0_active_minus1),
+            sh.ref_pic_list_modification_flag_l0,
+            sh.list_entry_l0.data(), sh.list_entry_l0.size());
+        ref_pic_list0_.clear();
+        for (Picture* p : l0) ref_pic_list0_.push_back({p});
     }
 
-    // §8.3.4 eq 8-9: Build RefPicList0
-    ref_pic_list0_.clear();
-    for (int rIdx = 0; rIdx <= static_cast<int>(sh.num_ref_idx_l0_active_minus1); rIdx++) {
-        Picture* pic;
-        if (sh.ref_pic_list_modification_flag_l0)
-            pic = RefPicListTemp0[sh.list_entry_l0[rIdx]];
-        else
-            pic = RefPicListTemp0[rIdx];
-        ref_pic_list0_.push_back({pic});
-    }
-
-    // §8.3.4 eq 8-10, 8-11: Build RefPicList1 (B slices only)
+    // §8.3.4 eq 8-10/8-11: RefPicList1 (B slices only)
+    // Order: StCurrAfter FIRST (reversed vs List0), then StCurrBefore, LtCurr.
     if (sh.slice_type == SliceType::B) {
-        int NumRpsCurrTempList1 = std::max<int>(sh.num_ref_idx_l1_active_minus1 + 1, NumPicTotalCurr);
-        std::vector<Picture*> RefPicListTemp1;
-        {
-            int rIdx = 0;
-            while (rIdx < NumRpsCurrTempList1) {
-                // §8.3.4 eq 8-10: StCurrAfter FIRST (reversed order vs List0)
-                for (int i = 0; i < NumPocStCurrAfter && rIdx < NumRpsCurrTempList1; rIdx++, i++)
-                    RefPicListTemp1.push_back(ref_pic_set_st_curr_after_[i]);
-                for (int i = 0; i < NumPocStCurrBefore && rIdx < NumRpsCurrTempList1; rIdx++, i++)
-                    RefPicListTemp1.push_back(ref_pic_set_st_curr_before_[i]);
-                for (int i = 0; i < NumPocLtCurr && rIdx < NumRpsCurrTempList1; rIdx++, i++)
-                    RefPicListTemp1.push_back(ref_pic_set_lt_curr_[i]);
-            }
-        }
-
+        auto l1 = build_ref_pic_list(
+            ref_pic_set_st_curr_after_, ref_pic_set_st_curr_before_, ref_pic_set_lt_curr_,
+            static_cast<int>(sh.num_ref_idx_l1_active_minus1),
+            sh.ref_pic_list_modification_flag_l1,
+            sh.list_entry_l1.data(), sh.list_entry_l1.size());
         ref_pic_list1_.clear();
-        for (int rIdx = 0; rIdx <= static_cast<int>(sh.num_ref_idx_l1_active_minus1); rIdx++) {
-            Picture* pic;
-            if (sh.ref_pic_list_modification_flag_l1)
-                pic = RefPicListTemp1[sh.list_entry_l1[rIdx]];
-            else
-                pic = RefPicListTemp1[rIdx];
-            ref_pic_list1_.push_back({pic});
-        }
+        for (Picture* p : l1) ref_pic_list1_.push_back({p});
     }
 
     HEVC_LOG(PARSE, "RefPicLists: L0=%zu entries, L1=%zu entries",
@@ -388,6 +396,29 @@ void DPB::mark_current_as_short_term_ref() {
         current_pic_->used_for_short_term_ref = true;
         current_pic_->used_for_long_term_ref = false;
     }
+}
+
+void DPB::drop_current() {
+    // Error recovery: remove the in-progress picture from the pool. It was
+    // pushed by alloc_picture() but never finished decoding, so it must not be
+    // output or referenced. The cached RPS/ref-list/colpic state may also hold a
+    // dangling pointer to it; clear those too (they are rebuilt per picture).
+    if (!current_pic_) return;
+    pictures_.erase(
+        std::remove_if(pictures_.begin(), pictures_.end(),
+            [this](const std::shared_ptr<Picture>& p) {
+                return p.get() == current_pic_;
+            }),
+        pictures_.end());
+    current_pic_ = nullptr;
+    ref_pic_set_st_curr_before_.clear();
+    ref_pic_set_st_curr_after_.clear();
+    ref_pic_set_st_foll_.clear();
+    ref_pic_set_lt_curr_.clear();
+    ref_pic_set_lt_foll_.clear();
+    ref_pic_list0_.clear();
+    ref_pic_list1_.clear();
+    col_pic_ = nullptr;
 }
 
 std::vector<Picture*> DPB::get_output_pictures() {
@@ -571,13 +602,12 @@ void DPB::reset() {
     pictures_.clear();
     current_pic_ = nullptr;
 
-    // §8.3.1 POC carry-over ("prevTid0Pic"). first_picture_ must go back to
-    // true so the first IRAP of the new stream gets NoRaslOutputFlag and a
-    // POC MSB of 0 — leaving these stale corrupts POCs (and therefore
-    // reference selection) silently, with no crash.
+    // §8.3.1 POC carry-over ("prevTid0Pic"). Leaving these stale corrupts POCs
+    // (and therefore reference selection) silently, with no crash. The
+    // first-picture / NoRaslOutputFlag tracking now lives at decoder level
+    // (Decoder::reset() re-arms wait-for-IRAP), so there is no per-DPB flag.
     prev_poc_lsb_ = 0;
     prev_poc_msb_ = 0;
-    first_picture_ = true;
 
     // Cached RPS / reference / collocated state holds dangling Picture* into
     // the pool we just cleared. They are rebuilt per picture, but clearing

@@ -217,12 +217,20 @@ static void apply_sao_impl(DecodingContext& ctx) {
     // a component with no SAO anywhere is never read from the backup (its CTBs are
     // skipped below), so there is no reason to copy its plane — at 4K the chroma
     // planes are half the picture's bytes, and chroma SAO is frequently off.
+    // Also track anyEoComp[c]: set when any CTU runs Edge-Offset (type 2) for that
+    // component. EO kernels read neighbour samples, so they need the pre-SAO backup;
+    // Band-Offset kernels read only the self sample at (x,y) and overwrite it, so a
+    // component that is SAO-active but never Edge-Offset can run in place — no backup
+    // copy. Any single EO CTU forces the backup for that whole component. The scan
+    // must settle anyEoComp fully (no early break).
     bool anySaoComp[3] = { false, false, false };
+    bool anyEoComp[3] = { false, false, false };
     for (int i = 0; i < sps.PicSizeInCtbsY; i++) {
         for (int c = 0; c < numComp; c++) {
-            if (ctx.sao_params[i].sao_type_idx[c] != 0) anySaoComp[c] = true;
+            int t = ctx.sao_params[i].sao_type_idx[c];
+            if (t != 0) anySaoComp[c] = true;
+            if (t == 2) anyEoComp[c] = true;
         }
-        if (anySaoComp[0] && (numComp == 1 || (anySaoComp[1] && anySaoComp[2]))) break;
     }
     if (!anySaoComp[0] && !anySaoComp[1] && !anySaoComp[2]) return;
 
@@ -243,8 +251,13 @@ static void apply_sao_impl(DecodingContext& ctx) {
     // §8.7.3.1: SAO operates on a copy of the deblocked picture
     // Use persistent backup buffers (avoids heap allocation per frame)
     auto* origPlane = ctx.sao_backup;
+    // A component that is SAO-active but has no Edge-Offset CTU runs Band-Offset in
+    // place (reads then overwrites the same sample) — skip its backup copy and read
+    // the source straight from the destination plane.
+    bool compInPlace[3] = { false, false, false };
     for (int c = 0; c < numComp; c++) {
         if (!anySaoComp[c]) continue;  // never read → don't copy
+        if (!anyEoComp[c]) { compInPlace[c] = true; continue; }  // BO-only → in place
         size_t nSamp = pic->plane_samples(c);
         size_t nBytes = nSamp * sizeof(Sample);  // == plane_bytes[c].size()
         auto& backup = origPlane[c];
@@ -308,8 +321,12 @@ static void apply_sao_impl(DecodingContext& ctx) {
                 // Only needed if neighbors can be in a different slice/tile
                 bool needBoundaryCheck = saoBoundaryPossible;
 
-                const Sample* origData = reinterpret_cast<const Sample*>(origPlane[cIdx].data());
                 Sample* destData = pic->plane_ptr<Sample>(cIdx);
+                // BO-only components read source == destination (in-place); EO
+                // components read the pre-SAO backup.
+                const Sample* origData = compInPlace[cIdx]
+                    ? destData
+                    : reinterpret_cast<const Sample*>(origPlane[cIdx].data());
 
                 if (sao.sao_type_idx[cIdx] == 2) {
                     // Edge offset — §8.7.3.2

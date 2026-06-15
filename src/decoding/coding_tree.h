@@ -158,18 +158,23 @@ void decode_prediction_unit_intra(DecodingContext& ctx, int x0, int y0,
                                    int log2CbSize, PartMode part_mode);
 
 // Decode a transform tree (§7.3.8.10)
+// cbf_cb_parent / cbf_cr_parent carry the parent chroma CBF. For 4:2:2
+// (ChromaArrayType == 2) each chroma component has two stacked transform blocks,
+// so index [0] is the top block and [1] the bottom; other formats use [0] only.
 void decode_transform_tree(DecodingContext& ctx, int x0, int y0,
                            int xBase, int yBase,
                            int log2TrafoSize, int trafoDepth,
                            int blkIdx,
-                           bool cbf_cb_parent, bool cbf_cr_parent);
+                           const bool cbf_cb_parent[2],
+                           const bool cbf_cr_parent[2]);
 
 // Decode a transform unit (§7.3.8.11)
 void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
                            int xBase, int yBase,
                            int log2TrafoSize, int trafoDepth,
                            int blkIdx,
-                           bool cbf_luma, bool cbf_cb, bool cbf_cr);
+                           bool cbf_luma,
+                           const bool cbf_cb[2], const bool cbf_cr[2]);
 
 // PCM mode (§7.3.10.2)
 void decode_pcm_samples(DecodingContext& ctx, int x0, int y0, int log2CbSize);

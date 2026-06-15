@@ -1,4 +1,5 @@
 import type { HEVCFrame, HEVCFrameView, HEVCStreamInfo, DecodeResult, DecoderOptions } from "./types.js";
+import { FRAME_STRUCT, copyPlane, readFrameStruct } from "./frame-layout.js";
 
 /**
  * Emscripten module interface (subset we use)
@@ -41,6 +42,14 @@ export class HEVCDecoder {
   private _m: EmscriptenModule;
   private _api: DecoderAPI;
   private _dec: number;
+  /**
+   * Monotonic generation counter, bumped at the start of every entry point that
+   * can mutate, advance, free, or grow the WASM heap (feed/decode/drain/
+   * drainViews/flush/reset/destroy). Each {@link HEVCFrameView} captures the
+   * generation it was minted at; if the live counter has moved past it, the
+   * view's planes may no longer alias the data they were created over.
+   */
+  private _gen = 0;
 
   private constructor(module: EmscriptenModule) {
     this._m = module;
@@ -91,6 +100,7 @@ export class HEVCDecoder {
    * @param data Raw .265 bitstream bytes
    */
   decode(data: Uint8Array): DecodeResult {
+    this._gen++; // allocation + decode can grow/overwrite the heap
     const m = this._m;
     const ptr = m._malloc(data.length);
     try {
@@ -124,7 +134,7 @@ export class HEVCDecoder {
 
   private _extractFrame(index: number): HEVCFrame | null {
     const m = this._m;
-    const framePtr = m._malloc(48);
+    const framePtr = m._malloc(FRAME_STRUCT.SIZE);
     try {
       const ret = this._api.getFrame(this._dec, index, framePtr);
       if (ret !== 0) return null;
@@ -136,7 +146,7 @@ export class HEVCDecoder {
 
   private _extractDrainedFrame(index: number): HEVCFrame | null {
     const m = this._m;
-    const framePtr = m._malloc(48);
+    const framePtr = m._malloc(FRAME_STRUCT.SIZE);
     try {
       const ret = this._api.getDrainedFrame(this._dec, index, framePtr);
       if (ret !== 0) return null;
@@ -148,24 +158,30 @@ export class HEVCDecoder {
 
   private _readFrameFromPtr(framePtr: number): HEVCFrame {
     const m = this._m;
-    const yPtr    = m.getValue(framePtr, "*");
-    const cbPtr   = m.getValue(framePtr + 4, "*");
-    const crPtr   = m.getValue(framePtr + 8, "*");
-    const width   = m.getValue(framePtr + 12, "i32");
-    const height  = m.getValue(framePtr + 16, "i32");
-    const strideY = m.getValue(framePtr + 20, "i32");
-    const strideC = m.getValue(framePtr + 24, "i32");
-    const cw      = m.getValue(framePtr + 28, "i32");
-    const ch      = m.getValue(framePtr + 32, "i32");
-    const bd      = m.getValue(framePtr + 36, "i32");
-    const poc     = m.getValue(framePtr + 40, "i32");
-    const bps     = m.getValue(framePtr + 44, "i32");
-
-    const y  = copyPlane(m, yPtr, width, height, strideY, bps);
-    const cb = copyPlane(m, cbPtr, cw, ch, strideC, bps);
-    const cr = copyPlane(m, crPtr, cw, ch, strideC, bps);
-
-    return { y, cb, cr, width, height, chromaWidth: cw, chromaHeight: ch, bitDepth: bd, poc, bytesPerSample: bps };
+    const s = readFrameStruct(m, framePtr);
+    // Copy the planes out of the heap; the discriminated `bytesPerSample`
+    // pins the element type for the whole frame so no narrowing assert is
+    // needed downstream.
+    if (s.bytesPerSample === 1) {
+      return {
+        bytesPerSample: 1,
+        y:  copyPlane(m, s.yPtr,  s.width, s.height, s.strideY, 1) as Uint8Array,
+        cb: copyPlane(m, s.cbPtr, s.chromaWidth, s.chromaHeight, s.strideC, 1) as Uint8Array,
+        cr: copyPlane(m, s.crPtr, s.chromaWidth, s.chromaHeight, s.strideC, 1) as Uint8Array,
+        width: s.width, height: s.height,
+        chromaWidth: s.chromaWidth, chromaHeight: s.chromaHeight,
+        bitDepth: s.bitDepth, poc: s.poc,
+      };
+    }
+    return {
+      bytesPerSample: 2,
+      y:  copyPlane(m, s.yPtr,  s.width, s.height, s.strideY, 2) as Uint16Array,
+      cb: copyPlane(m, s.cbPtr, s.chromaWidth, s.chromaHeight, s.strideC, 2) as Uint16Array,
+      cr: copyPlane(m, s.crPtr, s.chromaWidth, s.chromaHeight, s.strideC, 2) as Uint16Array,
+      width: s.width, height: s.height,
+      chromaWidth: s.chromaWidth, chromaHeight: s.chromaHeight,
+      bitDepth: s.bitDepth, poc: s.poc,
+    };
   }
 
   private _extractInfo(): HEVCStreamInfo | null {
@@ -195,6 +211,7 @@ export class HEVCDecoder {
    * Call drain() after each feed() to retrieve output-ready frames.
    */
   feed(data: Uint8Array): void {
+    this._gen++; // allocation + decode-in-feed can grow/overwrite the heap
     const m = this._m;
     const ptr = m._malloc(data.length);
     try {
@@ -212,6 +229,7 @@ export class HEVCDecoder {
    * Frames are valid until the next feed() or destroy() call.
    */
   drain(): HEVCFrame[] {
+    this._gen++; // advances the DPB and may overwrite the heap
     const m = this._m;
     const countPtr = m._malloc(4);
     try {
@@ -235,14 +253,22 @@ export class HEVCDecoder {
    * copy. Use this in the same thread/worker that consumes the pixels (e.g. a
    * transcode or render worker) to remove the steady-state plane copy.
    *
-   * The returned views (and all their planes) are only valid until the next
-   * `feed()`, `drain()`, `drainViews()`, `flush()`, or `destroy()` call on this
-   * decoder — any of which may overwrite or reallocate the heap. Consume every
-   * view (or copy out what you need) before the next such call. The views must
-   * NOT be transferred via postMessage: they alias the module's heap buffer,
-   * not an owned ArrayBuffer.
+   * LIFETIME — the returned views (and all their planes) alias the live WASM
+   * heap and are **invalidated by the next decoder call** on this decoder:
+   * `decode()`, `feed()`, `drain()`, `drainViews()`, `flush()`, `reset()`, or
+   * `destroy()`. Any of these may overwrite, free, or — under
+   * `ALLOW_MEMORY_GROWTH` — *detach* the underlying `ArrayBuffer`. They must be
+   * consumed **synchronously** before any such call or any other WASM-heap
+   * allocation, and must NOT be transferred via `postMessage`, queued, or held
+   * across an `await`: the planes do not own an `ArrayBuffer`. Each view carries
+   * {@link HEVCFrameView.isValid}/{@link HEVCFrameView.assertValid} so misuse
+   * fails loudly (a clear `Error`) instead of silently reading zeros/garbage.
+   *
+   * If you need to keep pixels past the next decoder call, use the copying
+   * {@link drain} instead.
    */
   drainViews(): HEVCFrameView[] {
+    this._gen++; // advances the DPB and may overwrite/grow the heap
     const m = this._m;
     const countPtr = m._malloc(4);
     try {
@@ -254,7 +280,7 @@ export class HEVCDecoder {
       // view built here is simultaneously live for the caller's loop. The
       // struct scratch is malloc'd once up front (no heap growth occurs in the
       // loop below), so the heap views stay attached while we build them.
-      const framePtr = m._malloc(48);
+      const framePtr = m._malloc(FRAME_STRUCT.SIZE);
       try {
         for (let i = 0; i < count; i++) {
           const r = this._api.getDrainedFrame(this._dec, i, framePtr);
@@ -270,42 +296,84 @@ export class HEVCDecoder {
     }
   }
 
+  /**
+   * Build the lifetime guard pair for a freshly-minted view. The view is valid
+   * while (a) the decoder has not advanced its generation past `gen`, and
+   * (b) the heap `ArrayBuffer` the planes alias is still the module's live heap.
+   *
+   * `heap` names the typed array (`HEAPU8` or `HEAPU16`) the view's sub-arrays
+   * were carved from: we capture its current `.buffer`, then later re-read the
+   * module's *live* heap of the same width and compare. Under
+   * `ALLOW_MEMORY_GROWTH` the module swaps `HEAPU8`/`HEAPU16` for fresh typed
+   * arrays over a new buffer, so a mismatch means the captured planes now alias
+   * a stale/detached buffer.
+   */
+  private _viewGuard(
+    gen: number,
+    heap: "HEAPU8" | "HEAPU16",
+  ): { isValid(): boolean; assertValid(): void } {
+    const self = this;
+    const buffer = self._m[heap].buffer;
+    const detached = (): boolean => self._m[heap].buffer !== buffer;
+    const isValid = (): boolean => self._gen === gen && !detached();
+    return {
+      isValid,
+      assertValid(): void {
+        if (self._gen !== gen) {
+          throw new Error(
+            `HEVCFrameView is stale: a later decoder call (generation ${self._gen} > ${gen}) ` +
+            `may have overwritten or freed its heap planes. Consume views synchronously, ` +
+            `or use the copying drain() to retain frames.`,
+          );
+        }
+        if (detached()) {
+          throw new Error(
+            "HEVCFrameView is detached: WASM memory growth replaced the heap ArrayBuffer. " +
+            "Its planes now alias a dead buffer. Use the copying drain() to retain frames.",
+          );
+        }
+      },
+    };
+  }
+
   private _readFrameView(framePtr: number): HEVCFrameView {
     const m = this._m;
-    const yPtr    = m.getValue(framePtr, "*");
-    const cbPtr   = m.getValue(framePtr + 4, "*");
-    const crPtr   = m.getValue(framePtr + 8, "*");
-    const width   = m.getValue(framePtr + 12, "i32");
-    const height  = m.getValue(framePtr + 16, "i32");
-    const strideY = m.getValue(framePtr + 20, "i32");
-    const strideC = m.getValue(framePtr + 24, "i32");
-    const cw      = m.getValue(framePtr + 28, "i32");
-    const ch      = m.getValue(framePtr + 32, "i32");
-    const bd      = m.getValue(framePtr + 36, "i32");
-    const poc     = m.getValue(framePtr + 40, "i32");
-    const bps     = m.getValue(framePtr + 44, "i32");
+    const s = readFrameStruct(m, framePtr);
 
     // Sub-array spans from the first visible sample through the last visible
     // sample of the strided plane: (h-1)*stride + w covers every row we read.
     // Spans are in SAMPLES, valid for both element widths.
-    const ySpan = height > 0 ? strideY * (height - 1) + width : 0;
-    const cSpan = ch > 0 ? strideC * (ch - 1) + cw : 0;
-    let y: Uint8Array | Uint16Array;
-    let cb: Uint8Array | Uint16Array;
-    let cr: Uint8Array | Uint16Array;
-    if (bps === 1) {
-      // Native 8-bit planes: byte base == sample base, view over HEAPU8.
-      y  = m.HEAPU8.subarray(yPtr,  yPtr  + ySpan);
-      cb = m.HEAPU8.subarray(cbPtr, cbPtr + cSpan);
-      cr = m.HEAPU8.subarray(crPtr, crPtr + cSpan);
-    } else {
-      const yBase = yPtr >> 1, cbBase = cbPtr >> 1, crBase = crPtr >> 1;
-      y  = m.HEAPU16.subarray(yBase,  yBase  + ySpan);
-      cb = m.HEAPU16.subarray(cbBase, cbBase + cSpan);
-      cr = m.HEAPU16.subarray(crBase, crBase + cSpan);
-    }
+    const ySpan = s.height > 0 ? s.strideY * (s.height - 1) + s.width : 0;
+    const cSpan = s.chromaHeight > 0 ? s.strideC * (s.chromaHeight - 1) + s.chromaWidth : 0;
 
-    return { y, cb, cr, width, height, chromaWidth: cw, chromaHeight: ch, strideY, strideC, bitDepth: bd, poc, bytesPerSample: bps };
+    if (s.bytesPerSample === 1) {
+      // Native 8-bit planes: byte base == sample base, view over HEAPU8.
+      // Stamp with the generation + source heap so consumers can detect
+      // invalidation (next decoder call / memory growth).
+      return {
+        ...this._viewGuard(this._gen, "HEAPU8"),
+        bytesPerSample: 1,
+        y:  m.HEAPU8.subarray(s.yPtr,  s.yPtr  + ySpan),
+        cb: m.HEAPU8.subarray(s.cbPtr, s.cbPtr + cSpan),
+        cr: m.HEAPU8.subarray(s.crPtr, s.crPtr + cSpan),
+        width: s.width, height: s.height,
+        chromaWidth: s.chromaWidth, chromaHeight: s.chromaHeight,
+        strideY: s.strideY, strideC: s.strideC,
+        bitDepth: s.bitDepth, poc: s.poc,
+      };
+    }
+    const yBase = s.yPtr >> 1, cbBase = s.cbPtr >> 1, crBase = s.crPtr >> 1;
+    return {
+      ...this._viewGuard(this._gen, "HEAPU16"),
+      bytesPerSample: 2,
+      y:  m.HEAPU16.subarray(yBase,  yBase  + ySpan),
+      cb: m.HEAPU16.subarray(cbBase, cbBase + cSpan),
+      cr: m.HEAPU16.subarray(crBase, crBase + cSpan),
+      width: s.width, height: s.height,
+      chromaWidth: s.chromaWidth, chromaHeight: s.chromaHeight,
+      strideY: s.strideY, strideC: s.strideC,
+      bitDepth: s.bitDepth, poc: s.poc,
+    };
   }
 
   /**
@@ -313,6 +381,7 @@ export class HEVCDecoder {
    * Returns all buffered frames in display order.
    */
   flush(): HEVCFrame[] {
+    this._gen++; // drains the DPB and may overwrite the heap
     const ret = this._api.flush(this._dec);
     if (ret !== 0) return [];
     // After flush, drained frames are available via getDrainedFrame
@@ -322,7 +391,7 @@ export class HEVCDecoder {
       // flush() already populates the drained list, read the count
       // by checking how many frames are available
       const frames: HEVCFrame[] = [];
-      const framePtr = m._malloc(48);
+      const framePtr = m._malloc(FRAME_STRUCT.SIZE);
       try {
         for (let i = 0; ; i++) {
           const r = this._api.getDrainedFrame(this._dec, i, framePtr);
@@ -357,6 +426,7 @@ export class HEVCDecoder {
    */
   reset(clearParameterSets = true): void {
     if (!this._dec) return;
+    this._gen++; // drops DPB/POC state — invalidates any outstanding views
     const ret = this._api.reset(this._dec, clearParameterSets ? 1 : 0);
     if (ret !== 0) throw new Error(`Reset failed (code ${ret})`);
   }
@@ -364,27 +434,9 @@ export class HEVCDecoder {
   /** Release decoder resources */
   destroy(): void {
     if (this._dec) {
+      this._gen++; // frees the instance — invalidates any outstanding views
       this._api.destroy(this._dec);
       this._dec = 0;
     }
   }
-}
-
-/** Copy a YUV plane out of the WASM heap into a packed array, handling stride !=
- *  width. bytesPerSample selects the storage width: 1 = uint8 (HEAPU8, byte base
- *  == sample base), 2 = uint16 (HEAPU16, base = ptr >> 1). */
-function copyPlane(m: EmscriptenModule, ptr: number, width: number, height: number, stride: number, bytesPerSample: number): Uint8Array | Uint16Array {
-  if (bytesPerSample === 1) {
-    const out = new Uint8Array(width * height);
-    for (let y = 0; y < height; y++) {
-      out.set(m.HEAPU8.subarray(ptr + y * stride, ptr + y * stride + width), y * width);
-    }
-    return out;
-  }
-  const out = new Uint16Array(width * height);
-  const base = ptr >> 1;
-  for (let y = 0; y < height; y++) {
-    out.set(m.HEAPU16.subarray(base + y * stride, base + y * stride + width), y * width);
-  }
-  return out;
 }

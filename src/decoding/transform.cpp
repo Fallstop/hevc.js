@@ -24,9 +24,120 @@ namespace hevc {
 // Partial butterfly inverse transforms
 // ============================================================
 
-static void idst4(const int16_t* src, int16_t* dst, int shift, int line) {
+#if defined(__SSE2__)
+// Column-parallel SSE2 small transforms (4 columns/iter), mirroring idct16:
+// W() zero-extends 4 int16 src to int32; MUL()=_mm_madd_epi16(w,set1_epi32((uint16_t)c))
+// yields c*src as int32 (src read as signed int16 in the low lane); OUT() does
+// (v+add)>>shift then _mm_packs_epi32 == Clip3(-32768,32767). Accumulators stay
+// within int32. Same integer butterfly as scalar (additions reassociated → bit-exact).
+static void idst4(const int16_t* src, int16_t* dst, int shift, int line, int numCols) {
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i vadd = _mm_set1_epi32(1 << (shift - 1));
+    const __m128i vsh = _mm_cvtsi32_si128(shift);
+    for (int j = 0; j < numCols; j += 4) {
+        const int16_t* s = src + j;
+        auto W = [&](int r) -> __m128i {
+            return _mm_unpacklo_epi16(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + r * line)), zero);
+        };
+        auto MUL = [&](__m128i w, int c) -> __m128i {
+            return _mm_madd_epi16(w, _mm_set1_epi32(static_cast<uint16_t>(c)));
+        };
+        __m128i c0=W(0),c1=W(1),c2=W(2),c3=W(3);
+
+        // DST-VII inverse (M^T rows): {29,74,84,55},{55,74,-29,-84},{74,0,-74,74},{84,-74,55,-29}
+        __m128i s0=_mm_add_epi32(_mm_add_epi32(MUL(c0,29),MUL(c1,74)),_mm_add_epi32(MUL(c2,84),MUL(c3,55)));
+        __m128i s1=_mm_add_epi32(_mm_add_epi32(MUL(c0,55),MUL(c1,74)),_mm_add_epi32(MUL(c2,-29),MUL(c3,-84)));
+        __m128i s2=_mm_add_epi32(_mm_add_epi32(MUL(c0,74),MUL(c1,0)),_mm_add_epi32(MUL(c2,-74),MUL(c3,74)));
+        __m128i s3=_mm_add_epi32(_mm_add_epi32(MUL(c0,84),MUL(c1,-74)),_mm_add_epi32(MUL(c2,55),MUL(c3,-29)));
+
+        auto OUT=[&](int row, __m128i v){
+            __m128i r=_mm_sra_epi32(_mm_add_epi32(v,vadd),vsh);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + row*line + j), _mm_packs_epi32(r,r));
+        };
+        OUT(0,s0); OUT(1,s1); OUT(2,s2); OUT(3,s3);
+    }
+}
+
+static void idct4(const int16_t* src, int16_t* dst, int shift, int line, int numCols) {
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i vadd = _mm_set1_epi32(1 << (shift - 1));
+    const __m128i vsh = _mm_cvtsi32_si128(shift);
+    for (int j = 0; j < numCols; j += 4) {
+        const int16_t* s = src + j;
+        auto W = [&](int r) -> __m128i {
+            return _mm_unpacklo_epi16(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + r * line)), zero);
+        };
+        auto MUL = [&](__m128i w, int c) -> __m128i {
+            return _mm_madd_epi16(w, _mm_set1_epi32(static_cast<uint16_t>(c)));
+        };
+        __m128i w0=W(0),w1=W(1),w2=W(2),w3=W(3);
+
+        __m128i m0=MUL(w0,64), m2=MUL(w2,64);
+        __m128i E0=_mm_add_epi32(m0,m2), E1=_mm_sub_epi32(m0,m2);
+        __m128i O0=_mm_add_epi32(MUL(w1,83),MUL(w3,36));
+        __m128i O1=_mm_sub_epi32(MUL(w1,36),MUL(w3,83));
+
+        auto OUT=[&](int row, __m128i v){
+            __m128i r=_mm_sra_epi32(_mm_add_epi32(v,vadd),vsh);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + row*line + j), _mm_packs_epi32(r,r));
+        };
+        OUT(0,_mm_add_epi32(E0,O0));
+        OUT(1,_mm_add_epi32(E1,O1));
+        OUT(2,_mm_sub_epi32(E1,O1));
+        OUT(3,_mm_sub_epi32(E0,O0));
+    }
+}
+
+static void idct8(const int16_t* src, int16_t* dst, int shift, int line, int numCols) {
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i vadd = _mm_set1_epi32(1 << (shift - 1));
+    const __m128i vsh = _mm_cvtsi32_si128(shift);
+    for (int j = 0; j < numCols; j += 4) {
+        const int16_t* s = src + j;
+        auto W = [&](int r) -> __m128i {
+            return _mm_unpacklo_epi16(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + r * line)), zero);
+        };
+        auto MUL = [&](__m128i w, int c) -> __m128i {
+            return _mm_madd_epi16(w, _mm_set1_epi32(static_cast<uint16_t>(c)));
+        };
+        __m128i w0=W(0),w1=W(1),w2=W(2),w3=W(3),w4=W(4),w5=W(5),w6=W(6),w7=W(7);
+
+        __m128i m0=MUL(w0,64), m4=MUL(w4,64);
+        __m128i EE0=_mm_add_epi32(m0,m4), EE1=_mm_sub_epi32(m0,m4);
+        __m128i EO0=_mm_add_epi32(MUL(w2,83),MUL(w6,36));
+        __m128i EO1=_mm_sub_epi32(MUL(w2,36),MUL(w6,83));
+
+        __m128i E0=_mm_add_epi32(EE0,EO0), E3=_mm_sub_epi32(EE0,EO0);
+        __m128i E1=_mm_add_epi32(EE1,EO1), E2=_mm_sub_epi32(EE1,EO1);
+
+        auto O=[&](int a,int b,int c,int d){
+            return _mm_add_epi32(_mm_add_epi32(MUL(w1,a),MUL(w3,b)),
+                                 _mm_add_epi32(MUL(w5,c),MUL(w7,d)));
+        };
+        __m128i O0=O(89,75,50,18), O1=O(75,-18,-89,-50);
+        __m128i O2=O(50,-89,18,75), O3=O(18,-50,75,-89);
+
+        auto OUT=[&](int row, __m128i v){
+            __m128i r=_mm_sra_epi32(_mm_add_epi32(v,vadd),vsh);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + row*line + j), _mm_packs_epi32(r,r));
+        };
+        OUT(0,_mm_add_epi32(E0,O0));
+        OUT(1,_mm_add_epi32(E1,O1));
+        OUT(2,_mm_add_epi32(E2,O2));
+        OUT(3,_mm_add_epi32(E3,O3));
+        OUT(4,_mm_sub_epi32(E3,O3));
+        OUT(5,_mm_sub_epi32(E2,O2));
+        OUT(6,_mm_sub_epi32(E1,O1));
+        OUT(7,_mm_sub_epi32(E0,O0));
+    }
+}
+#else
+static void idst4(const int16_t* src, int16_t* dst, int shift, int line, int numCols) {
     int add = 1 << (shift - 1);
-    for (int j = 0; j < line; j++) {
+    for (int j = 0; j < numCols; j++) {
         int c0 = src[0 * line + j];
         int c1 = src[1 * line + j];
         int c2 = src[2 * line + j];
@@ -47,9 +158,9 @@ static void idst4(const int16_t* src, int16_t* dst, int shift, int line) {
     }
 }
 
-static void idct4(const int16_t* src, int16_t* dst, int shift, int line) {
+static void idct4(const int16_t* src, int16_t* dst, int shift, int line, int numCols) {
     int add = 1 << (shift - 1);
-    for (int j = 0; j < line; j++) {
+    for (int j = 0; j < numCols; j++) {
         int E0 = 64 * src[0 * line + j] + 64 * src[2 * line + j];
         int E1 = 64 * src[0 * line + j] - 64 * src[2 * line + j];
         int O0 = 83 * src[1 * line + j] + 36 * src[3 * line + j];
@@ -62,9 +173,9 @@ static void idct4(const int16_t* src, int16_t* dst, int shift, int line) {
     }
 }
 
-static void idct8(const int16_t* src, int16_t* dst, int shift, int line) {
+static void idct8(const int16_t* src, int16_t* dst, int shift, int line, int numCols) {
     int add = 1 << (shift - 1);
-    for (int j = 0; j < line; j++) {
+    for (int j = 0; j < numCols; j++) {
         int EE0 = 64 * src[0 * line + j] + 64 * src[4 * line + j];
         int EE1 = 64 * src[0 * line + j] - 64 * src[4 * line + j];
         int EO0 = 83 * src[2 * line + j] + 36 * src[6 * line + j];
@@ -88,6 +199,7 @@ static void idct8(const int16_t* src, int16_t* dst, int shift, int line) {
         dst[7*line+j] = static_cast<int16_t>(Clip3(-32768, 32767, (E0-O0+add) >> shift));
     }
 }
+#endif  // __SSE2__ small transforms
 
 #if defined(__SSE2__)
 // Column-parallel SSE2 idct16 (processes 4 columns per iteration). Widening multiply
@@ -95,11 +207,11 @@ static void idct8(const int16_t* src, int16_t* dst, int shift, int line) {
 // madd yields c*src as int32 — one fast wasm i32x4.dot_i16x8_s, correct for negative
 // src/c. Output narrowing via _mm_packs_epi32 == the scalar Clip3(-32768,32767). The
 // butterfly is the same integer math (additions reassociated → bit-exact).
-static void idct16(const int16_t* src, int16_t* dst, int shift, int line) {
+static void idct16(const int16_t* src, int16_t* dst, int shift, int line, int numCols) {
     const __m128i zero = _mm_setzero_si128();
     const __m128i vadd = _mm_set1_epi32(1 << (shift - 1));
     const __m128i vsh = _mm_cvtsi32_si128(shift);
-    for (int j = 0; j < line; j += 4) {
+    for (int j = 0; j < numCols; j += 4) {
         const int16_t* s = src + j;
         auto W = [&](int r) -> __m128i {
             return _mm_unpacklo_epi16(
@@ -160,7 +272,7 @@ static void idct16(const int16_t* src, int16_t* dst, int shift, int line) {
     }
 }
 #else
-static void idct16(const int16_t* src, int16_t* dst, int shift, int line) {
+static void idct16(const int16_t* src, int16_t* dst, int shift, int line, int numCols) {
     static const int16_t g[8][16] = {
         { 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64 },
         { 90, 87, 80, 70, 57, 43, 25,  9, -9,-25,-43,-57,-70,-80,-87,-90 },
@@ -180,7 +292,7 @@ static void idct16(const int16_t* src, int16_t* dst, int shift, int line) {
     (void)g; (void)ge;
 
     int add = 1 << (shift - 1);
-    for (int j = 0; j < line; j++) {
+    for (int j = 0; j < numCols; j++) {
         // Even-even
         int EEE0 = 64 * src[0*line+j] + 64 * src[8*line+j];
         int EEE1 = 64 * src[0*line+j] - 64 * src[8*line+j];
@@ -260,11 +372,11 @@ static const int16_t idct32_tm[32][32] = {
 #if defined(__SSE2__)
 // Column-parallel SSE2 idct32 (4 columns/iter), reusing idct32_tm. Same madd widening
 // and packs-narrowing as idct16; bit-exact (reassociated integer butterfly).
-static void idct32(const int16_t* src, int16_t* dst, int shift, int line) {
+static void idct32(const int16_t* src, int16_t* dst, int shift, int line, int numCols) {
     const __m128i zero = _mm_setzero_si128();
     const __m128i vadd = _mm_set1_epi32(1 << (shift - 1));
     const __m128i vsh = _mm_cvtsi32_si128(shift);
-    for (int j = 0; j < line; j += 4) {
+    for (int j = 0; j < numCols; j += 4) {
         const int16_t* s = src + j;
         auto W = [&](int r) -> __m128i {
             return _mm_unpacklo_epi16(
@@ -318,11 +430,11 @@ static void idct32(const int16_t* src, int16_t* dst, int shift, int line) {
     }
 }
 #else
-static void idct32(const int16_t* src, int16_t* dst, int shift, int line) {
+static void idct32(const int16_t* src, int16_t* dst, int shift, int line, int numCols) {
     int add = 1 << (shift - 1);
     const int16_t (&tm)[32][32] = idct32_tm;
 
-    for (int j = 0; j < line; j++) {
+    for (int j = 0; j < numCols; j++) {
         int O[16], E[16], EO[8], EE[8], EEO[4], EEE[4];
 
         // Odd
@@ -377,29 +489,63 @@ static void idct32(const int16_t* src, int16_t* dst, int shift, int line) {
 // Vertical pass -> clip -> horizontal pass
 // ============================================================
 
+// Dispatch one transform pass over the first `numCols` columns (stride = trSize).
+static inline void run_pass(int log2TrafoSize, bool use_dst,
+                            const int16_t* src, int16_t* dst,
+                            int shift, int trSize, int numCols) {
+    if (use_dst && log2TrafoSize == 2) {
+        idst4(src, dst, shift, trSize, numCols);
+        return;
+    }
+    switch (log2TrafoSize) {
+        case 2: idct4(src, dst, shift, trSize, numCols); break;
+        case 3: idct8(src, dst, shift, trSize, numCols); break;
+        case 4: idct16(src, dst, shift, trSize, numCols); break;
+        case 5: idct32(src, dst, shift, trSize, numCols); break;
+    }
+}
+
+// Non-zero-region skip (§8.6.4.2). `lastX`/`lastY` are the inclusive bounding box
+// of non-zero scaled coefficients (column/row). lastX < 0 means "unknown" → full
+// processing. Bit-exact: an all-zero input column transforms to an all-zero output
+// column ((0+add)>>shift == 0), so columns beyond lastX can be skipped and memset.
 static void inverse_transform_2d(int log2TrafoSize, bool use_dst,
                                   int bit_depth,
-                                  const int16_t* coeff, int16_t* residual) {
+                                  const int16_t* coeff, int16_t* residual,
+                                  int lastX, int lastY) {
     int trSize = 1 << log2TrafoSize;
     int16_t tmp[64 * 64];
     int16_t tmp2[64 * 64];
+
+    // lastY bounds the non-zero input *rows*; the pass-1 column kernels already
+    // accumulate all rows, so the row extent is not used to gate work here (doing
+    // so would require per-size kernel variants). Kept in the signature for the
+    // pass-2 transpose orientation and as future-proofing for a row-limited kernel.
+    (void)lastY;
 
     // Vertical pass: shift1 = 7
     int shift1 = 7;
     // Horizontal pass: shift2 = 20 - BitDepth
     int shift2 = 20 - bit_depth;
 
+    // Pass 1 column count: process columns [0, numColsP1); SIMD kernels step 4
+    // columns/iter so round lastX up to a multiple of 4 (extra zero columns still
+    // yield zeros). Unknown bounding box → full width.
+    int numColsP1 = trSize;
+    if (lastX >= 0) {
+        numColsP1 = (lastX + 4) & ~3;         // round (lastX+1) up to multiple of 4
+        if (numColsP1 > trSize) numColsP1 = trSize;
+    }
+
     // Pass 1: vertical (columns)
     // idctN processes columns: for each j, transforms src[k*line+j] -> dst[k*line+j]
-    if (use_dst && log2TrafoSize == 2) {
-        idst4(coeff, tmp, shift1, trSize);
-    } else {
-        switch (log2TrafoSize) {
-            case 2: idct4(coeff, tmp, shift1, trSize); break;
-            case 3: idct8(coeff, tmp, shift1, trSize); break;
-            case 4: idct16(coeff, tmp, shift1, trSize); break;
-            case 5: idct32(coeff, tmp, shift1, trSize); break;
-        }
+    run_pass(log2TrafoSize, use_dst, coeff, tmp, shift1, trSize, numColsP1);
+
+    // Zero the skipped columns so the inter-pass transpose sees correct data.
+    if (numColsP1 < trSize) {
+        for (int y = 0; y < trSize; y++)
+            std::memset(tmp + y * trSize + numColsP1, 0,
+                        sizeof(int16_t) * (trSize - numColsP1));
     }
 
     // Transpose between passes so pass 2 transforms rows
@@ -407,17 +553,10 @@ static void inverse_transform_2d(int log2TrafoSize, bool use_dst,
         for (int x = 0; x < trSize; x++)
             tmp2[y * trSize + x] = tmp[x * trSize + y];
 
-    // Pass 2: horizontal (rows) — after transpose, columns of tmp2 are rows of tmp
-    if (use_dst && log2TrafoSize == 2) {
-        idst4(tmp2, tmp, shift2, trSize);
-    } else {
-        switch (log2TrafoSize) {
-            case 2: idct4(tmp2, tmp, shift2, trSize); break;
-            case 3: idct8(tmp2, tmp, shift2, trSize); break;
-            case 4: idct16(tmp2, tmp, shift2, trSize); break;
-            case 5: idct32(tmp2, tmp, shift2, trSize); break;
-        }
-    }
+    // Pass 2: horizontal (rows) — after transpose, columns of tmp2 are rows of tmp.
+    // All trSize columns of tmp2 (= rows of the block) may be non-zero after pass 1,
+    // so pass 2 must process the full width.
+    run_pass(log2TrafoSize, use_dst, tmp2, tmp, shift2, trSize, trSize);
 
     // Transpose back to get final residual in row-major order
     for (int y = 0; y < trSize; y++)
@@ -432,8 +571,15 @@ static void inverse_transform_2d(int log2TrafoSize, bool use_dst,
 
 void perform_dequant(DecodingContext& ctx, int x0, int y0,
                      int log2TrafoSize, int cIdx, int qp,
-                     const int16_t* coefficients, int16_t* scaled) {
+                     const int16_t* coefficients, int16_t* scaled,
+                     int* out_lastX, int* out_lastY) {
     int trSize = 1 << log2TrafoSize;
+
+    // Non-zero bounding box of the input coefficients (inclusive). This is a
+    // conservative superset of the non-zero scaled region (dequant can only map
+    // 0→0, never produce a non-zero from a zero coeff), so it is safe to drive the
+    // inverse-transform region skip. Default 0 → at least the DC coefficient.
+    int lastX = 0, lastY = 0;
 
     // §8.6.3 — bdShift = BitDepth + Log2(nTbS) + 10 - log2TransformRange
     // log2TransformRange = 15 for Main profile
@@ -455,6 +601,8 @@ void perform_dequant(DecodingContext& ctx, int x0, int y0,
                 scaled[y * trSize + x] = 0;
                 continue;
             }
+            if (x > lastX) lastX = x;
+            if (y > lastY) lastY = y;
 
             int m = 16; // flat scaling (no scaling list)
             if (useScalingList) {
@@ -466,32 +614,45 @@ void perform_dequant(DecodingContext& ctx, int x0, int y0,
                 else if (log2TrafoSize == 4) sizeId = 2;
                 else sizeId = 3;
 
+                // §8.6.3: CuPredMode[xTbY][yTbY] — use current CU, not (0,0)
+                bool inter = ctx.cu_at(x0, y0).pred_mode != PredMode::MODE_INTRA;
                 int matrixId;
+                int listSizeId = sizeId;  // stored scaling-list sizeId to read from
                 if (sizeId < 3) {
                     matrixId = (cIdx == 0) ? 0 : (cIdx == 1 ? 1 : 2);
-                    // §8.6.3: CuPredMode[xTbY][yTbY] — use current CU, not (0,0)
-                    if (ctx.cu_at(x0, y0).pred_mode != PredMode::MODE_INTRA)
-                        matrixId += 3;
+                    if (inter) matrixId += 3;
+                } else if (cIdx == 0) {
+                    // 32x32 luma: matrixId 0 (intra) / 3 (inter).
+                    matrixId = inter ? 3 : 0;
                 } else {
-                    matrixId = (ctx.cu_at(x0, y0).pred_mode == PredMode::MODE_INTRA) ? 0 : 3;
+                    // 32x32 chroma only arises in 4:4:4 (ChromaArrayType == 3). The
+                    // spec defines no dedicated 32x32 chroma scaling matrix; per the
+                    // Range Extensions (§7.4.5, Table 7-4 has matrices only for
+                    // sizeId 3 matrixId 0/3) it reuses the 16x16 chroma matrix and
+                    // its DC. Read sizeId 2 with the component-specific matrixId; the
+                    // 8x8-stored coefficients upscale by 4 below, same as a copied
+                    // 32x32 chroma list would.
+                    matrixId = (cIdx == 1 ? 1 : 2) + (inter ? 3 : 0);
+                    listSizeId = 2;
                 }
 
                 const auto& sl = ctx.pps->pps_scaling_list_data_present_flag ?
                     ctx.pps->scaling_list_data : ctx.sps->scaling_list_data;
 
                 if (sizeId == 0) {
-                    m = sl.scaling_list[sizeId][matrixId][y * trSize + x];
+                    m = sl.scaling_list[0][matrixId][y * trSize + x];
                 } else {
                     // Upscale from 8x8 matrix
                     int ratio = trSize / 8;
                     if (ratio < 1) ratio = 1;
                     int idx = (y / ratio) * 8 + (x / ratio);
                     if (idx > 63) idx = 63;
-                    m = sl.scaling_list[sizeId][matrixId % 6][idx];
+                    m = sl.scaling_list[listSizeId][matrixId][idx];
 
-                    // DC coeff override for 16x16 and 32x32
+                    // DC coeff override for 16x16 and 32x32 (32x32 chroma reuses the
+                    // 16x16 chroma DC via listSizeId-2 == 0).
                     if ((sizeId == 2 || sizeId == 3) && x == 0 && y == 0) {
-                        m = sl.scaling_list_dc[sizeId - 2][matrixId % 6];
+                        m = sl.scaling_list_dc[listSizeId - 2][matrixId];
                         if (m == 0) m = 16;
                     }
                 }
@@ -505,6 +666,9 @@ void perform_dequant(DecodingContext& ctx, int x0, int y0,
             scaled[y * trSize + x] = static_cast<int16_t>(Clip3(-32768, 32767, static_cast<int>(val)));
         }
     }
+
+    if (out_lastX) *out_lastX = lastX;
+    if (out_lastY) *out_lastY = lastY;
 }
 
 // ============================================================
@@ -514,15 +678,30 @@ void perform_dequant(DecodingContext& ctx, int x0, int y0,
 void perform_transform_inverse(int log2TrafoSize, int cIdx,
                                 bool is_intra, bool transform_skip,
                                 int bit_depth,
-                                const int16_t* scaled, int16_t* residual) {
+                                const int16_t* scaled, int16_t* residual,
+                                int lastX, int lastY) {
     int trSize = 1 << log2TrafoSize;
 
     if (transform_skip) {
-        // Transform skip: shift = 15 - BitDepth
-        int shift = std::max(0, 15 - bit_depth);
-        int add = (shift > 0) ? (1 << (shift - 1)) : 0;
-        for (int i = 0; i < trSize * trSize; i++) {
-            residual[i] = static_cast<int16_t>((scaled[i] + add) >> shift);
+        // §8.6.4.2: transform-skip replaces the inverse transform with a scaled
+        // identity. perform_dequant already produced the spec's d[x][y] in
+        // `scaled`. The skip left-shift tsShift = 5 + Log2(nTbS) combined with the
+        // common residual right-shift bdShift = 20 - BitDepth nets to
+        // (15 - BitDepth - Log2(nTbS)) — log2TransformRange = 15 (Main profile),
+        // matching the dequant bdShift here. The previous code used 15 - BitDepth,
+        // omitting the -Log2(nTbS) term and over-shifting by Log2(nTbS) (a 4x
+        // amplitude loss for 4x4), so every transform-skip block decoded wrong.
+        int shift = 15 - bit_depth - log2TrafoSize;
+        if (shift > 0) {
+            int add = 1 << (shift - 1);
+            for (int i = 0; i < trSize * trSize; i++)
+                residual[i] = static_cast<int16_t>(
+                    Clip3(-32768, 32767, (scaled[i] + add) >> shift));
+        } else {
+            int ls = -shift;
+            for (int i = 0; i < trSize * trSize; i++)
+                residual[i] = static_cast<int16_t>(
+                    Clip3(-32768, 32767, scaled[i] << ls));
         }
         return;
     }
@@ -530,7 +709,8 @@ void perform_transform_inverse(int log2TrafoSize, int cIdx,
     // Use DST for 4x4 luma intra
     bool use_dst = (is_intra && cIdx == 0 && log2TrafoSize == 2);
 
-    inverse_transform_2d(log2TrafoSize, use_dst, bit_depth, scaled, residual);
+    inverse_transform_2d(log2TrafoSize, use_dst, bit_depth, scaled, residual,
+                         lastX, lastY);
 }
 
 } // namespace hevc

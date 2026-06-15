@@ -31,16 +31,24 @@ public:
     // ============================================================
     // Returns PicOrderCntVal for the current picture.
     // Must be called once per picture, after slice header parsing.
+    // no_rasl_output_flag is the NoRaslOutputFlag (§8.1) for this IRAP, computed
+    // at decoder level (it depends on bitstream/EOS/reset position, not just the
+    // NAL type — a mid-stream CRA has NoRaslOutputFlag == 0). Ignored for
+    // non-IRAP pictures.
     int32_t derive_poc(const SliceHeader& sh, const SPS& sps,
-                       NalUnitType nal_type, uint8_t nuh_temporal_id);
+                       NalUnitType nal_type, uint8_t nuh_temporal_id,
+                       bool no_rasl_output_flag);
 
     // ============================================================
     // §8.3.2 — RPS derivation + picture marking
     // ============================================================
     // Derives the 5 RPS lists, marks pictures in the DPB.
     // Must be called once per picture, after POC derivation.
+    // no_rasl_output_flag — see derive_poc(); drives the "mark all references
+    // unused" reset that an IRAP with NoRaslOutputFlag == 1 performs.
     void derive_rps(const SliceHeader& sh, const SPS& sps,
-                    NalUnitType nal_type, int32_t picOrderCntVal);
+                    NalUnitType nal_type, int32_t picOrderCntVal,
+                    bool no_rasl_output_flag);
 
     // ============================================================
     // §8.3.4 — Reference picture list construction
@@ -49,6 +57,18 @@ public:
     // Must be called at the beginning of each P or B slice.
     void construct_ref_pic_lists(const SliceHeader& sh, const SPS& sps,
                                  const PPS& pps);
+
+    // §8.3.4 — pure list builder (eq 8-8..8-11) shared by L0/L1, exposed for
+    // unit testing the robustness guards (all-empty-RPS hang, out-of-range
+    // list_entry clamp). rps_first/rps_second are the two short-term RPS sets
+    // in the list's iteration order; rps_lt is the long-term set.
+    static std::vector<Picture*> build_ref_pic_list(
+        const std::vector<Picture*>& rps_first,
+        const std::vector<Picture*>& rps_second,
+        const std::vector<Picture*>& rps_lt,
+        int num_ref_idx_active_minus1,
+        bool modification_flag,
+        const uint32_t* list_entry, size_t list_entry_count);
 
     // ============================================================
     // §8.3.5 — Collocated picture + NoBackwardPredFlag
@@ -65,6 +85,13 @@ public:
 
     // Mark current picture as short-term reference after decoding (§8.1 step 4)
     void mark_current_as_short_term_ref();
+
+    // Drop a partially-decoded current picture (error recovery). If a slice fails
+    // to decode mid-picture, the half-filled Picture must not stay in the DPB:
+    // it would be output as garbage and could be picked as a reference. Removes
+    // current_pic_ from storage (freeing its pixel buffer) and clears the pointer.
+    // Safe to call when there is no current picture (no-op).
+    void drop_current();
 
     // Output and bumping process (§C.5 simplified — legacy batch mode)
     // Returns pictures that should be output (in POC order)
@@ -126,7 +153,6 @@ private:
     // POC state (§8.3.1) — "prevTid0Pic" values
     int32_t prev_poc_lsb_ = 0;
     int32_t prev_poc_msb_ = 0;
-    bool first_picture_ = true;
 
     // RPS lists (§8.3.2) — pictures from the DPB
     // "StCurrBefore" = short-term, used by current, POC < current

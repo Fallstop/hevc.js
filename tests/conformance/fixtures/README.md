@@ -47,6 +47,27 @@ Encodage : `x265 --input-depth 10 --output-depth 10 --profile main10 --preset me
 
 Reference : `ffmpeg -y -i fixture.265 -pix_fmt yuv420p10le fixture_ref.yuv`
 
+## Extended chroma formats (Main 4:2:2 / 4:4:4, Range Extensions)
+
+QCIF I+P clips that exercise the non-4:2:0 chroma paths. Each is byte-exact
+against the ffmpeg/libx265 reference at the matching `-pix_fmt`.
+
+| File | Resolution | Frames | Format | Notes | MD5 (YUV decode) |
+|------|------------|--------|--------|-------|------------------|
+| `i_p_qcif_422_4f.265` | 176x144 | 4 | 4:2:2 8-bit | deblock + SAO | `ca06427d6ae6af68127f3812b75aa9b5` |
+| `i_p_qcif_422_10b_4f.265` | 176x144 | 4 | 4:2:2 10-bit | uint16 storage | `7df5ccbfcca98ff8adce6b7321420f41` |
+| `i_p_qcif_422_hq_4f.265` | 176x144 | 4 | 4:2:2 8-bit | qp=42 — §8.6.1 chroma-QP clamp | `52162b65507ff80be5b3aa6819071cf6` |
+| `i_p_qcif_444_4f.265` | 176x144 | 4 | 4:4:4 8-bit | SAO; 240 intra-NxN CUs | `8a3d86c4a2452f4aa7f3668f6f710679` |
+| `i_p_qcif_444_10b_4f.265` | 176x144 | 4 | 4:4:4 10-bit | uint16 storage | `5192c41e701ab377e96e9de2ee3133f4` |
+| `i_p_qcif_444_hq_4f.265` | 176x144 | 4 | 4:4:4 8-bit | qp=6 — dense per-leaf chroma residual | `fe6acf6ed144c98e643d7485debe9c62` |
+
+The 4:4:4 clips are intentionally intra-NxN-heavy: 4:4:4 signals
+`intra_chroma_pred_mode` per luma PU (four per NxN CU) and reconstructs a
+co-sited chroma transform block at every transform leaf, so NxN content
+guards both 4:4:4 CABAC parse paths.
+
+Reference (4:4:4): `ffmpeg -y -i fixture.265 -pix_fmt yuv444p[10le] fixture_ref.yuv`
+
 ## Parametres d'encodage communs
 
 ```
