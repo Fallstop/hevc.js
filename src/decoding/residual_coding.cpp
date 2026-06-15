@@ -139,12 +139,17 @@ static int derive_sig_coeff_flag_ctx(int cIdx, int log2TrafoSize,
         int xP = xC & 3;                                        // inner sub-block location
         int yP = yC & 3;
 
-        switch (prevCsbf) {                                      // eq 9-45 to 9-48
-            case 0:  sigCtx = (xP + yP == 0) ? 2 : (xP + yP < 3) ? 1 : 0; break;
-            case 1:  sigCtx = (yP == 0) ? 2 : (yP == 1) ? 1 : 0; break;
-            case 2:  sigCtx = (xP == 0) ? 2 : (xP == 1) ? 1 : 0; break;
-            default: sigCtx = 2; break;
-        }
+        // eq 9-45 to 9-48 as a flat table indexed by [prevCsbf][(yP<<2)+xP]
+        // (precomputed from the spec equations — replaces a per-coefficient
+        // switch + nested ternaries, the densest branch nest in the hottest
+        // entropy-decode function). Bit-exact.
+        static const uint8_t sigCtxBase[4][16] = {
+            { 2,1,1,0, 1,1,0,0, 1,0,0,0, 0,0,0,0 },  // prevCsbf 0 (eq 9-45)
+            { 2,2,2,2, 1,1,1,1, 0,0,0,0, 0,0,0,0 },  // prevCsbf 1 (eq 9-46)
+            { 2,1,0,0, 2,1,0,0, 2,1,0,0, 2,1,0,0 },  // prevCsbf 2 (eq 9-47)
+            { 2,2,2,2, 2,2,2,2, 2,2,2,2, 2,2,2,2 },  // prevCsbf 3 (eq 9-48)
+        };
+        sigCtx = sigCtxBase[prevCsbf][(yP << 2) + xP];
 
         if (cIdx == 0) {
             if ((xS + yS) > 0)

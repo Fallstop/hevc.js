@@ -8,6 +8,14 @@
 #include <cstring>
 #include <algorithm>
 
+// Portable SSE2 for the pixel-write kernels (reconstruct / store-pred). Native
+// x86-64 baseline + emscripten -msimd128; same single-source / oracle-verified
+// strategy as interpolation.cpp / sao.cpp.
+#if defined(__SSE2__)
+  #define HEVC_SIMD_RECON 1
+  #include <emmintrin.h>
+#endif
+
 namespace hevc {
 
 // Forward declarations for residual/transform/intra (implemented in separate files)
@@ -368,6 +376,46 @@ static int derive_qp_y(DecodingContext& ctx, int xCb, int yCb) {
 // Reconstruction: pred + residual, clipping (§8.6.5)
 // ============================================================
 
+// dst[0..n) = Clip3(0, maxVal, pred[i] + res[i]), narrowed to Sample. Saturating
+// int16 add then clip is bit-exact with the scalar int add + Clip3 because
+// maxVal < 32767, so any sum that saturates the int16 add is already past the
+// clip bound. For uint8 (maxVal==255) packus does the [0,255] clip for free.
+template<typename Sample>
+static inline void recon_row(Sample* dst, const int16_t* pred, const int16_t* res,
+                             int n, int maxVal) {
+    int i = 0;
+#ifdef HEVC_SIMD_RECON
+    if constexpr (sizeof(Sample) == 1) {
+        const __m128i zero = _mm_setzero_si128();
+        for (; i + 16 <= n; i += 16) {
+            __m128i s0 = _mm_adds_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(pred + i)),
+                                        _mm_loadu_si128(reinterpret_cast<const __m128i*>(res + i)));
+            __m128i s1 = _mm_adds_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(pred + i + 8)),
+                                        _mm_loadu_si128(reinterpret_cast<const __m128i*>(res + i + 8)));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), _mm_packus_epi16(s0, s1));
+        }
+        for (; i + 8 <= n; i += 8) {
+            __m128i s0 = _mm_adds_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(pred + i)),
+                                        _mm_loadu_si128(reinterpret_cast<const __m128i*>(res + i)));
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + i), _mm_packus_epi16(s0, zero));
+        }
+    } else {
+        const __m128i vmax = _mm_set1_epi16(static_cast<int16_t>(maxVal));
+        const __m128i vzero = _mm_setzero_si128();
+        for (; i + 8 <= n; i += 8) {
+            __m128i s = _mm_adds_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(pred + i)),
+                                       _mm_loadu_si128(reinterpret_cast<const __m128i*>(res + i)));
+            s = _mm_max_epi16(_mm_min_epi16(s, vmax), vzero);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), s);
+        }
+    }
+#endif
+    for (; i < n; i++) {
+        int val = pred[i] + res[i];
+        dst[i] = static_cast<Sample>(val < 0 ? 0 : val > maxVal ? maxVal : val);
+    }
+}
+
 template<typename Sample>
 static void reconstruct_block_impl(DecodingContext& ctx, int x0, int y0,
                                int log2Size, int cIdx,
@@ -386,6 +434,17 @@ static void reconstruct_block_impl(DecodingContext& ctx, int x0, int y0,
     int picH = (cIdx == 0) ? ctx.sps->pic_height_in_luma_samples :
                ctx.sps->pic_height_in_luma_samples / ctx.sps->SubHeightC;
 
+    // Fast path: the whole TU is inside the picture → SIMD each full row.
+    if (xC + size <= picW && yC + size <= picH) {
+        Sample* plane = pic.plane_ptr<Sample>(cIdx);
+        int stride = pic.stride[cIdx];
+        for (int j = 0; j < size; j++)
+            recon_row<Sample>(plane + (yC + j) * stride + xC,
+                              pred + j * size, residual + j * size, size, maxVal);
+        return;
+    }
+
+    // Edge TU: scalar with per-sample bounds (clips the block to the picture).
     for (int j = 0; j < size; j++) {
         if (yC + j >= picH) continue;
         Sample* dstRow = pic.plane_ptr<Sample>(cIdx) + (yC + j) * pic.stride[cIdx];
@@ -410,16 +469,37 @@ static void reconstruct_block(DecodingContext& ctx, int x0, int y0,
 
 // Copy a w x h prediction block (already clipped int16) into plane cIdx at
 // (xC,yC) — no clip, matching the residual-free inter-prediction store path.
+// Narrowing copy of an already-clipped [0,maxVal] int16 prediction row to Sample.
+// uint8: packus (clip [0,255] is a no-op on in-range values); uint16: int16 copy.
+template<typename Sample>
+static inline void store_pred_row(Sample* dst, const int16_t* s, int n) {
+    int x = 0;
+#ifdef HEVC_SIMD_RECON
+    if constexpr (sizeof(Sample) == 1) {
+        const __m128i zero = _mm_setzero_si128();
+        for (; x + 16 <= n; x += 16)
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + x),
+                _mm_packus_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(s + x)),
+                                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + x + 8))));
+        for (; x + 8 <= n; x += 8)
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + x),
+                _mm_packus_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(s + x)), zero));
+    } else {
+        for (; x + 8 <= n; x += 8)
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + x),
+                             _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + x)));
+    }
+#endif
+    for (; x < n; x++) dst[x] = static_cast<Sample>(s[x]);
+}
+
 template<typename Sample>
 static void store_pred_block_impl(Picture& pic, int cIdx, int xC, int yC,
                                   int w, int h, const int16_t* src) {
     Sample* dst = pic.plane_ptr<Sample>(cIdx);
     int st = pic.stride[cIdx];
-    for (int y = 0; y < h; y++) {
-        Sample* row = dst + (yC + y) * st + xC;
-        const int16_t* s = src + y * w;
-        for (int x = 0; x < w; x++) row[x] = static_cast<Sample>(s[x]);
-    }
+    for (int y = 0; y < h; y++)
+        store_pred_row<Sample>(dst + (yC + y) * st + xC, src + y * w, w);
 }
 static void store_pred_block(Picture& pic, int cIdx, int xC, int yC,
                              int w, int h, const int16_t* src) {
