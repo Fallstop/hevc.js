@@ -1,5 +1,6 @@
 #include "syntax/sps.h"
 #include "bitstream/bitstream_reader.h"
+#include "decoding/cabac_tables.h"  // diag_scan_4x4 / diag_scan_8x8 (up-right diagonal scan)
 #include "common/debug.h"
 
 #include <algorithm>
@@ -103,10 +104,26 @@ bool ScalingListData::parse(BitstreamReader& bs) {
                     nextCoef = dc_coef;
                 }
 
+                // Coefficients arrive in up-right diagonal scan order (spec
+                // §7.3.4 indexes ScalingList[][][i] by scan position i). The
+                // dequant read (transform.cpp) and set_defaults() use RASTER
+                // layout, so map each scan position to its (xC,yC) raster cell
+                // via the inverse diagonal scan and store there. sbStride is 4
+                // for the 4x4 list (coefNum 16) and 8 for the 8x8 list (64).
+                const int sbStride = (coefNum == 16) ? 4 : 8;
                 for (int i = 0; i < coefNum; i++) {
                     int delta_coef = bs.read_se();
                     nextCoef = (nextCoef + delta_coef + 256) % 256;
-                    scaling_list[sizeId][matrixId][i] = static_cast<uint8_t>(nextCoef);
+                    int xC, yC;
+                    if (sbStride == 4) {
+                        xC = diag_scan_4x4[i][0];
+                        yC = diag_scan_4x4[i][1];
+                    } else {
+                        xC = diag_scan_8x8[i][0];
+                        yC = diag_scan_8x8[i][1];
+                    }
+                    scaling_list[sizeId][matrixId][yC * sbStride + xC] =
+                        static_cast<uint8_t>(nextCoef);
                 }
             }
         }
@@ -472,6 +489,11 @@ bool SPS::parse(BitstreamReader& bs) {
     // Compute derived values
     derive();
 
+    // Reject malformed/hostile dimensions before any allocation downstream.
+    if (!validate()) {
+        return false;
+    }
+
     HEVC_LOG(PARSE, "SPS: id=%d vps=%d %dx%d chroma=%d bit_depth=%d/%d",
              sps_seq_parameter_set_id, sps_video_parameter_set_id,
              pic_width_in_luma_samples, pic_height_in_luma_samples,
@@ -537,6 +559,54 @@ void SPS::derive() {
         Log2MaxIpcmCbSizeY = Log2MinIpcmCbSizeY +
                               static_cast<int>(log2_diff_max_min_pcm_luma_coding_block_size);
     }
+}
+
+// Validate dimensions from untrusted media. pic_width/height and the
+// conf_win_* offsets are read as ue(v) with no inherent bound and are used as
+// strides/extents into Picture::allocate and SIMD loops, so an out-of-range or
+// non-conformant value can drive an over-allocation or out-of-bounds access.
+bool SPS::validate() const {
+    // A valid MinCbSizeY is required to bound the picture (must be a power of
+    // two in [8,64]); derive() should have set it, but guard anyway.
+    if (MinCbSizeY <= 0) {
+        return false;
+    }
+
+    // Sane upper bound on picture dimensions (well above any real profile/level
+    // and the 16-bit allocator stride this decoder uses).
+    constexpr uint32_t kMaxDim = 16384;
+
+    // Width/height must be non-zero, within the cap, and (spec §A.3.2 /
+    // conformance) an integer multiple of MinCbSizeY.
+    if (pic_width_in_luma_samples == 0 || pic_height_in_luma_samples == 0) {
+        return false;
+    }
+    if (pic_width_in_luma_samples > kMaxDim || pic_height_in_luma_samples > kMaxDim) {
+        return false;
+    }
+    if (pic_width_in_luma_samples % static_cast<uint32_t>(MinCbSizeY) != 0 ||
+        pic_height_in_luma_samples % static_cast<uint32_t>(MinCbSizeY) != 0) {
+        return false;
+    }
+
+    // Conformance window must lie within the picture. Offsets are in chroma
+    // sample units; the cropped region (SubWidthC*(left+right) etc.) must leave
+    // at least one luma sample of picture, matching the spec §7.4.3.2.1
+    // constraint on conf_win_*_offset.
+    if (conformance_window_flag) {
+        const uint64_t crop_w =
+            static_cast<uint64_t>(SubWidthC) *
+            (static_cast<uint64_t>(conf_win_left_offset) + conf_win_right_offset);
+        const uint64_t crop_h =
+            static_cast<uint64_t>(SubHeightC) *
+            (static_cast<uint64_t>(conf_win_top_offset) + conf_win_bottom_offset);
+        if (crop_w >= pic_width_in_luma_samples ||
+            crop_h >= pic_height_in_luma_samples) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 } // namespace hevc

@@ -7,6 +7,8 @@
 
 #include <cstring>
 #include <algorithm>
+#include <cassert>
+#include <cstdint>
 
 // Portable SSE2 for the pixel-write kernels (reconstruct / store-pred). Native
 // x86-64 baseline + emscripten -msimd128; same single-source / oracle-verified
@@ -18,17 +20,46 @@
 
 namespace hevc {
 
+// DEBUG-only guard for the per-TU residual buffers, which are intentionally left
+// uninitialized in Release (the producer — inverse transform or bypass memcpy —
+// fully overwrites residual[0,count) before reconstruct_block reads it). After the
+// real producer call, we re-run it over the SAME buffer twice, pre-poisoned with two
+// distinct sentinels; any element the producer skips keeps a different sentinel in
+// each run and trips the assert, while a genuinely written element is deterministic
+// and matches (so no false positives for any legal residual value). Compiles to
+// nothing under NDEBUG (Release / WASM), so the decode stays byte-identical.
+template <class Producer>
+inline void assert_residual_fully_written(Producer&& produce, int16_t* residual,
+                                          int count) {
+#ifndef NDEBUG
+    constexpr int16_t kPoisonA = 0x5A5A;
+    constexpr int16_t kPoisonB = static_cast<int16_t>(0xA5A5);
+    for (int i = 0; i < count; i++) residual[i] = kPoisonA;
+    produce(residual);
+    int16_t first[64 * 64];
+    for (int i = 0; i < count; i++) first[i] = residual[i];
+    for (int i = 0; i < count; i++) residual[i] = kPoisonB;
+    produce(residual);
+    for (int i = 0; i < count; i++)
+        assert(first[i] == residual[i] && "residual TU element not written by producer");
+#else
+    (void)produce; (void)residual; (void)count;
+#endif
+}
+
 // Forward declarations for residual/transform/intra (implemented in separate files)
 void decode_residual_coding(DecodingContext& ctx, int x0, int y0,
                             int log2TrafoSize, int cIdx,
                             int16_t* coefficients);
 void perform_dequant(DecodingContext& ctx, int x0, int y0,
                      int log2TrafoSize, int cIdx, int qp,
-                     const int16_t* coefficients, int16_t* scaled);
+                     const int16_t* coefficients, int16_t* scaled,
+                     int* out_lastX = nullptr, int* out_lastY = nullptr);
 void perform_transform_inverse(int log2TrafoSize, int cIdx,
                                 bool is_intra, bool transform_skip,
                                 int bit_depth,
-                                const int16_t* scaled, int16_t* residual);
+                                const int16_t* scaled, int16_t* residual,
+                                int lastX = -1, int lastY = -1);
 void perform_intra_prediction(DecodingContext& ctx, int x0, int y0,
                               int log2PredSize, int cIdx, int intra_mode,
                               int16_t* pred_samples);
@@ -556,6 +587,12 @@ static bool decode_wpp_parallel(DecodingContext& ctx, BitstreamReader& bs,
     for (int r = 0; r < numRows; r++)
         completed_col[r].store(-1, std::memory_order_relaxed);
 
+    // Error resync (F4): set if any row's decode throws (e.g. a corrupt slice's
+    // entry-point offsets make CABAC read past the substream end). The failing
+    // row still publishes completion so dependent rows don't deadlock; the whole
+    // picture is then discarded and the decoder resyncs at the next IRAP.
+    std::atomic<bool> wpp_failed{false};
+
     // Per-row WPP saved contexts (row r saves at col 1, row r+1 restores at start)
     std::vector<CabacContext> wpp_ctx_storage(numRows * NUM_CABAC_CONTEXTS);
     auto wpp_ctx_ptr = [&](int row) -> CabacContext* {
@@ -573,6 +610,11 @@ static bool decode_wpp_parallel(DecodingContext& ctx, BitstreamReader& bs,
     std::vector<std::condition_variable> row_cv(numRows);
 
     auto decode_row = [&](int row) {
+        // F4: contain a per-row decode throw (corrupt slice). On failure we set
+        // wpp_failed and fall through to the guaranteed final-notify below, so
+        // rows waiting on this row's completion never deadlock. The picture is
+        // discarded by the caller, so decoding dependents on partial data is moot.
+        try {
         // Per-row BitstreamReader and CabacEngine
         BitstreamReader row_bs(rbsp_data, rbsp_size);
         CabacEngine row_cabac;
@@ -644,8 +686,12 @@ static bool decode_wpp_parallel(DecodingContext& ctx, BitstreamReader& bs,
             if (end_of_slice || col == numCols - 1)
                 break;
         }
+        } catch (...) {
+            wpp_failed.store(true, std::memory_order_relaxed);
+        }
 
-        // Final notify for rows that might wait on last column
+        // Final notify for rows that might wait on last column. ALWAYS runs, even
+        // after a thrown failure above, so dependent rows are never left waiting.
         {
             std::lock_guard<std::mutex> lock(row_mutex[row]);
             completed_col[row].store(numCols - 1, std::memory_order_release);
@@ -657,7 +703,7 @@ static bool decode_wpp_parallel(DecodingContext& ctx, BitstreamReader& bs,
 
     if (num_active_rows <= 1 || !ctx.thread_pool || ctx.thread_pool->num_workers() <= 1) {
         decode_row(startRow);
-        return true;
+        return !wpp_failed.load(std::memory_order_relaxed);
     }
 
     // Submit worker rows to thread pool; run first row on current thread
@@ -667,7 +713,7 @@ static bool decode_wpp_parallel(DecodingContext& ctx, BitstreamReader& bs,
     decode_row(startRow);
     ctx.thread_pool->wait_all();
 
-    return true;
+    return !wpp_failed.load(std::memory_order_relaxed);
 }
 
 // ============================================================
@@ -937,7 +983,11 @@ void decode_coding_unit(DecodingContext& ctx, int x0, int y0, int log2CbSize) {
                 int cW = cbSize / sps.SubWidthC, cH = cbSize / sps.SubHeightC;
                 int xC = x0 / sps.SubWidthC, yC = y0 / sps.SubHeightC;
                 for (int c = 1; c <= 2; c++) {
-                    int16_t cpred[32*32];
+                    // Sized for the largest chroma PU across all formats: 4:4:4
+                    // chroma is full-res (64x64), 4:2:2 is 32x64. 4:2:0 uses
+                    // only 32x32 of this. Undersizing overran the buffer for
+                    // 4:2:2/4:4:4 large CUs (SIMD store in weighted_pred_default).
+                    int16_t cpred[64*64];
                     perform_inter_prediction(ctx, x0, y0, cbSize, cbSize, c,
                         mi.mv[0], mi.mv[1], mi.ref_idx[0], mi.ref_idx[1],
                         mi.pred_flag[0], mi.pred_flag[1], cpred);
@@ -1023,7 +1073,9 @@ void decode_coding_unit(DecodingContext& ctx, int x0, int y0, int log2CbSize) {
                     int xC = xPb / sps.SubWidthC;
                     int yC = yPb / sps.SubHeightC;
                     for (int c = 1; c <= 2; c++) {
-                        int16_t pred[32*32];
+                        // Sized for the largest chroma PU across all formats
+                        // (4:4:4 full-res 64x64); see the merge-mode site above.
+                        int16_t pred[64*64];
                         perform_inter_prediction(ctx, xPb, yPb, nPbW, nPbH, c,
                             mi.mv[0], mi.mv[1], mi.ref_idx[0], mi.ref_idx[1],
                             mi.pred_flag[0], mi.pred_flag[1], pred);
@@ -1146,8 +1198,9 @@ void decode_coding_unit(DecodingContext& ctx, int x0, int y0, int log2CbSize) {
         }
 
         if (rqt_root_cbf) {
+            const bool cbf_seed[2] = {true, true};
             decode_transform_tree(ctx, x0, y0, x0, y0, log2CbSize, 0, 0,
-                                  true, true);
+                                  cbf_seed, cbf_seed);
         }
     }
 
@@ -1242,6 +1295,14 @@ void decode_prediction_unit_intra(DecodingContext& ctx, int x0, int y0,
         // For 4:2:0/4:2:2, one chroma mode per CU
         int luma_mode_for_chroma = ctx.intra_mode_at(x0, y0);
         int chroma_mode = derive_chroma_intra_mode(coded_chroma, luma_mode_for_chroma);
+        // §8.4.3 Table 8-3: for 4:2:2, remap the derived chroma intra mode to
+        // account for the rectangular (1:2) chroma sampling grid.
+        if (sps.ChromaArrayType == 2) {
+            static const uint8_t mode_map_422[35] = {
+                 0,  1,  2,  2,  2,  2,  3,  5,  7,  8, 10, 12, 13, 15, 17, 18, 19,
+                20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31 };
+            chroma_mode = mode_map_422[chroma_mode];
+        }
         ctx.set_chroma_mode(x0, y0, cbSize, chroma_mode);
         HEVC_LOG(INTRA, "CU (%d,%d) chroma_mode=%d (coded=%d luma=%d)",
                  x0, y0, chroma_mode, coded_chroma, luma_mode_for_chroma);
@@ -1256,7 +1317,8 @@ void decode_transform_tree(DecodingContext& ctx, int x0, int y0,
                            int xBase, int yBase,
                            int log2TrafoSize, int trafoDepth,
                            int blkIdx,
-                           bool cbf_cb_parent, bool cbf_cr_parent) {
+                           const bool cbf_cb_parent[2],
+                           const bool cbf_cr_parent[2]) {
     auto& sps = *ctx.sps;
     auto& cabac = *ctx.cabac;
 
@@ -1295,20 +1357,39 @@ void decode_transform_tree(DecodingContext& ctx, int x0, int y0,
                 interSplitFlag;
     }
 
-    // §7.3.8.8: Chroma CBF parsed when log2TrafoSize > 2 (4:2:0) or ChromaArrayType == 3
-    // When not parsed, inherit parent values for deferred chroma (§7.3.8.10 cbfDepthC)
-    bool cbf_cb = cbf_cb_parent, cbf_cr = cbf_cr_parent;
+    // §7.3.8.8: Chroma CBF parsed when log2TrafoSize > 2 (4:2:0/4:2:2) or
+    // ChromaArrayType == 3. When not parsed, inherit the parent value for deferred
+    // chroma (§7.3.8.10 cbfDepthC). For 4:2:2 each chroma component has TWO stacked
+    // transform blocks: cbf[0] = top, cbf[1] = bottom. A second cbf is parsed when
+    // ChromaArrayType == 2 && (!split || log2TrafoSize == 3). Other formats use [0].
+    // Monochrome (ChromaArrayType == 0) has no chroma transform blocks, so cbf_cb/cbf_cr
+    // stay 0 — they must never inherit the root's (true,true) seed, otherwise the
+    // spurious chroma CBF would trigger a phantom cu_qp_delta read (§7.3.8.10) and
+    // desync CABAC.
+    // Inherit BOTH parent CBF entries: for a 4:2:2 deferred chroma TU the top and
+    // bottom blocks carry the parent's cbf[0] and cbf[1] respectively (parsed at the
+    // log2TrafoSize==3 ancestor and never re-parsed at the 4x4 leaves).
+    bool cbf_cb[2] = { (sps.ChromaArrayType != 0) && cbf_cb_parent[0],
+                       (sps.ChromaArrayType != 0) && cbf_cb_parent[1] };
+    bool cbf_cr[2] = { (sps.ChromaArrayType != 0) && cbf_cr_parent[0],
+                       (sps.ChromaArrayType != 0) && cbf_cr_parent[1] };
     if ((log2TrafoSize > 2 && sps.ChromaArrayType != 0) ||
         sps.ChromaArrayType == 3) {
-        if (trafoDepth == 0 || cbf_cb_parent) {
-            cbf_cb = decode_cbf_chroma(cabac, trafoDepth);
+        bool parse_second = (sps.ChromaArrayType == 2) &&
+                            (!split || log2TrafoSize == 3);
+        if (trafoDepth == 0 || cbf_cb_parent[0]) {
+            cbf_cb[0] = decode_cbf_chroma(cabac, trafoDepth);
+            cbf_cb[1] = parse_second ? decode_cbf_chroma(cabac, trafoDepth)
+                                     : cbf_cb[0];
         } else {
-            cbf_cb = false;
+            cbf_cb[0] = cbf_cb[1] = false;
         }
-        if (trafoDepth == 0 || cbf_cr_parent) {
-            cbf_cr = decode_cbf_chroma(cabac, trafoDepth);
+        if (trafoDepth == 0 || cbf_cr_parent[0]) {
+            cbf_cr[0] = decode_cbf_chroma(cabac, trafoDepth);
+            cbf_cr[1] = parse_second ? decode_cbf_chroma(cabac, trafoDepth)
+                                     : cbf_cr[0];
         } else {
-            cbf_cr = false;
+            cbf_cr[0] = cbf_cr[1] = false;
         }
     }
 
@@ -1316,6 +1397,12 @@ void decode_transform_tree(DecodingContext& ctx, int x0, int y0,
         int x1 = x0 + (1 << (log2TrafoSize - 1));
         int y1 = y0 + (1 << (log2TrafoSize - 1));
 
+        // §7.3.8.8: the re-parse gate for every child uses the parent CBF at the
+        // parent's top-left (cbf_cb[xBase][yBase][trafoDepth-1]) → cbf[0] for all
+        // children. We pass the full parent array {cbf[0],cbf[1]} unchanged: a
+        // 4:2:2 deferred chroma TU (log2TrafoSize == 2, blkIdx == 3) needs BOTH the
+        // top and bottom parent CBF, which were parsed at the log2TrafoSize == 3
+        // parent and never re-parsed at the 4x4 leaves.
         decode_transform_tree(ctx, x0, y0, x0, y0, log2TrafoSize - 1,
                               trafoDepth + 1, 0, cbf_cb, cbf_cr);
         decode_transform_tree(ctx, x1, y0, x0, y0, log2TrafoSize - 1,
@@ -1328,7 +1415,7 @@ void decode_transform_tree(DecodingContext& ctx, int x0, int y0,
         // Leaf: read cbf_luma and decode transform unit
         bool cbf_luma = true;
         if (cu.pred_mode == PredMode::MODE_INTRA || trafoDepth != 0 ||
-            cbf_cb || cbf_cr) {
+            cbf_cb[0] || cbf_cb[1] || cbf_cr[0] || cbf_cr[1]) {
             cbf_luma = decode_cbf_luma(cabac, trafoDepth);
         }
 
@@ -1366,7 +1453,8 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
                            int xBase, int yBase,
                            int log2TrafoSize, int /*trafoDepth*/,
                            int blkIdx,
-                           bool cbf_luma, bool cbf_cb, bool cbf_cr) {
+                           bool cbf_luma,
+                           const bool cbf_cb[2], const bool cbf_cr[2]) {
     auto& sps = *ctx.sps;
     auto& pps = *ctx.pps;
     auto& cabac = *ctx.cabac;
@@ -1375,7 +1463,7 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
     int trSize = 1 << log2TrafoSize;
 
     // QP delta
-    if ((cbf_luma || cbf_cb || cbf_cr) &&
+    if ((cbf_luma || cbf_cb[0] || cbf_cb[1] || cbf_cr[0] || cbf_cr[1]) &&
         pps.cu_qp_delta_enabled_flag && !ctx.IsCuQpDeltaCoded) {
         ctx.CuQpDeltaVal = decode_cu_qp_delta(cabac);
         ctx.IsCuQpDeltaCoded = true;
@@ -1386,11 +1474,14 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
 
     // Luma residual
     if (cbf_luma) {
-        // Not zero-initialized: decode_residual_coding() memsets `coefficients`,
+        // INVARIANT (load-bearing — these buffers are intentionally NOT
+        // zero-initialized): decode_residual_coding() memsets `coefficients`,
         // perform_dequant() fully writes `scaled`, and the inverse transform / bypass
         // memcpy fully writes `residual` over [0,trSize²) before any read; the unused
         // tail is never read. Dropping these per-TU 8 KB zero-fills removes the bulk
         // of the decoder's L1 write-misses (decode_transform_unit was ~42% of them).
+        // The DEBUG poison-and-verify below guards the `residual` half of that
+        // invariant; it compiles away under NDEBUG (Release/WASM) via assert().
         int16_t coefficients[64 * 64];
         int16_t scaled[64 * 64];
         int16_t residual[64 * 64];
@@ -1403,19 +1494,23 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
 
         decode_residual_coding(ctx, x0, y0, log2TrafoSize, 0, coefficients);
 
-        if (!cu.cu_transquant_bypass) {
-            int qpPrime = qpY + sps.QpBdOffsetY;
-            perform_dequant(ctx, x0, y0, log2TrafoSize, 0, qpPrime,
-                           coefficients, scaled);
-
-            perform_transform_inverse(log2TrafoSize, 0,
-                                       cu.pred_mode == PredMode::MODE_INTRA,
-                                       transform_skip, sps.BitDepthY,
-                                       scaled, residual);
-
-        } else {
-            std::memcpy(residual, coefficients, sizeof(int16_t) * trSize * trSize);
-        }
+        // Produce the residual into `out` (transform/skip path, or bypass memcpy).
+        auto produce_residual = [&](int16_t* out) {
+            if (!cu.cu_transquant_bypass) {
+                int qpPrime = qpY + sps.QpBdOffsetY;
+                int lastX, lastY;
+                perform_dequant(ctx, x0, y0, log2TrafoSize, 0, qpPrime,
+                               coefficients, scaled, &lastX, &lastY);
+                perform_transform_inverse(log2TrafoSize, 0,
+                                           cu.pred_mode == PredMode::MODE_INTRA,
+                                           transform_skip, sps.BitDepthY,
+                                           scaled, out, lastX, lastY);
+            } else {
+                std::memcpy(out, coefficients, sizeof(int16_t) * trSize * trSize);
+            }
+        };
+        produce_residual(residual);
+        assert_residual_fully_written(produce_residual, residual, trSize * trSize);
 
         // Prediction for luma
         int16_t pred_samples[64 * 64];  // fully written by intra-pred / inter-copy
@@ -1444,36 +1539,46 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
 
     }
 
-    // Chroma residual (4:2:0: chroma TU is log2TrafoSize-1, min 2)
+    // Chroma residual.
+    //   4:2:0 → one chroma TU per luma TB, size log2TrafoSize-1 (min 2).
+    //   4:2:2 → TWO chroma TUs stacked vertically per luma TB (chroma grid is
+    //           W/2 x H), each of size log2TrafoSize-1 (min 2). The lower block
+    //           sits trSizeC chroma rows below the upper one; since SubHeightC==1
+    //           that is +trSizeC in luma-equivalent coordinates.
+    //   4:4:4 → one chroma TU per luma TB at full luma size.
     if (sps.ChromaArrayType != 0) {
-        int log2TrafoSizeC = std::max(2, log2TrafoSize - 1);
+        int log2TrafoSizeC = (sps.ChromaArrayType == 3) ? log2TrafoSize
+                                                        : std::max(2, log2TrafoSize - 1);
         int trSizeC = 1 << log2TrafoSizeC;
+        int numChromaBlocks = (sps.ChromaArrayType == 2) ? 2 : 1;
 
-        // For 4:2:0 with log2TrafoSize==2, chroma is deferred to blkIdx==3
+        // For 4:2:0/4:2:2 with log2TrafoSize==2, chroma is deferred to blkIdx==3.
         bool processChroma = (log2TrafoSize > 2) || (blkIdx == 3);
 
-        // §7.3.8.10: chroma position uses xBase/yBase when log2TrafoSize==2
+        // §7.3.8.10: chroma position uses xBase/yBase when log2TrafoSize==2.
         int xC = (sps.ChromaArrayType != 3 && log2TrafoSize == 2) ? xBase : x0;
         int yC = (sps.ChromaArrayType != 3 && log2TrafoSize == 2) ? yBase : y0;
 
-        if (processChroma) {
-            for (int cIdx = 1; cIdx <= 2; cIdx++) {
-                bool cbf_c = (cIdx == 1) ? cbf_cb : cbf_cr;
-                if (cbf_c) {
-                    // Same as luma: consumers fully overwrite [0,trSize²) first.
-                    int16_t coefficients[32 * 32];
-                    int16_t scaled[32 * 32];
-                    int16_t residual[32 * 32];
+        // Process one chroma transform block (cIdx, sub-block tIdx). yBlk is the
+        // luma-equivalent top-left of this chroma TB; cbf_c its coded-block flag.
+        auto process_chroma_block = [&](int cIdx, int yBlk, bool cbf_c) {
+            if (cbf_c) {
+                // Same load-bearing invariant as luma: the producer fully
+                // overwrites residual[0,trSizeC²) before reconstruct_block reads it.
+                int16_t coefficients[32 * 32];
+                int16_t scaled[32 * 32];
+                int16_t residual[32 * 32];
 
-                    bool transform_skip = false;
-                    if (pps.transform_skip_enabled_flag &&
-                        !cu.cu_transquant_bypass && log2TrafoSizeC <= 2) {
-                        transform_skip = decode_transform_skip_flag(cabac, cIdx);
-                    }
+                bool transform_skip = false;
+                if (pps.transform_skip_enabled_flag &&
+                    !cu.cu_transquant_bypass && log2TrafoSizeC <= 2) {
+                    transform_skip = decode_transform_skip_flag(cabac, cIdx);
+                }
 
-                    decode_residual_coding(ctx, xC, yC, log2TrafoSizeC, cIdx,
-                                          coefficients);
+                decode_residual_coding(ctx, xC, yBlk, log2TrafoSizeC, cIdx,
+                                      coefficients);
 
+                auto produce_residual = [&](int16_t* out) {
                     if (!cu.cu_transquant_bypass) {
                         // Chroma QP derivation
                         int qpOffset = (cIdx == 1) ? pps.pps_cb_qp_offset +
@@ -1482,45 +1587,66 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
                                         ctx.sh->slice_cr_qp_offset;
                         int qPi = Clip3(-sps.QpBdOffsetC, 57, qpY + qpOffset);
                         int qPc;
-                        if (qPi < 0) qPc = qPi;
-                        else if (qPi < 58) qPc = qpChromaTable[qPi];
-                        else qPc = qPi - 6;
+                        // Spec 8.6.1: the chroma-QP mapping table (Table 8-10)
+                        // applies only for ChromaArrayType == 1 (4:2:0). For
+                        // 4:2:2 / 4:4:4 (ChromaArrayType 2 / 3), qPc = Min(qPi, 51).
+                        if (sps.ChromaArrayType == 1) {
+                            if (qPi < 0) qPc = qPi;
+                            else if (qPi < 58) qPc = qpChromaTable[qPi];
+                            else qPc = qPi - 6;
+                        } else {
+                            qPc = std::min(qPi, 51);
+                        }
                         int qpPrimeC = qPc + sps.QpBdOffsetC;
 
-                        perform_dequant(ctx, xC, yC, log2TrafoSizeC, cIdx,
-                                       qpPrimeC, coefficients, scaled);
+                        int lastX, lastY;
+                        perform_dequant(ctx, xC, yBlk, log2TrafoSizeC, cIdx,
+                                       qpPrimeC, coefficients, scaled,
+                                       &lastX, &lastY);
                         perform_transform_inverse(log2TrafoSizeC, cIdx,
                                                    cu.pred_mode == PredMode::MODE_INTRA,
                                                    transform_skip, sps.BitDepthC,
-                                                   scaled, residual);
+                                                   scaled, out, lastX, lastY);
                     } else {
-                        std::memcpy(residual, coefficients,
+                        std::memcpy(out, coefficients,
                                     sizeof(int16_t) * trSizeC * trSizeC);
                     }
+                };
+                produce_residual(residual);
+                assert_residual_fully_written(produce_residual, residual,
+                                              trSizeC * trSizeC);
 
-                    // Chroma prediction
-                    int16_t pred_samples[32 * 32];  // fully written before read
-                    if (cu.pred_mode == PredMode::MODE_INTRA) {
-                        int chroma_mode = ctx.chroma_mode_at(xC, yC);
-                        perform_intra_prediction(ctx, xC, yC, log2TrafoSizeC, cIdx,
-                                                chroma_mode, pred_samples);
-                    } else {
-                        // Inter: pred already written by PU-level MC
-                        int xCC = xC / sps.SubWidthC;
-                        int yCC = yC / sps.SubHeightC;
-                        load_block(*ctx.pic, cIdx, xCC, yCC, trSizeC, trSizeC, pred_samples);
-                    }
-
-                    reconstruct_block(ctx, xC, yC, log2TrafoSizeC, cIdx,
-                                     pred_samples, residual);
-                } else if (cu.pred_mode == PredMode::MODE_INTRA) {
+                // Chroma prediction
+                int16_t pred_samples[32 * 32];  // fully written before read
+                if (cu.pred_mode == PredMode::MODE_INTRA) {
                     int chroma_mode = ctx.chroma_mode_at(xC, yC);
-                    int16_t pred_samples[32 * 32];  // fully written before read
-                    perform_intra_prediction(ctx, xC, yC, log2TrafoSizeC, cIdx,
+                    perform_intra_prediction(ctx, xC, yBlk, log2TrafoSizeC, cIdx,
                                             chroma_mode, pred_samples);
-                    int16_t zero[32 * 32] = {};
-                    reconstruct_block(ctx, xC, yC, log2TrafoSizeC, cIdx,
-                                     pred_samples, zero);
+                } else {
+                    int xCC = xC / sps.SubWidthC;
+                    int yCC = yBlk / sps.SubHeightC;
+                    load_block(*ctx.pic, cIdx, xCC, yCC, trSizeC, trSizeC, pred_samples);
+                }
+
+                reconstruct_block(ctx, xC, yBlk, log2TrafoSizeC, cIdx,
+                                 pred_samples, residual);
+            } else if (cu.pred_mode == PredMode::MODE_INTRA) {
+                int chroma_mode = ctx.chroma_mode_at(xC, yC);
+                int16_t pred_samples[32 * 32];  // fully written before read
+                perform_intra_prediction(ctx, xC, yBlk, log2TrafoSizeC, cIdx,
+                                        chroma_mode, pred_samples);
+                int16_t zero[32 * 32] = {};
+                reconstruct_block(ctx, xC, yBlk, log2TrafoSizeC, cIdx,
+                                 pred_samples, zero);
+            }
+        };
+
+        if (processChroma) {
+            const bool* cbf_arr[2] = { cbf_cb, cbf_cr };
+            for (int cIdx = 1; cIdx <= 2; cIdx++) {
+                for (int tIdx = 0; tIdx < numChromaBlocks; tIdx++) {
+                    process_chroma_block(cIdx, yC + tIdx * trSizeC,
+                                         cbf_arr[cIdx - 1][tIdx]);
                 }
             }
         }

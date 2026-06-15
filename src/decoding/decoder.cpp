@@ -1,6 +1,7 @@
 #include "decoding/decoder.h"
 #include "bitstream/nal_unit.h"
 #include "bitstream/bitstream_reader.h"
+#include "syntax/sei.h"
 #include "filters/deblocking.h"
 #include "filters/sao.h"
 #include "common/debug.h"
@@ -31,6 +32,11 @@ DecodeStatus Decoder::decode(const uint8_t* data, size_t size) {
             size_t first_vcl = i;
             i++;
             while (i < nals.size() && is_vcl(nals[i].header.nal_unit_type)) {
+                // A truncated/empty VCL RBSP would make read_flag() throw past the
+                // end. Treat it as a new picture boundary so the corrupt NAL forms
+                // its own picture group and is failed cleanly inside the try/catch
+                // below — never escaping to abort the whole feed() buffer.
+                if (nals[i].rbsp.empty()) break;
                 BitstreamReader bs(nals[i].rbsp.data(), nals[i].rbsp.size());
                 bool first_slice = bs.read_flag();
                 if (first_slice) break; // New picture starts here
@@ -38,10 +44,43 @@ DecodeStatus Decoder::decode(const uint8_t* data, size_t size) {
             }
             size_t vcl_count = i - first_vcl;
 
-            auto status = decode_picture(nals, first_vcl, vcl_count);
-            if (status != DecodeStatus::OK) return status;
+            // F4 error resync: a single bad/undecodable picture must NOT abort the
+            // whole feed() buffer (24/7 lossy camera feeds). Contain a per-picture
+            // failure — including a thrown bitstream over-read on a corrupt slice —
+            // record it, drop the half-decoded picture, arm skip-to-next-IRAP, and
+            // continue to the next NAL. Output recovers at the next IRAP.
+            DecodeStatus status;
+            try {
+                status = decode_picture(nals, first_vcl, vcl_count);
+            } catch (...) {
+                status = DecodeStatus::ERROR;
+            }
+            if (status != DecodeStatus::OK) {
+                dpb_.drop_current();
+                skip_to_next_irap_ = true;
+                HEVC_LOG(PARSE, "Picture decode failed — resyncing at next IRAP%s", "");
+            }
+        } else if (type == NalUnitType::PREFIX_SEI ||
+                   type == NalUnitType::SUFFIX_SEI) {
+            // §7.3.5 — parse the SEI RBSP. The recovery_point message (§D.3.8)
+            // tells a non-IDR (gradual-refresh) tune-in when output is reliable.
+            BitstreamReader bs(nals[i].rbsp.data(), nals[i].rbsp.size());
+            SeiMessages sei = parse_sei(bs);
+            // recovery_point is a prefix-only message (§D.1): bind it to the next
+            // picture in decoding order. A PREFIX_SEI precedes its associated
+            // picture, so defer until that picture's POC is known.
+            if (sei.has_recovery_point && type == NalUnitType::PREFIX_SEI) {
+                has_pending_recovery_point_ = true;
+                pending_recovery_poc_cnt_ = sei.recovery_point.recovery_poc_cnt;
+            }
+            i++;
         } else {
-            // Non-VCL, non-parameter-set NAL (SEI, AUD, etc.) — skip
+            // §8.1: an end-of-sequence NAL makes the next CRA the first picture
+            // of a new CVS (NoRaslOutputFlag == 1, RASL discarded). EOB behaves
+            // the same for our purposes.
+            if (type == NalUnitType::EOS_NUT || type == NalUnitType::EOB_NUT)
+                handle_cra_as_first_ = true;
+            // Non-VCL, non-parameter-set NAL (AUD, etc.) — skip
             i++;
         }
     }
@@ -67,13 +106,62 @@ DecodeStatus Decoder::decode_picture(const std::vector<NalUnit>& nals,
         return DecodeStatus::ERROR;
     }
 
+    // §8.1 — random access decisions, evaluated before touching the DPB.
+    NalUnitType nut = nal.header.nal_unit_type;
+    bool isIRAP = is_irap(nut);
+    if (isIRAP) {
+        // NoRaslOutputFlag: 1 for IDR/BLA, and for a CRA that is the first
+        // picture of the bitstream / first after EOS_NUT / first after reset().
+        // A mid-stream CRA gets 0 (its RASL pictures are decodable & output).
+        bool no_rasl_output = is_idr(nut) || is_bla(nut) ||
+                              (is_cra(nut) && (handle_cra_as_first_ || no_irap_yet_));
+        prev_irap_no_rasl_output_ = no_rasl_output;
+        no_irap_yet_ = false;
+        handle_cra_as_first_ = false;
+        // F4 error resync: an IRAP starts a clean CVS — references are self
+        // contained, so we can resume decoding here. Clear the error-skip arm.
+        skip_to_next_irap_ = false;
+    } else {
+        // F4 error resync: after a per-picture decode failure, drop every non-IRAP
+        // picture until the next IRAP. Their references may be the corrupted
+        // picture (or pictures that depended on it), so decoding them would
+        // propagate garbage; recover at the next keyframe.
+        if (skip_to_next_irap_) {
+            HEVC_LOG(PARSE, "Skipping non-IRAP VCL (resyncing after decode error)%s", "");
+            return DecodeStatus::OK;
+        }
+        // §8.1 wait-for-random-access-point: until the first IRAP after a fresh
+        // start/reset, non-IRAP VCL pictures reference frames we never decoded —
+        // skip them entirely (don't decode, don't output).
+        if (no_irap_yet_) {
+            HEVC_LOG(PARSE, "Skipping non-IRAP VCL (waiting for random access point)%s", "");
+            return DecodeStatus::OK;
+        }
+        // §8.1: RASL pictures associated with an IRAP whose NoRaslOutputFlag == 1
+        // are undecodable — their references were discarded. Skip them.
+        if (is_rasl(nut) && prev_irap_no_rasl_output_) {
+            HEVC_LOG(PARSE, "Skipping RASL (associated IRAP has NoRaslOutputFlag=1)%s", "");
+            return DecodeStatus::OK;
+        }
+    }
+    bool no_rasl_output_flag = isIRAP && prev_irap_no_rasl_output_;
+
     HEVC_LOG(PARSE, "Decoding picture: %dx%d type=%d QP=%d slices=%zu",
              sps->pic_width_in_luma_samples, sps->pic_height_in_luma_samples,
              static_cast<int>(first_sh.slice_type), first_sh.SliceQpY, vcl_count);
 
     // §8.3.1 — POC derivation (from first slice only)
-    int32_t poc = dpb_.derive_poc(first_sh, *sps, nal.header.nal_unit_type,
-                                   nal.header.TemporalId());
+    int32_t poc = dpb_.derive_poc(first_sh, *sps, nut,
+                                   nal.header.TemporalId(), no_rasl_output_flag);
+
+    // §D.3.8 — bind a pending recovery_point SEI to this (its associated)
+    // picture: output is reliable from POC + recovery_poc_cnt onward.
+    if (has_pending_recovery_point_) {
+        has_recovery_point_ = true;
+        recovery_poc_cnt_ = pending_recovery_poc_cnt_;
+        recovery_point_poc_ = poc + pending_recovery_poc_cnt_;
+        has_pending_recovery_point_ = false;
+    }
 
     // Allocate picture in DPB
     ChromaFormat fmt = static_cast<ChromaFormat>(sps->chroma_format_idc);
@@ -84,16 +172,11 @@ DecodeStatus Decoder::decode_picture(const std::vector<NalUnit>& nals,
     pic->poc = poc;
     pic->needed_for_output = first_sh.pic_output_flag;
 
-    // §8.1: IRAP with NoRaslOutputFlag starts a new CVS
-    if (is_irap(nal.header.nal_unit_type)) {
-        bool isIDR = (nal.header.nal_unit_type == NalUnitType::IDR_W_RADL ||
-                      nal.header.nal_unit_type == NalUnitType::IDR_N_LP);
-        bool isBLA = (nal.header.nal_unit_type == NalUnitType::BLA_W_LP ||
-                      nal.header.nal_unit_type == NalUnitType::BLA_W_RADL ||
-                      nal.header.nal_unit_type == NalUnitType::BLA_N_LP);
-        if (isIDR || isBLA)
-            cvs_id_++;
-    }
+    // §8.1: IRAP with NoRaslOutputFlag == 1 starts a new CVS. This now covers a
+    // CRA at the start of the bitstream / after EOS / after reset() too, not
+    // just IDR/BLA — so random-access tune-in produces a fresh CVS boundary.
+    if (isIRAP && no_rasl_output_flag)
+        cvs_id_++;
     pic->cvs_id = cvs_id_;
 
     // Set conformance window
@@ -105,7 +188,7 @@ DecodeStatus Decoder::decode_picture(const std::vector<NalUnit>& nals,
     }
 
     // §8.3.2 — RPS derivation and picture marking
-    dpb_.derive_rps(first_sh, *sps, nal.header.nal_unit_type, poc);
+    dpb_.derive_rps(first_sh, *sps, nut, poc, no_rasl_output_flag);
 
     // §8.3.4 — Reference picture list construction (P and B slices)
     if (first_sh.slice_type != SliceType::I) {
@@ -335,6 +418,20 @@ void Decoder::reset(bool clear_parameter_sets) {
     dpb_.reset();
     if (clear_parameter_sets) ps_mgr_.reset();
     cvs_id_ = 0;
+    // §8.1 random access: re-arm wait-for-IRAP and treat the next CRA as the
+    // first picture of a CVS (NoRaslOutputFlag == 1) — a reset() is a tune-in.
+    no_irap_yet_ = true;
+    prev_irap_no_rasl_output_ = false;
+    handle_cra_as_first_ = true;
+    // A reset() is a clean tune-in: clear any pending error-resync state.
+    skip_to_next_irap_ = false;
+    // §D.3.8: a reset() is a tune-in — drop any recovery-point state so the next
+    // stream's recovery_point SEI is reported fresh.
+    has_pending_recovery_point_ = false;
+    pending_recovery_poc_cnt_ = 0;
+    has_recovery_point_ = false;
+    recovery_poc_cnt_ = 0;
+    recovery_point_poc_ = 0;
     // The per-picture scratch buffers (cu_info_buf_, intra/chroma/motion,
     // cbf/log2/edge grids, sao_params_buf_, sao_backup_, slice_idx_buf_) are
     // intentionally left alone: every one is resize()+fill()'d at the top of

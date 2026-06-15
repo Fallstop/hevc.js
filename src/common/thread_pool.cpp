@@ -59,7 +59,17 @@ void ThreadPool::worker_loop() {
             job = std::move(jobs_.front());
             jobs_.pop();
         }
-        job();
+        // A job must never let an exception escape into the worker thread: an
+        // unhandled exception here would call std::terminate() and abort the whole
+        // process. On 24/7 lossy camera feeds a corrupt slice can make a WPP row
+        // job throw (bitstream over-read); swallow it so the decoder can contain
+        // the failure, drop the picture, and resync at the next IRAP. Jobs that
+        // need to report failure do so out-of-band (e.g. a shared error flag).
+        try {
+            job();
+        } catch (...) {
+            // Intentionally swallowed — see above.
+        }
         if (active_jobs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             jobs_done_.notify_one();
         }

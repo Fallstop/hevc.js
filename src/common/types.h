@@ -31,9 +31,10 @@ enum class ChromaFormat : uint8_t {
     YUV444     = 3,
 };
 
-// Derived chroma subsampling
+// Derived chroma subsampling (spec Table 6-1). MONOCHROME (4:0:0) has no chroma
+// planes, so SubWidthC == SubHeightC == 1 (matches SPS::derive() for chroma_format_idc 0).
 inline int SubWidthC(ChromaFormat fmt) {
-    return (fmt == ChromaFormat::YUV444) ? 1 : 2;
+    return (fmt == ChromaFormat::YUV444 || fmt == ChromaFormat::MONOCHROME) ? 1 : 2;
 }
 
 inline int SubHeightC(ChromaFormat fmt) {

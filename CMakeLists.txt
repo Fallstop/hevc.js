@@ -36,6 +36,7 @@ add_library(hevc-decode-lib
     src/syntax/pps.cpp
     src/syntax/slice_header.cpp
     src/syntax/parameter_sets.cpp
+    src/syntax/sei.cpp
     src/decoding/cabac.cpp
     src/decoding/syntax_elements.cpp
     src/decoding/coding_tree.cpp
@@ -96,7 +97,7 @@ if(BUILD_WASM)
         "SHELL:-s EXPORT_NAME=HEVCDecoderModule"
         "SHELL:-s STACK_SIZE=4194304"
         "SHELL:-s NO_DISABLE_EXCEPTION_CATCHING=1"
-        "SHELL:-s EXPORTED_FUNCTIONS=[_hevc_decoder_create,_hevc_decoder_destroy,_hevc_decoder_decode,_hevc_decoder_get_frame_count,_hevc_decoder_get_frame,_hevc_decoder_get_info,_hevc_decoder_feed,_hevc_decoder_drain,_hevc_decoder_get_drained_frame,_hevc_decoder_flush,_hevc_decoder_reset,_malloc,_free]"
+        "SHELL:-s EXPORTED_FUNCTIONS=[_hevc_decoder_create,_hevc_decoder_destroy,_hevc_decoder_decode,_hevc_decoder_get_frame_count,_hevc_decoder_get_frame,_hevc_decoder_get_info,_hevc_decoder_get_recovery_point,_hevc_decoder_feed,_hevc_decoder_drain,_hevc_decoder_get_drained_frame,_hevc_decoder_flush,_hevc_decoder_reset,_malloc,_free]"
         "SHELL:-s EXPORTED_RUNTIME_METHODS=[ccall,cwrap,getValue,HEAPU8,HEAPU16]"
     )
     # Don't build the native CLI in WASM mode
@@ -123,6 +124,16 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
         tests/unit/test_cabac.cpp
         tests/unit/test_incremental.cpp
         tests/unit/test_reset.cpp
+        tests/unit/test_small_transforms.cpp
+        tests/unit/test_ref_lists.cpp
+        tests/unit/test_interp_conceal.cpp
+        tests/unit/test_slice_ltrp_sps.cpp
+        tests/unit/test_sps_validate_dims.cpp
+        tests/unit/test_scaling_list_scan.cpp
+        tests/unit/test_random_access.cpp
+        tests/unit/test_decoder_resync.cpp
+        tests/unit/test_sei.cpp
+        tests/unit/test_monochrome_output.cpp
     )
 
     target_link_libraries(hevc_tests PRIVATE
@@ -170,6 +181,75 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
         COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/i_64x64_qp22.265 64 64
             48c64cd2de381113913149e92065d66c $<TARGET_FILE:hevc-decode>)
     set_tests_properties(oracle_i_64x64_qp22 PROPERTIES LABELS "oracle;phase4"
+        SKIP_RETURN_CODE 2)
+
+    # Open-GOP CRA + RASL leading pictures (random access, feature F1).
+    # Decoded from the start: the mid-stream CRA has NoRaslOutputFlag == 0, so its
+    # RASL leading pictures ARE decoded and output. Must stay byte-identical to
+    # the trusted ffmpeg reference — this guards the decoder-level NoRaslOutputFlag
+    # refactor against regressing the normal full-GOP path.
+    add_test(NAME oracle_opengop_cra_rasl
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/opengop_cra_rasl.265 176 144
+            9fba759b58ff8cd4a9a7ac5473cc1b1b $<TARGET_FILE:hevc-decode>)
+    set_tests_properties(oracle_opengop_cra_rasl PROPERTIES LABELS "oracle;feature"
+        SKIP_RETURN_CODE 2)
+
+    # Recovery-point SEI (gradual decoding refresh, feature F2). An intra-refresh
+    # clip with x265 idr-recovery-sei: the IDR carries a recovery_point PREFIX_SEI.
+    # SEI is now parsed but pixel output is unchanged — this guards that the SEI
+    # subsystem does not perturb decoded samples (must stay byte-identical to the
+    # trusted ffmpeg reference).
+    add_test(NAME oracle_sei_recovery_point
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/sei_recovery_point.265 176 144
+            87897c661d1b170cf2c8d879777c9f0d $<TARGET_FILE:hevc-decode>)
+    set_tests_properties(oracle_sei_recovery_point PROPERTIES LABELS "oracle;feature"
+        SKIP_RETURN_CODE 2)
+
+    # Explicit (non-default) scaling list — exercises the up-right diagonal
+    # scan -> raster mapping in ScalingListData::parse (feature C5).
+    add_test(NAME oracle_i_64x64_scaling_list
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/i_64x64_scaling_list.265 64 64
+            7b14e2d4f20b2525ee9f038d4ded62fb $<TARGET_FILE:hevc-decode>)
+    set_tests_properties(oracle_i_64x64_scaling_list PROPERTIES LABELS "oracle;feature"
+        SKIP_RETURN_CODE 2)
+
+    # Monochrome 4:0:0 (feature F3 — IR/thermal cameras). i400 luma-only clip with
+    # adaptive QP. Guards two monochrome bugs: the chroma-CBF root seed must not leak
+    # into the cu_qp_delta condition (CABAC desync), and the output path must report
+    # 0-width chroma / null chroma pointers (no read into the empty chroma buffers).
+    add_test(NAME oracle_mono_qcif_4f
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/mono_qcif_4f.265 176 144
+            3c4e47dcac037796dfa665ab9e51e822 $<TARGET_FILE:hevc-decode> gray)
+    set_tests_properties(oracle_mono_qcif_4f PROPERTIES LABELS "oracle;feature"
+        SKIP_RETURN_CODE 2)
+
+    # 4:2:2 chroma (feature M1 — Main 4:2:2 / Rext). QCIF clip with I + P frames,
+    # deblocking + SAO. Guards the 4:2:2 transform path: two stacked chroma TBs per
+    # luma TB (deferred-CBF inheritance, per-block residual/dequant/transform), the
+    # luma-space intra reference-availability (chroma CTB height is full in 4:2:2),
+    # and the doubled vertical chroma motion-vector for inter prediction.
+    add_test(NAME oracle_i_p_qcif_422_4f
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/i_p_qcif_422_4f.265 176 144
+            ca06427d6ae6af68127f3812b75aa9b5 $<TARGET_FILE:hevc-decode> yuv422p)
+    set_tests_properties(oracle_i_p_qcif_422_4f PROPERTIES LABELS "oracle;feature"
+        SKIP_RETURN_CODE 2)
+
+    # 4:2:2 10-bit (Main 4:2:2 10). Same clip as above at yuv422p10le — guards the
+    # 4:2:2 path on the uint16 sample storage / 10-bit output writer.
+    add_test(NAME oracle_i_p_qcif_422_10b_4f
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/i_p_qcif_422_10b_4f.265 176 144
+            7df5ccbfcca98ff8adce6b7321420f41 $<TARGET_FILE:hevc-decode> yuv422p10le)
+    set_tests_properties(oracle_i_p_qcif_422_10b_4f PROPERTIES LABELS "oracle;feature"
+        SKIP_RETURN_CODE 2)
+
+    # 4:2:2 high-QP (qp=42). Guards spec 8.6.1 chroma-QP derivation: for
+    # ChromaArrayType != 1 (4:2:2/4:4:4), qPc = Min(qPi, 51) — NOT the 4:2:0
+    # mapping table. The table is identity for qPi <= 29, so only a high-QP
+    # 4:2:2 stream (qPi > 30) exercises the divergent clamp path.
+    add_test(NAME oracle_i_p_qcif_422_hq_4f
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/i_p_qcif_422_hq_4f.265 176 144
+            52162b65507ff80be5b3aa6819071cf6 $<TARGET_FILE:hevc-decode> yuv422p)
+    set_tests_properties(oracle_i_p_qcif_422_hq_4f PROPERTIES LABELS "oracle;feature"
         SKIP_RETURN_CODE 2)
 
     # Phase 5 — P-frames, no filters

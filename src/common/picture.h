@@ -80,10 +80,6 @@ struct Picture {
     template<class S> S sample(int c, int x, int y) const {
         return plane_ptr<S>(c)[y * stride[c] + x];
     }
-    // Non-templated convenience for the uint16 storage path (bytes_per_sample==2);
-    // pixel kernels that must handle uint8 storage use the templated form.
-    uint16_t& sample(int c, int x, int y) { return sample<uint16_t>(c, x, y); }
-    uint16_t sample(int c, int x, int y) const { return sample<uint16_t>(c, x, y); }
 
     // Width-dispatched single-sample read for cold/scalar paths that must work
     // for both uint8 and uint16 storage (e.g. intra neighbour fetch).

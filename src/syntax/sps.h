@@ -165,6 +165,12 @@ struct SPS {
 
     // Compute all derived values after parsing
     void derive();
+
+    // Validate parsed/derived dimensions against sane bounds (untrusted media).
+    // Must be called after derive() (needs MinCbSizeY). Returns false if the
+    // picture size or conformance window offsets are out of range, so the
+    // caller can reject the SPS instead of allocating an oversized/OOB buffer.
+    bool validate() const;
 };
 
 } // namespace hevc
