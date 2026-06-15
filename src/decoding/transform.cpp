@@ -683,11 +683,25 @@ void perform_transform_inverse(int log2TrafoSize, int cIdx,
     int trSize = 1 << log2TrafoSize;
 
     if (transform_skip) {
-        // Transform skip: shift = 15 - BitDepth
-        int shift = std::max(0, 15 - bit_depth);
-        int add = (shift > 0) ? (1 << (shift - 1)) : 0;
-        for (int i = 0; i < trSize * trSize; i++) {
-            residual[i] = static_cast<int16_t>((scaled[i] + add) >> shift);
+        // §8.6.4.2: transform-skip replaces the inverse transform with a scaled
+        // identity. perform_dequant already produced the spec's d[x][y] in
+        // `scaled`. The skip left-shift tsShift = 5 + Log2(nTbS) combined with the
+        // common residual right-shift bdShift = 20 - BitDepth nets to
+        // (15 - BitDepth - Log2(nTbS)) — log2TransformRange = 15 (Main profile),
+        // matching the dequant bdShift here. The previous code used 15 - BitDepth,
+        // omitting the -Log2(nTbS) term and over-shifting by Log2(nTbS) (a 4x
+        // amplitude loss for 4x4), so every transform-skip block decoded wrong.
+        int shift = 15 - bit_depth - log2TrafoSize;
+        if (shift > 0) {
+            int add = 1 << (shift - 1);
+            for (int i = 0; i < trSize * trSize; i++)
+                residual[i] = static_cast<int16_t>(
+                    Clip3(-32768, 32767, (scaled[i] + add) >> shift));
+        } else {
+            int ls = -shift;
+            for (int i = 0; i < trSize * trSize; i++)
+                residual[i] = static_cast<int16_t>(
+                    Clip3(-32768, 32767, scaled[i] << ls));
         }
         return;
     }

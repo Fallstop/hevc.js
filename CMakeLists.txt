@@ -282,6 +282,23 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
     set_tests_properties(oracle_i_p_qcif_444_hq_4f PROPERTIES LABELS "oracle;feature"
         SKIP_RETURN_CODE 2)
 
+    # transform_skip (§8.6.4.2). I+P clips with transform_skip_enabled_flag and
+    # transform-skipped 4x4 blocks. Guards the skip residual shift:
+    # 15 - BitDepth - Log2(nTbS) (the previous code used 15 - BitDepth, omitting
+    # the -Log2(nTbS) term and scaling every skip block down by 4x). Both decode
+    # wrong before the fix. 4:2:0 (common) + 4:4:4 (per-leaf chroma + skip).
+    add_test(NAME oracle_i_p_qcif_tskip_4f
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/i_p_qcif_tskip_4f.265 176 144
+            e6f8200e4a8d09692e5fbfd51f271be4 $<TARGET_FILE:hevc-decode> yuv420p)
+    set_tests_properties(oracle_i_p_qcif_tskip_4f PROPERTIES LABELS "oracle;feature"
+        SKIP_RETURN_CODE 2)
+
+    add_test(NAME oracle_i_p_qcif_444_tskip_4f
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/i_p_qcif_444_tskip_4f.265 176 144
+            25e77cb30a2dddf7c8e47570c8b83a61 $<TARGET_FILE:hevc-decode> yuv444p)
+    set_tests_properties(oracle_i_p_qcif_444_tskip_4f PROPERTIES LABELS "oracle;feature"
+        SKIP_RETURN_CODE 2)
+
     # Phase 5 — P-frames, no filters
     add_test(NAME oracle_p_qcif_10f
         COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/p_qcif_10f.265 176 144

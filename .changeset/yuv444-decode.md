@@ -36,6 +36,5 @@ qp 6..51, with NxN-heavy content. Adds three 4:4:4 oracle fixtures
 existing 4:2:0 / 4:2:2 / monochrome / 10-bit oracles stay byte-identical,
 and the WASM decoder (`packages/core/wasm/`) is rebuilt to match.
 
-Note: `transform_skip` remains incorrect for all chroma formats (a
-pre-existing decoder limitation, not specific to 4:4:4); it is off by
-default in common encoders and is tracked separately.
+Note: a pre-existing `transform_skip` scaling bug (all chroma formats, not
+specific to 4:4:4) is fixed in a companion change in this same series.
