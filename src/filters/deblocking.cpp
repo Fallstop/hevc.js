@@ -320,8 +320,10 @@ static int derive_bs(const DecodingContext& ctx, int xP, int yP, int xQ, int yQ,
 
     // Check if edge is also a TU boundary with nonzero coefficients
     int stride = ctx.filter_grid_stride;
-    int gxP = xP / 4, gyP = yP / 4;
-    int gxQ = xQ / 4, gyQ = yQ / 4;
+    // xP/yP/xQ/yQ are provably non-negative (bounds-checked above), so these
+    // power-of-two divides/modulos lower to shifts/masks without sign correction.
+    int gxP = xP >> 2, gyP = yP >> 2;
+    int gxQ = xQ >> 2, gyQ = yQ >> 2;
     bool cbfP = ctx.cbf_luma_grid[gyP * stride + gxP] != 0;
     bool cbfQ = ctx.cbf_luma_grid[gyQ * stride + gxQ] != 0;
 
@@ -339,20 +341,20 @@ static int derive_bs(const DecodingContext& ctx, int xP, int yP, int xQ, int yQ,
     bool isTuEdge = false;
     if (xP != xQ) {
         // Vertical edge
-        isTuEdge = (xQ % tuSizeQ == 0) || ((xP + 1) % tuSizeP == 0 && (xP + 1) == xQ);
+        isTuEdge = ((xQ & (tuSizeQ - 1)) == 0) || (((xP + 1) & (tuSizeP - 1)) == 0 && (xP + 1) == xQ);
     } else {
         // Horizontal edge
-        isTuEdge = (yQ % tuSizeQ == 0) || ((yP + 1) % tuSizeP == 0 && (yP + 1) == yQ);
+        isTuEdge = ((yQ & (tuSizeQ - 1)) == 0) || (((yP + 1) & (tuSizeP - 1)) == 0 && (yP + 1) == yQ);
     }
 
     if (isTuEdge && (cbfP || cbfQ))
         return 1;
 
     // Inter prediction comparison
-    int minTb = sps.MinTbSizeY;
+    int minTbLog2 = sps.MinTbLog2SizeY;
     int miStride = ctx.motion_info_stride;
-    auto& miP = ctx.motion_info[(yP / minTb) * miStride + (xP / minTb)];
-    auto& miQ = ctx.motion_info[(yQ / minTb) * miStride + (xQ / minTb)];
+    auto& miP = ctx.motion_info[(yP >> minTbLog2) * miStride + (xP >> minTbLog2)];
+    auto& miQ = ctx.motion_info[(yQ >> minTbLog2) * miStride + (xQ >> minTbLog2)];
 
     int nRefP = (miP.pred_flag[0] ? 1 : 0) + (miP.pred_flag[1] ? 1 : 0);
     int nRefQ = (miQ.pred_flag[0] ? 1 : 0) + (miQ.pred_flag[1] ? 1 : 0);
