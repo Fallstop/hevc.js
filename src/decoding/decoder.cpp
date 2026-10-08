@@ -347,7 +347,8 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek, const Seg
     if (!first_sh.first_slice_segment_in_pic_flag && !opens_cvs) {
         const int32_t taken = dpb_.derive_poc(first_sh, *sps, nut, nal.header.TemporalId(),
                                               false, /*commit=*/false);
-        if (dpb_.holds_poc(cvs_id_, taken, last_picture_.get())) {
+        if (std::find(recent_pocs_.begin(), recent_pocs_.end(), std::make_pair(cvs_id_, taken)) !=
+            recent_pocs_.end()) {
             drop_stray_segment(peek);
             return;
         }
@@ -460,6 +461,8 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek, const Seg
     if (isIRAP && no_rasl_output_flag)
         cvs_id_++;
     pic->cvs_id = cvs_id_;
+    if (recent_pocs_.size() >= kRecentPocs) recent_pocs_.erase(recent_pocs_.begin());
+    recent_pocs_.emplace_back(cvs_id_, poc);
 
     // A reference the RPS names but the DPB lacks: with concealment, predict
     // from the nearest available picture rather than from mid-grey.
@@ -959,6 +962,7 @@ std::vector<Picture*> Decoder::output_pictures() {
 void Decoder::discontinuity() {
     finish_picture();
     done_sigs_.clear();
+    recent_pocs_.clear();
     dpb_.discontinuity();
     // §8.1: the next IRAP opens a new CVS — a CRA takes NoRaslOutputFlag = 1
     no_irap_yet_ = true;
@@ -981,6 +985,7 @@ void Decoder::reset(bool clear_parameter_sets) {
     pend_.sigs.clear();
     pend_.last_independent = nullptr;
     done_sigs_.clear();
+    recent_pocs_.clear();
     dpb_.reset();
     // Parameter sets held back for the abandoned picture still belong to the
     // stream: keep them unless the stored sets are cleared anyway.

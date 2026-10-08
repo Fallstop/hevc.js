@@ -459,3 +459,45 @@ TEST(PictureAssembly, AChangedPpsMidPictureAppliesFromTheNextPicture) {
         }
     }
 }
+
+// A non-first slice arriving two pictures late (reordered in transit): its
+// picture was finished — and may already be output and released — without
+// it. It is dropped, not decoded as a second picture with the same POC.
+TEST(PictureAssembly, ALateSegmentOfAFinishedPictureIsDropped) {
+    ErrorPolicy conceal;
+    conceal.conceal_slice_errors = true;
+    for (const char* name : kMultiSlice) {
+        const auto data = read_file(fixture(name));
+        const Output clean = batch(data);
+        const auto aus = split_access_units(data);
+        NalParser parser;
+        for (size_t k = 1; k + 2 < aus.size(); k++) {
+            // Move the second slice of picture k behind picture k + 2
+            std::vector<std::vector<uint8_t>> moved = aus;
+            std::vector<uint8_t> late, rest;
+            size_t v = 0;
+            for (const auto& nal : parser.parse(aus[k].data(), aus[k].size())) {
+                auto c = nal_chunk(aus[k], nal);
+                append(is_vcl(nal.header.nal_unit_type) && v++ == 1 ? late : rest, c);
+            }
+            ASSERT_FALSE(late.empty());
+            moved[k] = rest;
+            append(moved[k + 2], late);
+            std::vector<uint8_t> stream;
+            for (const auto& au : moved) append(stream, au);
+            for (const ErrorPolicy& policy : {ErrorPolicy{}, conceal}) {
+                SCOPED_TRACE(std::string(name) + " picture " + std::to_string(k) +
+                             (policy.conceal_slice_errors ? " conceal" : " default"));
+                const Fed got = feed_per_au(stream, policy);
+                std::vector<double> pocs(got.out.pocs.begin(), got.out.pocs.end());
+                EXPECT_TRUE(unique(pocs));
+                EXPECT_TRUE(unique(got.tags));
+                if (policy.conceal_slice_errors) {
+                    EXPECT_EQ(got.out.pocs, clean.pocs);
+                    EXPECT_EQ(got.stats.skipped_error, 0u);
+                    EXPECT_EQ(got.stats.concealed, 1u);
+                }
+            }
+        }
+    }
+}

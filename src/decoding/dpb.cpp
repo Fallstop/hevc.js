@@ -785,15 +785,6 @@ int DPB::substitute_missing_refs(const Picture& cur, Picture* fallback) {
     return still_missing;
 }
 
-bool DPB::holds_poc(int32_t cvs_id, int32_t poc, const Picture* also) const {
-    auto match = [&](const Picture* p) {
-        return p && p->cvs_id == cvs_id && p->poc == poc;
-    };
-    for (const auto& pic : pictures_)
-        if ((pic->is_reference() || pic->needed_for_output) && match(pic.get())) return true;
-    return match(also);
-}
-
 std::shared_ptr<Picture> DPB::share(const Picture* pic) const {
     for (const auto& p : pictures_)
         if (p.get() == pic) return p;

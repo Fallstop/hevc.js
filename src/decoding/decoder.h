@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <deque>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "common/picture.h"
@@ -232,6 +233,11 @@ private:
     // segments arriving after it completed is dropped, not started as a
     // picture of its own. Cleared by flush(), discontinuity() and reset().
     std::vector<SegmentSig> done_sigs_;
+    // (CVS, POC) of the pictures started last: a picture whose first segment
+    // was lost and whose POC is among them is a late or stray segment of
+    // that picture (§8.3.1: POC is unique within a CVS).
+    std::vector<std::pair<int32_t, int32_t>> recent_pocs_;
+    static constexpr size_t kRecentPocs = 32;
     // Parameter sets that arrived while a picture was being assembled
     // (§7.4.2.4.4 allows them between its slices); applied when it finishes.
     std::vector<NalUnit> deferred_ps_;

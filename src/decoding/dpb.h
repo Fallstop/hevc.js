@@ -240,10 +240,6 @@ public:
     // number of entries that remain missing.
     int substitute_missing_refs(const Picture& cur, Picture* fallback);
 
-    // A decoded picture of CVS `cvs_id` with POC `poc` is still held — a
-    // reference, awaiting output, or `also` (kept alive outside the DPB).
-    bool holds_poc(int32_t cvs_id, int32_t poc, const Picture* also) const;
-
     // Shared ownership of a stored picture (to keep it alive past eviction)
     std::shared_ptr<Picture> share(const Picture* pic) const;
 
