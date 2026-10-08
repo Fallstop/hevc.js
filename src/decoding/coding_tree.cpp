@@ -836,13 +836,21 @@ bool decode_slice_segment_data(DecodingContext& ctx, BitstreamReader& bs,
         const int startTs = pps.CtbAddrRsToTs[startRs];
         const bool firstInTile = startTs == 0 ||
             (!pps.TileId.empty() && pps.TileId[startTs] != pps.TileId[startTs - 1]);
+        const bool wppRowStart = pps.entropy_coding_sync_enabled_flag &&
+            (startRs % sps.PicWidthInCtbsY == 0 ||
+             (!pps.TileId.empty() &&
+              pps.TileId[startTs] != pps.TileId[pps.CtbAddrRsToTs[startRs - 1]]));
+        // §8.6.1: qPY_PREV is SliceQpY at the first quantization group of a
+        // slice, a tile, or (WPP) a CTB row. A dependent segment continues its
+        // slice: it keeps the QP the previous segment ended with.
+        if (!sh.dependent_slice_segment_flag || firstInTile || wppRowStart) {
+            ctx.QpY_prev = sh.SliceQpY;
+            ctx.QpY_prev_qg = sh.SliceQpY;
+        }
         const int sliceType = static_cast<int>(sh.slice_type);
         if (!sh.dependent_slice_segment_flag || firstInTile) {
             cabac.init_contexts(sliceType, sh.SliceQpY, sh.cabac_init_flag);
-        } else if (pps.entropy_coding_sync_enabled_flag &&
-                   (startRs % sps.PicWidthInCtbsY == 0 ||
-                    (!pps.TileId.empty() &&
-                     pps.TileId[startTs] != pps.TileId[pps.CtbAddrRsToTs[startRs - 1]]))) {
+        } else if (wppRowStart) {
             if (ctx.slice_idx) ctx.slice_idx[startRs] = static_cast<uint16_t>(ctx.current_slice_idx);
             if (wpp_sync_available_at(ctx, startRs))
                 cabac.load_contexts(ctx.wpp_saved_contexts);
@@ -853,10 +861,6 @@ bool decode_slice_segment_data(DecodingContext& ctx, BitstreamReader& bs,
         // (TableStateIdxDs), which the shared engine still holds.
     }
     cabac.init_decoder(bs);
-
-    // Init QP
-    ctx.QpY_prev = sh.SliceQpY;
-    ctx.QpY_prev_qg = sh.SliceQpY;
 
     // CTU scan
     int CtbAddrInTs = pps.CtbAddrRsToTs[sh.slice_segment_address];
