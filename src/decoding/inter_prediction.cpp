@@ -317,11 +317,16 @@ static void derive_spatial_merge_candidates(
     }
 
     // Second pass: apply pruning per spec, using rawAvail for conditions
+    // Motion of an unused list does not take part in the comparison.
     auto same_motion_raw = [](const PUMotionInfo& a, const PUMotionInfo& b) {
-        return a.mv[0].x == b.mv[0].x && a.mv[0].y == b.mv[0].y &&
-               a.mv[1].x == b.mv[1].x && a.mv[1].y == b.mv[1].y &&
-               a.ref_idx[0] == b.ref_idx[0] && a.ref_idx[1] == b.ref_idx[1] &&
-               a.pred_flag[0] == b.pred_flag[0] && a.pred_flag[1] == b.pred_flag[1];
+        for (int l = 0; l < 2; l++) {
+            if (a.pred_flag[l] != b.pred_flag[l]) return false;
+            if (!a.pred_flag[l]) continue;
+            if (a.mv[l].x != b.mv[l].x || a.mv[l].y != b.mv[l].y ||
+                a.ref_idx[l] != b.ref_idx[l])
+                return false;
+        }
+        return true;
     };
 
     for (int i = 0; i < 5; i++) {
@@ -366,6 +371,10 @@ static PUMotionInfo derive_merge_mode(DecodingContext& ctx,
                                        int xPb, int yPb, int nPbW, int nPbH,
                                        int partIdx, int mergeIdx) {
     auto& sh = *ctx.sh;
+    // The 8x4/4x8 bi-prediction restriction (step 10) is about the PU as
+    // coded, before the shared-merge-list override below (nOrigPbW/H).
+    const int nOrigPbW = nPbW;
+    const int nOrigPbH = nPbH;
     // §8.5.3.2.2 eq 8-110..8-113: Log2ParMrgLevel override for 8x8 CU
     int Log2ParMrgLevel = ctx.pps->log2_parallel_merge_level_minus2 + 2;
     if (Log2ParMrgLevel > 2 && nCbS == 8) {
@@ -487,10 +496,11 @@ static PUMotionInfo derive_merge_mode(DecodingContext& ctx,
     result.pred_flag[0] = sel.pred_flag[0];
     result.pred_flag[1] = sel.pred_flag[1];
 
-    // §8.5.3.2.2 step 10: bi-pred restriction for small PUs
-    if (result.pred_flag[0] && result.pred_flag[1] && (nPbW + nPbH) == 12) {
+    // §8.5.3.2.2 step 10: bi-pred restriction for small PUs (original size)
+    if (result.pred_flag[0] && result.pred_flag[1] && (nOrigPbW + nOrigPbH) == 12) {
         result.ref_idx[1] = -1;
         result.pred_flag[1] = false;
+        result.mv[1] = {};
     }
 
     return result;
