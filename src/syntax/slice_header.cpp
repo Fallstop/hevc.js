@@ -177,11 +177,13 @@ bool SliceHeader::parse(BitstreamReader& bs, const SPS& sps, const PPS& pps,
                   sps.PicSizeInCtbsY);
     }
 
-    // The rest is only present for independent slice segments
+    // §7.3.6.1: a dependent slice segment carries only its address, entry
+    // points and header extension; every other field is inherited from the
+    // preceding independent segment (inherit_from()).
     if (dependent_slice_segment_flag) {
-        // Dependent slices inherit most fields from the independent slice
-        return true;
+        return parse_segment_tail(bs, sps, pps);
     }
+    SliceAddrRs = slice_segment_address;
 
     // Extra slice header bits (reserved)
     for (int i = 0; i < pps.num_extra_slice_header_bits; i++) {
@@ -467,7 +469,15 @@ bool SliceHeader::parse(BitstreamReader& bs, const SPS& sps, const PPS& pps,
         slice_loop_filter_across_slices_enabled_flag = bs.read_flag();
     }
 
-    // Entry point offsets
+    (void)nuh_temporal_id;
+    return parse_segment_tail(bs, sps, pps);
+}
+
+// Entry points, header extension and byte_alignment() — present in both
+// independent and dependent slice segment headers.
+bool SliceHeader::parse_segment_tail(BitstreamReader& bs, const SPS& sps, const PPS& pps) {
+    num_entry_point_offsets = 0;
+    entry_point_offset_minus1.clear();
     if (pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag) {
         num_entry_point_offsets = bs.read_ue();
         // §7.4.7.1: bounded by the substreams the picture can have — CTB rows
@@ -507,14 +517,34 @@ bool SliceHeader::parse(BitstreamReader& bs, const SPS& sps, const PPS& pps,
 
     // byte_alignment()
     bs.byte_alignment();
+    slice_data_byte_offset = bs.byte_position();
 
     HEVC_LOG(PARSE, "Slice: type=%d poc_lsb=%d qp=%d addr=%d first=%d dep=%d",
              static_cast<int>(slice_type), slice_pic_order_cnt_lsb, SliceQpY,
              slice_segment_address, first_slice_segment_in_pic_flag ? 1 : 0,
              dependent_slice_segment_flag ? 1 : 0);
-
-    (void)nuh_temporal_id;
     return true;
+}
+
+void SliceHeader::inherit_from(const SliceHeader& indep) {
+    // Segment-level fields this dependent header parsed itself
+    const bool first = first_slice_segment_in_pic_flag;
+    const uint32_t address = slice_segment_address;
+    const uint32_t num_entry = num_entry_point_offsets;
+    std::vector<uint32_t> entries = std::move(entry_point_offset_minus1);
+    const size_t data_offset = slice_data_byte_offset;
+
+    *this = indep;
+
+    first_slice_segment_in_pic_flag = first;
+    dependent_slice_segment_flag = true;
+    slice_segment_address = address;
+    num_entry_point_offsets = num_entry;
+    entry_point_offset_minus1 = std::move(entries);
+    slice_data_byte_offset = data_offset;
+    SliceAddrRs = indep.SliceAddrRs;
+    // Never leave a pointer into the independent header's inline RPS
+    if (indep.active_rps == &indep.st_rps) active_rps = &st_rps;
 }
 
 } // namespace hevc

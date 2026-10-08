@@ -19,6 +19,9 @@ struct PPS;
 // Reference Picture List entry — pointer to a decoded picture in the DPB
 struct RefPicListEntry {
     Picture* pic = nullptr;  // nullptr = "no reference picture"
+    // Marked "used for long-term reference" when the current picture is
+    // decoded (§8.5.3.2: LongTermRefPic)
+    bool is_long_term = false;
 };
 
 // Decoded Picture Buffer
@@ -172,6 +175,12 @@ public:
     Picture* ref_pic_list1(int idx) const {
         return (idx >= 0 && idx < static_cast<int>(ref_pic_list1_.size()))
                ? ref_pic_list1_[idx].pic : nullptr;
+    }
+    bool ref_is_long_term0(int idx) const {
+        return idx >= 0 && idx < static_cast<int>(ref_pic_list0_.size()) && ref_pic_list0_[idx].is_long_term;
+    }
+    bool ref_is_long_term1(int idx) const {
+        return idx >= 0 && idx < static_cast<int>(ref_pic_list1_.size()) && ref_pic_list1_[idx].is_long_term;
     }
     int num_ref_list0() const { return static_cast<int>(ref_pic_list0_.size()); }
     int num_ref_list1() const { return static_cast<int>(ref_pic_list1_.size()); }

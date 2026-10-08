@@ -107,7 +107,8 @@ static void decode_sao(DecodingContext& ctx, int rx, int ry) {
     bool sao_merge_up_flag = false;
 
     if (rx > 0) {
-        bool leftInSlice = (CtbAddrInRs > static_cast<int>(sh.slice_segment_address));
+        // §7.3.8.3 compares against SliceAddrRs (the slice, not the segment)
+        bool leftInSlice = (CtbAddrInRs > static_cast<int>(sh.SliceAddrRs));
         bool leftInTile = (ctx.pps->TileId.empty() ||
             ctx.pps->TileId[ctx.pps->CtbAddrRsToTs[CtbAddrInRs]] ==
             ctx.pps->TileId[ctx.pps->CtbAddrRsToTs[CtbAddrInRs - 1]]);
@@ -117,7 +118,7 @@ static void decode_sao(DecodingContext& ctx, int rx, int ry) {
 
     if (ry > 0 && !sao_merge_left_flag) {
         int upAddr = CtbAddrInRs - ctx.sps->PicWidthInCtbsY;
-        bool upInSlice = (upAddr >= static_cast<int>(sh.slice_segment_address));
+        bool upInSlice = (upAddr >= static_cast<int>(sh.SliceAddrRs));
         bool upInTile = (ctx.pps->TileId.empty() ||
             ctx.pps->TileId[ctx.pps->CtbAddrRsToTs[CtbAddrInRs]] ==
             ctx.pps->TileId[ctx.pps->CtbAddrRsToTs[upAddr]]);
@@ -581,9 +582,17 @@ static bool decode_wpp_parallel(DecodingContext& ctx, BitstreamReader& bs,
     auto& sps = *ctx.sps;
     auto& sh = *ctx.sh;
 
-    int numRows = sps.PicHeightInCtbsY;
     int numCols = sps.PicWidthInCtbsY;
     int startRow = (sh.slice_segment_address / numCols);
+    // One substream per CTB row (§7.3.8.1, WPP without tiles): the segment
+    // covers exactly substream_byte_pos.size() rows. Rows past those belong to
+    // later slices and must not be decoded from this segment's data.
+    int numRows = std::min<int>(sps.PicHeightInCtbsY,
+                                startRow + static_cast<int>(substream_byte_pos.size()));
+    const int lastRow = numRows - 1;
+    // End-of-segment CABAC state of the last row: what a following dependent
+    // segment continues from (TableStateIdxDs, §9.3.2.4).
+    std::vector<CabacContext> final_ctx(NUM_CABAC_CONTEXTS);
 
     // Per-row synchronization: completed_col[row] = last completed column (-1 = not started)
     std::vector<std::atomic<int>> completed_col(numRows);
@@ -628,11 +637,11 @@ static bool decode_wpp_parallel(DecodingContext& ctx, BitstreamReader& bs,
             row_bs.seek_to_byte(substream_byte_pos[substreamIdx]);
         }
 
-        // Init CABAC contexts
-        if (row == startRow) {
-            if (!sh.dependent_slice_segment_flag) {
-                row_cabac.init_contexts(sliceType, sh.SliceQpY, sh.cabac_init_flag);
-            }
+        // Init CABAC contexts. A one-CTB-wide picture has no CTB (1, row-1)
+        // to synchronize from (§9.3.1): every row initializes — and waiting
+        // for that CTB would never finish.
+        if (row == startRow || numCols < 2) {
+            row_cabac.init_contexts(sliceType, sh.SliceQpY, sh.cabac_init_flag);
         } else {
             // Wait for row-1 col 1 (2nd CTU) before restoring contexts
             {
@@ -668,10 +677,11 @@ static bool decode_wpp_parallel(DecodingContext& ctx, BitstreamReader& bs,
 
             // Phase 10: record slice ownership
             if (row_ctx.slice_idx) {
-                row_ctx.slice_idx[CtbAddrInRs] = static_cast<uint8_t>(ctx.current_slice_idx);
+                row_ctx.slice_idx[CtbAddrInRs] = static_cast<uint16_t>(ctx.current_slice_idx);
             }
 
             decode_coding_tree_unit(row_ctx, xCtb, yCtb);
+            if (row_ctx.ctb_decoded) row_ctx.ctb_decoded[CtbAddrInRs] = 1;
 
             // §9.3.2.4: save contexts after 2nd CTU (col 1) for next row
             if (col == 1) {
@@ -689,6 +699,7 @@ static bool decode_wpp_parallel(DecodingContext& ctx, BitstreamReader& bs,
             if (end_of_slice || col == numCols - 1)
                 break;
         }
+        if (row == lastRow) row_cabac.save_contexts(final_ctx.data());
         } catch (...) {
             wpp_failed.store(true, std::memory_order_relaxed);
         }
@@ -705,18 +716,43 @@ static bool decode_wpp_parallel(DecodingContext& ctx, BitstreamReader& bs,
     int num_active_rows = numRows - startRow;
 
     if (num_active_rows <= 1 || !ctx.thread_pool || ctx.thread_pool->num_workers() <= 1) {
+        for (int r = startRow; r < numRows; r++) decode_row(r);
+    } else {
+        // Submit worker rows to thread pool; run first row on current thread
+        for (int r = startRow + 1; r < numRows; r++) {
+            ctx.thread_pool->submit([&decode_row, r]() { decode_row(r); });
+        }
         decode_row(startRow);
-        return !wpp_failed.load(std::memory_order_relaxed);
+        ctx.thread_pool->wait_all();
     }
 
-    // Submit worker rows to thread pool; run first row on current thread
-    for (int r = startRow + 1; r < numRows; r++) {
-        ctx.thread_pool->submit([&decode_row, r]() { decode_row(r); });
+    // Hand the shared context what the sequential path would have left in it,
+    // for a dependent segment that follows: the end-of-segment state and the
+    // last row's WPP storage (its second CTB).
+    ctx.cabac->load_contexts(final_ctx.data());
+    if (numCols > 1) {
+        std::memcpy(ctx.wpp_saved_contexts, wpp_ctx_ptr(lastRow), sizeof(ctx.wpp_saved_contexts));
+        ctx.wpp_contexts_available = true;
     }
-    decode_row(startRow);
-    ctx.thread_pool->wait_all();
 
     return !wpp_failed.load(std::memory_order_relaxed);
+}
+
+// §9.3.1: the first CTB of a CTB row synchronizes its contexts from the CTB at
+// (1, row - 1) when that CTB is available (§6.4.1): inside the picture, in the
+// same slice and tile, and already decoded. Otherwise the contexts initialize.
+static bool wpp_sync_available(const DecodingContext& ctx, int row) {
+    const auto& sps = *ctx.sps;
+    const auto& pps = *ctx.pps;
+    if (row <= 0 || sps.PicWidthInCtbsY < 2) return false;
+    const int rsT = (row - 1) * sps.PicWidthInCtbsY + 1;
+    const int rsCur = row * sps.PicWidthInCtbsY;
+    if (ctx.slice_idx && ctx.slice_idx[rsT] != ctx.current_slice_idx) return false;
+    if (ctx.ctb_decoded && !ctx.ctb_decoded[rsT]) return false;
+    if (!pps.TileId.empty() &&
+        pps.TileId[pps.CtbAddrRsToTs[rsT]] != pps.TileId[pps.CtbAddrRsToTs[rsCur]])
+        return false;
+    return ctx.wpp_contexts_available;
 }
 
 // ============================================================
@@ -759,17 +795,38 @@ bool decode_slice_segment_data(DecodingContext& ctx, BitstreamReader& bs,
 
     // WPP parallel path: when entropy_coding_sync is enabled, tiles disabled,
     // and we have entry point offsets, decode rows in parallel via thread pool.
+    // The row-parallel path handles the common shape: an independent segment
+    // starting at the first CTB of a row. Dependent segments and segments
+    // starting mid-row take the sequential path, which implements the full
+    // §9.3.1 initialization/synchronization rules.
     if (pps.entropy_coding_sync_enabled_flag && !pps.tiles_enabled_flag &&
-        !substream_byte_pos.empty() && ctx.thread_pool && ctx.thread_pool->num_workers() > 1) {
+        !substream_byte_pos.empty() && ctx.thread_pool && ctx.thread_pool->num_workers() > 1 &&
+        !sh.dependent_slice_segment_flag &&
+        sh.slice_segment_address % static_cast<uint32_t>(sps.PicWidthInCtbsY) == 0) {
         return decode_wpp_parallel(ctx, bs, substream_byte_pos);
     }
 
     uint32_t wpp_substream_idx = 0;
 
-    // Initialize CABAC
-    if (!sh.dependent_slice_segment_flag) {
-        int sliceType = static_cast<int>(sh.slice_type);
-        cabac.init_contexts(sliceType, sh.SliceQpY, sh.cabac_init_flag);
+    // §9.3.1 — context variables at the start of the segment
+    {
+        const int startRs = static_cast<int>(sh.slice_segment_address);
+        const int startTs = pps.CtbAddrRsToTs[startRs];
+        const bool firstInTile = startTs == 0 ||
+            (!pps.TileId.empty() && pps.TileId[startTs] != pps.TileId[startTs - 1]);
+        const int sliceType = static_cast<int>(sh.slice_type);
+        if (!sh.dependent_slice_segment_flag || firstInTile) {
+            cabac.init_contexts(sliceType, sh.SliceQpY, sh.cabac_init_flag);
+        } else if (pps.entropy_coding_sync_enabled_flag &&
+                   startRs % sps.PicWidthInCtbsY == 0) {
+            if (ctx.slice_idx) ctx.slice_idx[startRs] = static_cast<uint16_t>(ctx.current_slice_idx);
+            if (wpp_sync_available(ctx, startRs / sps.PicWidthInCtbsY))
+                cabac.load_contexts(ctx.wpp_saved_contexts);
+            else
+                cabac.init_contexts(sliceType, sh.SliceQpY, sh.cabac_init_flag);
+        }
+        // else: a dependent segment continues the previous segment's contexts
+        // (TableStateIdxDs), which the shared engine still holds.
     }
     cabac.init_decoder(bs);
 
@@ -797,10 +854,11 @@ bool decode_slice_segment_data(DecodingContext& ctx, BitstreamReader& bs,
 
         // Phase 10: record slice ownership for this CTU
         if (ctx.slice_idx) {
-            ctx.slice_idx[CtbAddrInRs] = static_cast<uint8_t>(ctx.current_slice_idx);
+            ctx.slice_idx[CtbAddrInRs] = static_cast<uint16_t>(ctx.current_slice_idx);
         }
 
         decode_coding_tree_unit(ctx, xCtb, yCtb);
+        if (ctx.ctb_decoded) ctx.ctb_decoded[CtbAddrInRs] = 1;
         HEVC_LOG(TREE, "CTU addr_rs=%d consumed %zu bits, remaining=%zu",
                  CtbAddrInRs, bs.bits_read() - bits_before, bs.bits_remaining());
 
@@ -846,7 +904,7 @@ bool decode_slice_segment_data(DecodingContext& ctx, BitstreamReader& bs,
                     ctx.QpY_prev = sh.SliceQpY;
                     ctx.QpY_prev_qg = sh.SliceQpY;
                     // §9.2.2: restore contexts from 2nd CTU of previous row
-                    if (ctx.wpp_contexts_available) {
+                    if (wpp_sync_available(ctx, curRow)) {
                         cabac.load_contexts(ctx.wpp_saved_contexts);
                     } else {
                         cabac.init_contexts(static_cast<int>(sh.slice_type),

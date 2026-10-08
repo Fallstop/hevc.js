@@ -85,8 +85,17 @@ struct DecodingContext {
     std::vector<uint8_t>* sao_backup = nullptr;  // array of 3 byte-vectors
 
     // Phase 10: slice index per CTU (for cross-slice boundary detection)
-    uint8_t* slice_idx = nullptr;          // array [PicSizeInCtbsY], indexed by CtbAddrInRs
-    int current_slice_idx = 0;             // slice index being decoded (set before each decode_slice_segment_data)
+    // Slice number of each CTB (array [PicSizeInCtbsY], indexed by CtbAddrInRs):
+    // the index of the slice — independent segment plus its dependent
+    // segments, i.e. one SliceAddrRs — in the picture. kNoSlice marks a CTB no
+    // slice has decoded (lost/concealed), which is never "the same slice".
+    static constexpr uint16_t kNoSlice = 0xFFFF;
+    uint16_t* slice_idx = nullptr;
+    int current_slice_idx = 0;             // slice number being decoded
+
+    // 1 per CTB (CtbAddrInRs) once its coding_tree_unit() has been decoded.
+    // Tracks slice coverage for error concealment; may be null.
+    uint8_t* ctb_decoded = nullptr;
 
     // Phase 10: per-slice headers for correct filter parameter lookup
     const SliceHeader* const* slice_headers = nullptr;  // array of pointers, indexed by slice_idx

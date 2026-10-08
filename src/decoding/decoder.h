@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <deque>
 #include <vector>
 
 #include "common/picture.h"
@@ -99,9 +100,69 @@ public:
     int32_t recovery_poc_cnt() const { return recovery_poc_cnt_; }
 
 private:
-    DecodeStatus decode_picture(const std::vector<NalUnit>& nals,
-                                 size_t first_vcl_idx, size_t vcl_count);
+    // ---- Picture assembly (§7.4.2.4.4/§7.4.2.4.5) ----
+    //
+    // A picture is assembled slice by slice and may span feed() calls: it is
+    // finished when its slices cover the last CTB, when the next picture's
+    // first slice (or a slice that cannot belong to it) arrives, at an
+    // AUD/EOS/EOB or parameter-set NAL, or at flush().
 
+    // First fields of a slice header, enough to decide which picture a slice
+    // segment belongs to without activating parameter sets.
+    struct SlicePeek {
+        bool first_slice = false;
+        bool dependent = false;
+        uint32_t pps_id = 0;
+        uint32_t address = 0;   // slice_segment_address (0 for the first slice)
+        int address_ts = 0;     // the same in tile-scan order
+        bool has_poc = false;   // independent non-IDR segment: poc_lsb is valid
+        uint32_t poc_lsb = 0;
+    };
+    bool peek_slice(const NalUnit& nal, SlicePeek& out) const;
+
+    void process_nal(const NalUnit& nal);
+    void process_vcl(const NalUnit& nal);
+    // Parse the first decodable slice of a picture and set it up (§8.1
+    // random-access decisions, POC, RPS, output process, allocation).
+    void start_picture(const NalUnit& nal, const SlicePeek& peek);
+    // Decode one slice segment of the pending picture (`parsed`: its header,
+    // when the caller already parsed it).
+    void decode_slice(const NalUnit& nal, const SlicePeek& peek, SliceHeader* parsed);
+    void decode_slice_data(const NalUnit& nal, SliceHeader& sh, int slice_number);
+    // Complete the pending picture: coverage check, in-loop filters, reference
+    // marking, output marking. Drops it if it cannot be completed.
+    void finish_picture();
+    // Drop the pending picture (decode error); arms skip-to-next-IRAP.
+    void fail_picture();
+    // Absorb the remaining slices of a picture that is not decoded.
+    void begin_skip(const SlicePeek& peek, NalUnitType nut);
+
+    enum class PendingMode { NONE, DECODING, SKIPPING };
+    struct PendingPicture {
+        PendingMode mode = PendingMode::NONE;
+        // Grouping keys of the picture the next slices must match
+        NalUnitType nut = NalUnitType::TRAIL_N;
+        uint32_t pps_id = 0;
+        bool has_poc = false;
+        uint32_t poc_lsb = 0;
+        int next_ctb_ts = 0;        // tile-scan address just past the last segment
+        // DECODING only
+        Picture* pic = nullptr;
+        const SPS* sps = nullptr;
+        const PPS* pps = nullptr;
+        std::deque<SliceHeader> headers;          // every parsed segment (stable)
+        std::vector<const SliceHeader*> slices;   // independent header per slice number
+        const SliceHeader* last_independent = nullptr;  // nullptr: current slice lost
+        bool prev_segment_ok = false;  // the segment a dependent one continues
+        bool error = false;            // some slice data failed to decode
+        bool pic_output_flag = true;
+        DecodingContext ctx;
+        CabacEngine cabac;
+    };
+    PendingPicture pend_;
+
+    // Snapshot the reference lists just built for slice `slice_number`.
+    void record_slice_refs(int slice_number);
     ParameterSetManager ps_mgr_;
     DPB dpb_;
     DPB::OutputLimits output_limits_;
@@ -172,8 +233,9 @@ private:
     // uint16 plane bytes; apply_sao reinterprets per the plane Sample type.
     std::vector<uint8_t> sao_backup_[3];
 
-    // Phase 10: slice index per CTU
-    std::vector<uint8_t> slice_idx_buf_;
+    // Phase 10: slice number per CTU, and which CTUs were decoded
+    std::vector<uint16_t> slice_idx_buf_;
+    std::vector<uint8_t> ctb_decoded_buf_;
 
     // Phase 9B: persistent thread pool for WPP parallel decode
     ThreadPool thread_pool_;

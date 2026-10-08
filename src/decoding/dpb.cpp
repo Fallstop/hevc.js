@@ -203,6 +203,22 @@ void DPB::derive_rps(const SliceHeader& sh, const SPS& sps,
         ref_pic_set_st_foll_.push_back(find_short_term_by_poc(poc));
     }
 
+    // A picture whose geometry differs from the current SPS (a resolution or
+    // format change without an IRAP, or a corrupt RPS naming a picture of the
+    // previous sequence) cannot be predicted from: its planes and motion grid
+    // have another size. Treat it as "no reference picture".
+    auto compatible = [&](const Picture* p) {
+        return p &&
+               p->pic_width_in_luma == static_cast<int>(sps.pic_width_in_luma_samples) &&
+               p->pic_height_in_luma == static_cast<int>(sps.pic_height_in_luma_samples) &&
+               p->chroma_format == static_cast<ChromaFormat>(sps.chroma_format_idc) &&
+               p->bit_depth_luma == sps.BitDepthY && p->bit_depth_chroma == sps.BitDepthC;
+    };
+    for (auto* list : {&ref_pic_set_st_curr_before_, &ref_pic_set_st_curr_after_,
+                       &ref_pic_set_st_foll_, &ref_pic_set_lt_curr_, &ref_pic_set_lt_foll_})
+        for (auto*& p : *list)
+            if (p && !compatible(p)) p = nullptr;
+
     // §8.3.2 step 4: Mark all pictures not in any RPS list as "unused for reference"
     for (auto& pic : pictures_) {
         if (pic.get() == current_pic_) continue;
@@ -308,7 +324,7 @@ void DPB::construct_ref_pic_lists(const SliceHeader& sh, const SPS& /*sps*/,
             numL0m1,
             sh.ref_pic_list_modification_flag_l0,
             sh.list_entry_l0.data(), sh.list_entry_l0.size());
-        for (Picture* p : l0) ref_pic_list0_.push_back({p});
+        for (Picture* p : l0) ref_pic_list0_.push_back({p, p && p->used_for_long_term_ref});
     }
 
     // §8.3.4 eq 8-10/8-11: RefPicList1 (B slices only)
@@ -319,7 +335,7 @@ void DPB::construct_ref_pic_lists(const SliceHeader& sh, const SPS& /*sps*/,
             numL1m1,
             sh.ref_pic_list_modification_flag_l1,
             sh.list_entry_l1.data(), sh.list_entry_l1.size());
-        for (Picture* p : l1) ref_pic_list1_.push_back({p});
+        for (Picture* p : l1) ref_pic_list1_.push_back({p, p && p->used_for_long_term_ref});
     }
 
     HEVC_LOG(PARSE, "RefPicLists: L0=%zu entries, L1=%zu entries",

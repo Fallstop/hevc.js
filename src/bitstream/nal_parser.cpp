@@ -20,6 +20,7 @@ NalUnitHeader NalParser::parse_header(const uint8_t* data) {
     }
 
     NalUnitHeader h;
+    h.forbidden_zero_bit = ((word >> 15) & 1) != 0;
     // bits 14-9: nal_unit_type
     h.nal_unit_type = static_cast<NalUnitType>((word >> 9) & 0x3F);
     // bits 8-3: nuh_layer_id

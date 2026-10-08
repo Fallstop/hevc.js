@@ -130,6 +130,7 @@ struct NalUnitHeader {
     NalUnitType nal_unit_type;
     uint8_t nuh_layer_id;
     uint8_t nuh_temporal_id_plus1;
+    bool forbidden_zero_bit = false;
 
     uint8_t TemporalId() const { return nuh_temporal_id_plus1 - 1; }
 };

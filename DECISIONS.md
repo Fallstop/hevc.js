@@ -195,3 +195,51 @@ CTB-address lookups).
 **Consequence**: a broken VUI can no longer cost a stream, but a stream whose
 range-extension flags sit after a broken VUI loses them — the safe direction
 for Main/Main 10 cameras.
+
+## AD-013 : Pictures are assembled slice by slice, across non-VCL NALs and feed() calls
+
+**Context**: VCL NALs were grouped into a picture only while adjacent, so a
+SUFFIX_SEI or filler NAL between two slices split the picture in two; reference
+lists and ColPic were built once from the first slice; dependent slice segments
+lost their entry points and inherited from `slice_headers[0]`; a slice of the
+next picture whose first slice was lost was decoded *into* the current one; a
+picture had to arrive whole in one `feed()`; and reserved VCL types,
+`nuh_layer_id > 0` and forbidden-bit NALs were decoded.
+
+**Decision**:
+- A pending picture is assembled one slice segment at a time. A segment
+  continues it when it is not a first segment, shares its PPS and POC LSB, and
+  starts at a tile-scan address past the previous segment's end; anything else
+  finishes the pending picture first. The picture is also finished as soon as
+  its segments reach the last CTB (so per-access-unit feeding outputs in the
+  same call), at AUD/EOS/EOB or a parameter-set NAL (an AU boundary that may
+  also replace the sets it uses), and at `flush()`/batch output. Prefix SEI,
+  suffix SEI, filler and reserved/unspecified non-VCL NALs never split a
+  picture. A picture may therefore span `feed()` calls (NAL-at-a-time input).
+- Reference lists and ColPic are built per independent slice. Each slice's
+  lists are snapshot (POC + long-term flag) into the picture, with a per-CTB
+  slice map when there is more than one: deblocking compares references
+  through the table of each block's own slice, and TMVP reads the collocated
+  block's slice table — including the §8.5.3.2.9 long-term rules (no
+  long-term/short-term mixing, no scaling between long-term references).
+- Dependent segments parse their own entry points / extension / alignment,
+  inherit from the independent segment of *their* slice, share its slice
+  number (SliceAddrRs) for availability, SAO merge and filters, and follow the
+  §9.3.1 context rules (initialize at a tile start, WPP-synchronize at a row
+  start when the CTB above-right is in the same slice, otherwise continue the
+  previous segment). A dependent segment whose predecessor is missing or failed
+  is dropped (orphan). The row-parallel WPP path is limited to independent
+  segments starting at a row start and to the segment's own rows (it used to
+  decode every row to the bottom of the picture from the wrong data, and
+  deadlocked on one-CTB-wide pictures).
+- Reserved VCL types, `nuh_layer_id > 0` (all NAL types) and NALs with
+  `forbidden_zero_bit` set or `nuh_temporal_id_plus1 == 0` are not decoded; the
+  last two count as `nal_errors`.
+- References whose picture size, chroma format or bit depth differ from the
+  current SPS are treated as missing (their planes and motion grid do not fit).
+
+**Verification**: besides the unit tests, the JCT-VC HEVC_v1 suite compared
+against ffmpeg (`tools/jctvc_conformance.py`): 58/147 → 67/147 matching, no
+regression; the baseline hung (≥900 s) on CONFWIN_A, FILLER_A, INITQP_A/B and
+WPP_D, all of which now complete. The remaining mismatches predate this work
+and are outside it (see the report accompanying this branch).

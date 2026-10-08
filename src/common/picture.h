@@ -60,8 +60,29 @@ struct Picture {
     PUMotionInfoCompact* motion_info_data() { return motion_info_buf.data(); }
     const PUMotionInfoCompact* motion_info_data() const { return motion_info_buf.data(); }
 
-    // Ref POC lists (snapshot at decode time, for TMVP MV scaling)
-    std::vector<int32_t> ref_poc[2];  // ref_poc[0] = L0 POCs, ref_poc[1] = L1 POCs
+    // Reference picture lists of one slice, snapshot at decode time: TMVP
+    // (§8.5.3.2.9) scales by the POC of the collocated block's reference *in
+    // the slice containing it*, and needs to know whether it was long-term.
+    struct RefPocTable {
+        int32_t poc[2][16] = {};
+        bool is_long_term[2][16] = {};
+        uint8_t count[2] = {};
+    };
+    std::vector<RefPocTable> ref_tables;   // indexed by slice number
+    std::vector<uint16_t> ctb_slice;       // CtbAddrRs -> slice number (empty: one table)
+    int ctb_log2_size = 0;
+    int width_in_ctbs = 0;
+
+    // Ref table of the slice containing luma sample (x, y); nullptr if none.
+    const RefPocTable* ref_table_at(int x, int y) const {
+        if (ref_tables.empty()) return nullptr;
+        if (ctb_slice.empty()) return &ref_tables[0];
+        const size_t addr = static_cast<size_t>(y >> ctb_log2_size) * width_in_ctbs +
+                            static_cast<size_t>(x >> ctb_log2_size);
+        if (addr >= ctb_slice.size()) return nullptr;
+        const uint16_t s = ctb_slice[addr];
+        return s < ref_tables.size() ? &ref_tables[s] : nullptr;
+    }
 
     // Allocate planes based on dimensions and chroma format
     void allocate(int width, int height, ChromaFormat fmt, int bd_luma, int bd_chroma);

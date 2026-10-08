@@ -139,6 +139,7 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
         tests/unit/test_output_process.cpp
         tests/unit/test_validation.cpp
         tests/unit/test_nonvcl_tolerance.cpp
+        tests/unit/test_picture_assembly.cpp
     )
 
     target_link_libraries(hevc_tests PRIVATE
@@ -213,6 +214,21 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
         COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/opengop_qcif_cra_first.265 176 144
             9c249fb00174f2f6e6fbb3457c10679b $<TARGET_FILE:hevc-decode>)
     set_tests_properties(oracle_opengop_qcif_cra_first PROPERTIES LABELS "oracle;feature"
+        SKIP_RETURN_CODE 2)
+
+    # Multi-slice pictures (x265 --slices 3, 32x32 CTBs; and 16x16 CTBs with
+    # WPP, 3 slices of 3 CTB rows each with 2 entry points). Guards picture
+    # assembly across slices and per-slice reference lists.
+    add_test(NAME oracle_multislice_qcif_8f
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/multislice_qcif_8f.265 176 144
+            a3248d9042a15320f483931c567ec06c $<TARGET_FILE:hevc-decode>)
+    set_tests_properties(oracle_multislice_qcif_8f PROPERTIES LABELS "oracle;feature"
+        SKIP_RETURN_CODE 2)
+
+    add_test(NAME oracle_multislice_wpp_qcif_8f
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/multislice_wpp_qcif_8f.265 176 144
+            ef35793ec7e91f163df00ca6c5cbe820 $<TARGET_FILE:hevc-decode>)
+    set_tests_properties(oracle_multislice_wpp_qcif_8f PROPERTIES LABELS "oracle;feature"
         SKIP_RETURN_CODE 2)
 
     # Recovery-point SEI (gradual decoding refresh, feature F2). An intra-refresh

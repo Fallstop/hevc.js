@@ -297,12 +297,30 @@ static bool is_boundary_excluded(const DecodingContext& ctx,
     return false;
 }
 
+// Reference-picture POCs per slice (the picture's RefPocTables). Slices of a
+// picture may build different reference lists (§8.3.4 runs per slice), so the
+// P and Q blocks are each resolved through the table of their own slice; the
+// common single-table case needs no per-block lookup.
+struct DeblockRefPocs {
+    const Picture::RefPocTable* tables = nullptr;
+    int num = 0;
+};
+
+static inline const Picture::RefPocTable* ref_table_for(const DecodingContext& ctx,
+                                                         const DeblockRefPocs& refs,
+                                                         int x, int y) {
+    if (refs.num <= 1 || !ctx.slice_idx) return refs.tables;
+    const auto& sps = *ctx.sps;
+    const int addr = (y >> sps.CtbLog2SizeY) * sps.PicWidthInCtbsY + (x >> sps.CtbLog2SizeY);
+    const int s = ctx.slice_idx[addr];
+    return s < refs.num ? &refs.tables[s] : refs.tables;
+}
+
 // ============================================================
 // Boundary Strength derivation — §8.7.2.4
 // ============================================================
 static int derive_bs(const DecodingContext& ctx, int xP, int yP, int xQ, int yQ,
-                     const int32_t* pocL0, int nL0,
-                     const int32_t* pocL1, int nL1) {
+                     const DeblockRefPocs& refs) {
     auto& sps = *ctx.sps;
     int picW = sps.pic_width_in_luma_samples;
     int picH = sps.pic_height_in_luma_samples;
@@ -361,32 +379,33 @@ static int derive_bs(const DecodingContext& ctx, int xP, int yP, int xQ, int yQ,
 
     if (nRefP != nRefQ) return 1;
 
-    // Reference-picture POCs (precomputed once per picture — the spec compares
-    // by picture, not ref index; the per-edge dpb->ref_pic_listX(idx)->poc chase
-    // is a pointer-indirect cache-miss source, so it is hoisted to apply_deblocking).
-    auto get_ref_poc = [&](const PUMotionInfo& mi, int list) -> int32_t {
-        if (!mi.pred_flag[list] || mi.ref_idx[list] < 0) return -999999;
+    // Reference-picture POCs (snapshot once per slice — the spec compares by
+    // picture, not ref index; the per-edge dpb->ref_pic_listX(idx)->poc chase
+    // is a pointer-indirect cache-miss source).
+    const Picture::RefPocTable* tabP = ref_table_for(ctx, refs, xP, yP);
+    const Picture::RefPocTable* tabQ = (refs.num <= 1) ? tabP : ref_table_for(ctx, refs, xQ, yQ);
+    auto get_ref_poc = [](const Picture::RefPocTable* t, const PUMotionInfo& mi, int list) -> int32_t {
+        if (!t || !mi.pred_flag[list] || mi.ref_idx[list] < 0) return -999999;
         int idx = mi.ref_idx[list];
-        if (list == 0) return (idx < nL0) ? pocL0[idx] : -999999;
-        return (idx < nL1) ? pocL1[idx] : -999999;
+        return (idx < t->count[list]) ? t->poc[list][idx] : -999999;
     };
 
     if (nRefP == 1) {
         // Uni-prediction
         int listP = miP.pred_flag[0] ? 0 : 1;
         int listQ = miQ.pred_flag[0] ? 0 : 1;
-        int32_t pocP = get_ref_poc(miP, listP);
-        int32_t pocQ = get_ref_poc(miQ, listQ);
+        int32_t pocP = get_ref_poc(tabP, miP, listP);
+        int32_t pocQ = get_ref_poc(tabQ, miQ, listQ);
         if (pocP != pocQ) return 1;
         MV mvP = miP.mv[listP], mvQ = miQ.mv[listQ];
         if (std::abs(mvP.x - mvQ.x) >= 4 || std::abs(mvP.y - mvQ.y) >= 4)
             return 1;
     } else if (nRefP == 2) {
         // Bi-prediction — §8.7.2.4.5: check both orderings
-        int32_t pocPL0 = get_ref_poc(miP, 0);
-        int32_t pocPL1 = get_ref_poc(miP, 1);
-        int32_t pocQL0 = get_ref_poc(miQ, 0);
-        int32_t pocQL1 = get_ref_poc(miQ, 1);
+        int32_t pocPL0 = get_ref_poc(tabP, miP, 0);
+        int32_t pocPL1 = get_ref_poc(tabP, miP, 1);
+        int32_t pocQL0 = get_ref_poc(tabQ, miQ, 0);
+        int32_t pocQL1 = get_ref_poc(tabQ, miQ, 1);
 
         bool sameOrder = (pocPL0 == pocQL0 && pocPL1 == pocQL1);
         bool swapped   = (pocPL0 == pocQL1 && pocPL1 == pocQL0);
@@ -619,8 +638,7 @@ static inline void deblock_luma_edge(
 // dispatcher below and passed in, so the only per-Sample cost is the plane I/O.
 template<typename Sample>
 static void apply_deblocking_impl(DecodingContext& ctx,
-                                  const int32_t* pocL0, int nL0,
-                                  const int32_t* pocL1, int nL1,
+                                  const DeblockRefPocs& refs,
                                   bool complexBound) {
     auto& sps = *ctx.sps;
     auto& pps = *ctx.pps;
@@ -679,7 +697,7 @@ static void apply_deblocking_impl(DecodingContext& ctx,
                     } else {
                         xP = x; yP = y - 1; xQ = x; yQ = y;
                     }
-                    int bS = derive_bs(ctx, xP, yP, xQ, yQ, pocL0, nL0, pocL1, nL1);
+                    int bS = derive_bs(ctx, xP, yP, xQ, yQ, refs);
                     if (bS == 0) continue;
 
                     // Get QP for both sides
@@ -802,14 +820,23 @@ static void apply_deblocking_impl(DecodingContext& ctx,
 void apply_deblocking(DecodingContext& ctx) {
     auto& pps = *ctx.pps;
 
-    // Reference-picture POCs, picture-constant — precompute once so derive_bs's
-    // Bs comparison (§8.7.2.4.5) indexes a hot 16-entry array instead of chasing
-    // dpb->ref_pic_listX(idx)->poc (vector + Picture* indirections) per edge.
-    int32_t pocL0[16], pocL1[16];
-    int nL0 = std::min(ctx.dpb->num_ref_list0(), 16);
-    int nL1 = std::min(ctx.dpb->num_ref_list1(), 16);
-    for (int i = 0; i < nL0; i++) { Picture* rp = ctx.dpb->ref_pic_list0(i); pocL0[i] = rp ? rp->poc : -999999; }
-    for (int i = 0; i < nL1; i++) { Picture* rp = ctx.dpb->ref_pic_list1(i); pocL1[i] = rp ? rp->poc : -999999; }
+    // Reference-picture POCs per slice, snapshot by the decoder as each slice's
+    // lists were built, so derive_bs's Bs comparison (§8.7.2.4.5) indexes a hot
+    // 16-entry array instead of chasing Picture* per edge. Without a snapshot
+    // (unit tests driving the filter directly) fall back to the DPB's lists.
+    Picture::RefPocTable fallback;
+    DeblockRefPocs refs;
+    if (!ctx.pic->ref_tables.empty()) {
+        refs.tables = ctx.pic->ref_tables.data();
+        refs.num = static_cast<int>(ctx.pic->ref_tables.size());
+    } else {
+        fallback.count[0] = static_cast<uint8_t>(std::min(ctx.dpb ? ctx.dpb->num_ref_list0() : 0, 16));
+        fallback.count[1] = static_cast<uint8_t>(std::min(ctx.dpb ? ctx.dpb->num_ref_list1() : 0, 16));
+        for (int i = 0; i < fallback.count[0]; i++) { Picture* rp = ctx.dpb->ref_pic_list0(i); fallback.poc[0][i] = rp ? rp->poc : -999999; }
+        for (int i = 0; i < fallback.count[1]; i++) { Picture* rp = ctx.dpb->ref_pic_list1(i); fallback.poc[1][i] = rp ? rp->poc : -999999; }
+        refs.tables = &fallback;
+        refs.num = 1;
+    }
 
     // Does any edge need the per-CTB tile/slice exclusion logic? For the common
     // case (no tiles, single slice, deblocking enabled everywhere) only the
@@ -828,9 +855,9 @@ void apply_deblocking(DecodingContext& ctx) {
     }
 
     if (ctx.pic->bytes_per_sample == 1)
-        apply_deblocking_impl<uint8_t>(ctx, pocL0, nL0, pocL1, nL1, complexBound);
+        apply_deblocking_impl<uint8_t>(ctx, refs, complexBound);
     else
-        apply_deblocking_impl<uint16_t>(ctx, pocL0, nL0, pocL1, nL1, complexBound);
+        apply_deblocking_impl<uint16_t>(ctx, refs, complexBound);
 }
 
 } // namespace hevc

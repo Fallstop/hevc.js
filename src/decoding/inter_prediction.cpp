@@ -175,15 +175,18 @@ static bool derive_collocated_mv_at(const DecodingContext& ctx,
         }
     }
 
-    if (colList < 0 || !colMi.pred_flag[colList] ||
+    // The reference lists of the slice containing colPb (§8.5.3.2.9)
+    const Picture::RefPocTable* colTab = colPic->ref_table_at(xColQ, yColQ);
+    if (colList < 0 || !colTab || !colMi.pred_flag[colList] ||
         colMi.ref_idx[colList] < 0 ||
-        colMi.ref_idx[colList] >= static_cast<int>(colPic->ref_poc[colList].size()))
+        colMi.ref_idx[colList] >= static_cast<int>(colTab->count[colList]))
         return false;
 
     MV colMV;
     colMV.x = colMi.mv_x[colList];
     colMV.y = colMi.mv_y[colList];
-    int colRefPOC = colPic->ref_poc[colList][colMi.ref_idx[colList]];
+    int colRefPOC = colTab->poc[colList][colMi.ref_idx[colList]];
+    const bool colRefIsLongTerm = colTab->is_long_term[colList][colMi.ref_idx[colList]];
 
     // Scale MV by POC distance
     int currPOC = ctx.pic->poc;
@@ -191,8 +194,16 @@ static bool derive_collocated_mv_at(const DecodingContext& ctx,
                                      : ctx.dpb->ref_pic_list1(refIdxLX);
     if (!currRef) return false;
     int currRefPOC = currRef->poc;
+    const bool currRefIsLongTerm = (listX == 0) ? ctx.dpb->ref_is_long_term0(refIdxLX)
+                                                : ctx.dpb->ref_is_long_term1(refIdxLX);
 
-    mvLXCol = scale_mv(colMV, currPOC, currRefPOC, colPic->poc, colRefPOC);
+    // §8.5.3.2.9: a long-term and a short-term reference do not predict each
+    // other; between long-term references the MV is taken unscaled.
+    if (currRefIsLongTerm != colRefIsLongTerm) return false;
+    if (currRefIsLongTerm)
+        mvLXCol = colMV;
+    else
+        mvLXCol = scale_mv(colMV, currPOC, currRefPOC, colPic->poc, colRefPOC);
     HEVC_LOG(INTER, "TMVP colQ=(%d,%d) colMV=(%d,%d) scaled=(%d,%d) colRefPOC=%d currPOC=%d currRefPOC=%d colPOC=%d",
              xColQ, yColQ, colMV.x, colMV.y, mvLXCol.x, mvLXCol.y, colRefPOC, ctx.pic->poc, currRefPOC, colPic->poc);
     return true;

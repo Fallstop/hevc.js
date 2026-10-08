@@ -121,9 +121,25 @@ struct SliceHeader {
     // Active RPS for this slice (pointer to SPS set or inline set)
     const ShortTermRefPicSet* active_rps = nullptr;
 
+    // §7.4.7.1 SliceAddrRs: address of the independent segment of the slice
+    // this segment belongs to (equal to slice_segment_address unless dependent)
+    uint32_t SliceAddrRs = 0;
+
+    // RBSP byte offset of slice_segment_data(), i.e. the header length
+    // including byte_alignment(). Set by parse().
+    size_t slice_data_byte_offset = 0;
+
     // Parse from bitstream (needs active SPS and PPS)
     bool parse(BitstreamReader& bs, const SPS& sps, const PPS& pps,
                NalUnitType nal_type, uint8_t nuh_temporal_id);
+
+    // Complete a parsed dependent segment header with the slice-level fields
+    // of its independent segment (§7.4.7.1), keeping its own address, entry
+    // points and data offset.
+    void inherit_from(const SliceHeader& indep);
+
+private:
+    bool parse_segment_tail(BitstreamReader& bs, const SPS& sps, const PPS& pps);
 };
 
 } // namespace hevc
