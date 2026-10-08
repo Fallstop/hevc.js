@@ -3,6 +3,7 @@ import type {
   HEVCFrameView,
   HEVCStreamInfo,
   HEVCDecodeStats,
+  HEVCErrorPolicy,
   DecodeResult,
   DecoderOptions,
 } from "./types.js";
@@ -40,7 +41,12 @@ interface DecoderAPI {
   flush: (dec: number) => number;
   reset: (dec: number, clearParameterSets: number) => number;
   discontinuity: (dec: number) => number;
+  setErrorPolicy: (dec: number, flags: number) => number;
 }
+
+/** Bits of hevc_decoder_set_error_policy() (HEVC_POLICY_* in hevc_api.h). */
+const POLICY_CONCEAL_SLICE_ERRORS = 0x1;
+const POLICY_DECODE_BEFORE_IRAP = 0x2;
 
 /**
  * HEVC/H.265 Decoder — JavaScript wrapper for the WASM module.
@@ -82,6 +88,7 @@ export class HEVCDecoder {
       flush: module.cwrap("hevc_decoder_flush", "number", ["number"]) as (dec: number) => number,
       reset: module.cwrap("hevc_decoder_reset", "number", ["number", "number"]) as (dec: number, clearParameterSets: number) => number,
       discontinuity: module.cwrap("hevc_decoder_discontinuity", "number", ["number"]) as (dec: number) => number,
+      setErrorPolicy: module.cwrap("hevc_decoder_set_error_policy", "number", ["number", "number"]) as (dec: number, flags: number) => number,
     };
     this._dec = this._api.create();
     if (!this._dec) throw new Error("Failed to create HEVC decoder");
@@ -487,6 +494,30 @@ export class HEVCDecoder {
     this._gen++; // releases pictures to the output queue
     const ret = this._api.discontinuity(this._dec);
     if (ret !== 0) throw new Error(`Discontinuity failed (code ${ret})`);
+  }
+
+  /**
+   * Choose how damaged input is handled. Omitted fields are `false`, which is
+   * the default, conformant behaviour (drop a damaged picture and wait for the
+   * next IRAP; skip pictures before the first IRAP). Takes effect from the
+   * next picture; call it right after `create()` to cover the whole stream.
+   *
+   * - `concealSliceErrors`: repair instead of dropping — undecodable or missing
+   *   slices are filled from the nearest decoded picture and the frame is
+   *   output with `HEVC_FRAME_CORRUPT`; a missing reference is replaced by the
+   *   nearest picture (`HEVC_FRAME_MISSING_REF`). Decoding only waits for an
+   *   IRAP when a picture's first slice header is unreadable.
+   * - `decodeBeforeIrap`: decode pictures that precede the first IRAP (stream
+   *   joined mid-GOP, after `reset()`/`discontinuity()`, or after an
+   *   unreadable picture), flagged `HEVC_FRAME_PRE_RECOVERY` until an IRAP or
+   *   the stream's recovery point.
+   */
+  setErrorPolicy(policy: HEVCErrorPolicy): void {
+    if (!this._dec) return;
+    const flags = (policy.concealSliceErrors ? POLICY_CONCEAL_SLICE_ERRORS : 0) |
+                  (policy.decodeBeforeIrap ? POLICY_DECODE_BEFORE_IRAP : 0);
+    const ret = this._api.setErrorPolicy(this._dec, flags);
+    if (ret !== 0) throw new Error(`setErrorPolicy failed (code ${ret})`);
   }
 
   /** Release decoder resources */

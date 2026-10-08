@@ -289,3 +289,46 @@ know that the next CRA's RASL pictures cannot be decoded.
   HandleCraAsBlaFlag would), and non-IRAP pictures before the next IRAP are
   skipped (`skipped_wait_irap`) unless the error policy decodes them;
 - keeps parameter sets, scratch allocations, POC carry-over and statistics.
+
+## AD-016 : Forgiving error policy — opt-in, conceal and keep going
+
+**Context**: a security-camera client prefers a damaged but moving picture to a
+frozen one. The decoder dropped any picture with an error and skipped every
+non-IRAP picture until the next IRAP (seconds of freeze on cameras with long
+GOPs), skipped everything before the first IRAP, and predicted from mid-grey
+where a reference was missing.
+
+**Decision**: `hevc_decoder_set_error_policy(dec, flags)` / `setErrorPolicy({...})`.
+The default (0) keeps the previous behaviour, so conformance output and every
+MD5 oracle are unchanged.
+- `HEVC_POLICY_CONCEAL_SLICE_ERRORS`: when the first slice header of a picture
+  decoded (POC, RPS, output order known) but a slice fails, is missing, or the
+  slices do not cover the picture, the undecoded CTUs are filled with the
+  co-located samples of the stored picture nearest in POC (same CVS; otherwise
+  the most recently decoded one — kept alive for this even after an IDR
+  released it; mid-grey only if nothing fits). Their SAO parameters, motion and
+  every deblocking edge inside or on the boundary of the area are cleared, so
+  the filters neither run inside the concealed area nor across its seam. The
+  picture is kept as a reference and output with `CORRUPT`; skip-to-IRAP is
+  armed only when the first slice header itself is undecodable. A missing
+  reference picture is replaced by the stored picture nearest to the POC the
+  RPS names (`MISSING_REF`); the list entry keeps the *named* POC so MV
+  scaling and reference comparisons follow the bitstream, and a substituted
+  ColPic contributes zero temporal motion (the lost picture's motion field is
+  unknowable; zero is right for the static scenes cameras mostly see).
+- `HEVC_POLICY_DECODE_BEFORE_IRAP`: non-IRAP pictures at stream start, after
+  `reset()`/`discontinuity()` or after an undecodable picture are decoded
+  (missing references concealed as above) and flagged `PRE_RECOVERY` until an
+  IRAP, or until the POC of a recovery point SEI (§D.3.8) bound during that
+  span — which makes gradual-decoding-refresh cameras decodable at all. RASL
+  pictures of an IRAP that opens the sequence stay skipped: they would be
+  output *before* that IRAP.
+
+Also, independent of the policy: a slice whose CABAC read position runs well
+past the end of its data (zero-padded reads) or that runs past the last CTB
+without `end_of_slice_segment_flag` is now an error — a truncated slice used to
+decode garbage silently and be output as clean.
+
+**Measured** (camera-like fixture, one access unit lost): luma SAD of the next
+picture against the clean decode 591k with mid-grey prediction, 85k with
+substitution (~3 per sample, about the freeze error).

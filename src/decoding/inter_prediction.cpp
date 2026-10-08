@@ -191,7 +191,8 @@ static bool derive_collocated_mv_at(const DecodingContext& ctx,
     Picture* currRef = (listX == 0) ? ctx.dpb->ref_pic_list0(refIdxLX)
                                      : ctx.dpb->ref_pic_list1(refIdxLX);
     if (!currRef) return false;
-    int currRefPOC = currRef->poc;
+    // The POC the bitstream names (a substituted stand-in keeps it)
+    int currRefPOC = (listX == 0) ? ctx.dpb->ref_poc0(refIdxLX) : ctx.dpb->ref_poc1(refIdxLX);
     const bool currRefIsLongTerm = (listX == 0) ? ctx.dpb->ref_is_long_term0(refIdxLX)
                                                 : ctx.dpb->ref_is_long_term1(refIdxLX);
 
@@ -215,6 +216,17 @@ static bool derive_temporal_mv(const DecodingContext& ctx,
     if (!ctx.dpb || !ctx.dpb->col_pic()) return false;
 
     Picture* colPic = ctx.dpb->col_pic();
+    // ColPic is a stand-in for a picture that was lost (error concealment):
+    // its motion field is unrelated to the one the bitstream predicts from.
+    // Assume the lost picture was static — the best guess for a fixed camera
+    // — i.e. a zero collocated motion vector (between short-term references).
+    if (ctx.dpb->col_pic_substituted()) {
+        const bool currRefIsLongTerm = (listX == 0) ? ctx.dpb->ref_is_long_term0(refIdxLX)
+                                                    : ctx.dpb->ref_is_long_term1(refIdxLX);
+        if (currRefIsLongTerm) return false;
+        mvLXCol = MV{};
+        return true;
+    }
     int picW = static_cast<int>(ctx.sps->pic_width_in_luma_samples);
     int picH = static_cast<int>(ctx.sps->pic_height_in_luma_samples);
     if (colPic->motion_info_buf.empty() || colPic->motion_info_stride == 0) return false;
@@ -422,9 +434,10 @@ static PUMotionInfo derive_merge_mode(DecodingContext& ctx,
                 auto& c1 = mergeCandList[l1];
                 if (c0.pred_flag[0] && c1.pred_flag[1]) {
                     // §8.5.3.2.4: check different ref or different MV
-                    Picture* ref0 = ctx.dpb->ref_pic_list0(c0.ref_idx[0]);
-                    Picture* ref1 = ctx.dpb->ref_pic_list1(c1.ref_idx[1]);
-                    if (ref0 != ref1 ||
+                    // DiffPicOrderCnt(RefPicList0[..], RefPicList1[..]) != 0
+                    const int32_t poc0 = ctx.dpb->ref_poc0(c0.ref_idx[0]);
+                    const int32_t poc1 = ctx.dpb->ref_poc1(c1.ref_idx[1]);
+                    if (poc0 != poc1 ||
                         c0.mv[0].x != c1.mv[1].x || c0.mv[0].y != c1.mv[1].y) {
                         MergeCandidate& comb = mergeCandList[numCands++];
                         comb = {};
@@ -569,9 +582,14 @@ static MV derive_amvp_predictor(const DecodingContext& ctx,
                                  int mvpFlag) {
     int X = listX;
     int Y = 1 - X;
-    Picture* currRef = (X == 0) ? ctx.dpb->ref_pic_list0(refIdxLX)
-                                 : ctx.dpb->ref_pic_list1(refIdxLX);
-    int currRefPOC = currRef ? currRef->poc : 0;
+    // Reference POCs and long-term flags come from the list entries: the POC
+    // the bitstream names, even where a missing picture was substituted.
+    auto refPoc = [&](int L, int idx) { return L == 0 ? ctx.dpb->ref_poc0(idx) : ctx.dpb->ref_poc1(idx); };
+    auto refPic = [&](int L, int idx) { return L == 0 ? ctx.dpb->ref_pic_list0(idx) : ctx.dpb->ref_pic_list1(idx); };
+    auto refLt = [&](int L, int idx) { return L == 0 ? ctx.dpb->ref_is_long_term0(idx) : ctx.dpb->ref_is_long_term1(idx); };
+    Picture* currRef = refPic(X, refIdxLX);
+    int currRefPOC = currRef ? refPoc(X, refIdxLX) : 0;
+    const bool currRefLt = currRef && refLt(X, refIdxLX);
     int currPOC = ctx.pic->poc;
 
     // §8.5.3.2.7 step 1: positions
@@ -602,18 +620,16 @@ static MV derive_amvp_predictor(const DecodingContext& ctx,
         PUMotionInfo mi = get_pu_motion(ctx, aPos[k][0], aPos[k][1]);
         // Try same list X first, then other list Y
         if (mi.pred_flag[X]) {
-            Picture* nbRef = (X == 0) ? ctx.dpb->ref_pic_list0(mi.ref_idx[X])
-                                       : ctx.dpb->ref_pic_list1(mi.ref_idx[X]);
-            if (nbRef && nbRef->poc == currRefPOC) {
+            Picture* nbRef = refPic(X, mi.ref_idx[X]);
+            if (nbRef && refPoc(X, mi.ref_idx[X]) == currRefPOC) {
                 mvLXA = mi.mv[X];   // eq 8-171
                 availFlagA = true;
                 continue;
             }
         }
         if (mi.pred_flag[Y]) {
-            Picture* nbRef = (Y == 0) ? ctx.dpb->ref_pic_list0(mi.ref_idx[Y])
-                                       : ctx.dpb->ref_pic_list1(mi.ref_idx[Y]);
-            if (nbRef && nbRef->poc == currRefPOC) {
+            Picture* nbRef = refPic(Y, mi.ref_idx[Y]);
+            if (nbRef && refPoc(Y, mi.ref_idx[Y]) == currRefPOC) {
                 mvLXA = mi.mv[Y];   // eq 8-172
                 availFlagA = true;
             }
@@ -628,16 +644,16 @@ static MV derive_amvp_predictor(const DecodingContext& ctx,
             for (int l = 0; l < 2 && !availFlagA; l++) {
                 int tryL = (l == 0) ? X : Y;
                 if (!mi.pred_flag[tryL]) continue;
-                Picture* nbRef = (tryL == 0) ? ctx.dpb->ref_pic_list0(mi.ref_idx[tryL])
-                                              : ctx.dpb->ref_pic_list1(mi.ref_idx[tryL]);
+                Picture* nbRef = refPic(tryL, mi.ref_idx[tryL]);
                 if (!nbRef) continue;
-                if (nbRef->used_for_long_term_ref != (currRef && currRef->used_for_long_term_ref))
+                const bool nbLt = refLt(tryL, mi.ref_idx[tryL]);
+                const int32_t nbPoc = refPoc(tryL, mi.ref_idx[tryL]);
+                if (nbLt != currRefLt)
                     continue;
                 availFlagA = true;
-                if (nbRef->poc != currRefPOC && nbRef->used_for_short_term_ref &&
-                    currRef && currRef->used_for_short_term_ref) {
+                if (nbPoc != currRefPOC && !nbLt && currRef && !currRefLt) {
                     mvLXA = scale_mv(mi.mv[tryL], currPOC, currRefPOC,
-                                      currPOC, nbRef->poc);
+                                      currPOC, nbPoc);
                 } else {
                     mvLXA = mi.mv[tryL];
                 }
@@ -655,18 +671,16 @@ static MV derive_amvp_predictor(const DecodingContext& ctx,
         if (!bAvailArr[k]) continue;
         PUMotionInfo mi = get_pu_motion(ctx, bPos[k][0], bPos[k][1]);
         if (mi.pred_flag[X]) {
-            Picture* nbRef = (X == 0) ? ctx.dpb->ref_pic_list0(mi.ref_idx[X])
-                                       : ctx.dpb->ref_pic_list1(mi.ref_idx[X]);
-            if (nbRef && nbRef->poc == currRefPOC) {
+            Picture* nbRef = refPic(X, mi.ref_idx[X]);
+            if (nbRef && refPoc(X, mi.ref_idx[X]) == currRefPOC) {
                 mvLXB = mi.mv[X];   // eq 8-184
                 availFlagB = true;
                 continue;
             }
         }
         if (mi.pred_flag[Y]) {
-            Picture* nbRef = (Y == 0) ? ctx.dpb->ref_pic_list0(mi.ref_idx[Y])
-                                       : ctx.dpb->ref_pic_list1(mi.ref_idx[Y]);
-            if (nbRef && nbRef->poc == currRefPOC) {
+            Picture* nbRef = refPic(Y, mi.ref_idx[Y]);
+            if (nbRef && refPoc(Y, mi.ref_idx[Y]) == currRefPOC) {
                 mvLXB = mi.mv[Y];   // eq 8-185
                 availFlagB = true;
             }
@@ -688,16 +702,16 @@ static MV derive_amvp_predictor(const DecodingContext& ctx,
             for (int l = 0; l < 2 && !availFlagB; l++) {
                 int tryL = (l == 0) ? X : Y;
                 if (!mi.pred_flag[tryL]) continue;
-                Picture* nbRef = (tryL == 0) ? ctx.dpb->ref_pic_list0(mi.ref_idx[tryL])
-                                              : ctx.dpb->ref_pic_list1(mi.ref_idx[tryL]);
+                Picture* nbRef = refPic(tryL, mi.ref_idx[tryL]);
                 if (!nbRef) continue;
-                if (nbRef->used_for_long_term_ref != (currRef && currRef->used_for_long_term_ref))
+                const bool nbLt = refLt(tryL, mi.ref_idx[tryL]);
+                const int32_t nbPoc = refPoc(tryL, mi.ref_idx[tryL]);
+                if (nbLt != currRefLt)
                     continue;
                 availFlagB = true;
-                if (nbRef->poc != currRefPOC && nbRef->used_for_short_term_ref &&
-                    currRef && currRef->used_for_short_term_ref) {
+                if (nbPoc != currRefPOC && !nbLt && currRef && !currRefLt) {
                     mvLXB = scale_mv(mi.mv[tryL], currPOC, currRefPOC,
-                                      currPOC, nbRef->poc);
+                                      currPOC, nbPoc);
                 } else {
                     mvLXB = mi.mv[tryL];
                 }

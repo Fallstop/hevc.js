@@ -19,9 +19,15 @@ struct PPS;
 // Reference Picture List entry — pointer to a decoded picture in the DPB
 struct RefPicListEntry {
     Picture* pic = nullptr;  // nullptr = "no reference picture"
-    // Marked "used for long-term reference" when the current picture is
-    // decoded (§8.5.3.2: LongTermRefPic)
+    // POC of the picture the RPS names for this entry. Equal to pic->poc
+    // unless the picture was missing and a stand-in was substituted: motion
+    // vector scaling and reference comparisons then still use the POC the
+    // bitstream was coded against, only the samples come from the stand-in.
+    int32_t poc = 0;
+    // From RefPicSetLtCurr (§8.5.3.2: LongTermRefPic)
     bool is_long_term = false;
+    // `pic` stands in for a missing picture (error concealment)
+    bool substituted = false;
 };
 
 // Decoded Picture Buffer
@@ -69,6 +75,14 @@ public:
         const std::vector<Picture*>& rps_first,
         const std::vector<Picture*>& rps_second,
         const std::vector<Picture*>& rps_lt,
+        int num_ref_idx_active_minus1,
+        bool modification_flag,
+        const uint32_t* list_entry, size_t list_entry_count);
+
+    // The same construction expressed as indices into the concatenation
+    // [first, second, lt] of sets of the given sizes; -1 = no entry.
+    static std::vector<int> build_ref_pic_list_indices(
+        size_t n_first, size_t n_second, size_t n_lt,
         int num_ref_idx_active_minus1,
         bool modification_flag,
         const uint32_t* list_entry, size_t list_entry_count);
@@ -182,6 +196,13 @@ public:
         return (idx >= 0 && idx < static_cast<int>(ref_pic_list1_.size()))
                ? ref_pic_list1_[idx].pic : nullptr;
     }
+    // POC the RPS names for list entry idx (see RefPicListEntry::poc)
+    int32_t ref_poc0(int idx) const {
+        return (idx >= 0 && idx < static_cast<int>(ref_pic_list0_.size())) ? ref_pic_list0_[idx].poc : 0;
+    }
+    int32_t ref_poc1(int idx) const {
+        return (idx >= 0 && idx < static_cast<int>(ref_pic_list1_.size())) ? ref_pic_list1_[idx].poc : 0;
+    }
     bool ref_is_long_term0(int idx) const {
         return idx >= 0 && idx < static_cast<int>(ref_pic_list0_.size()) && ref_pic_list0_[idx].is_long_term;
     }
@@ -193,6 +214,9 @@ public:
 
     // Collocated picture (valid after derive_colpic)
     Picture* col_pic() const { return col_pic_; }
+    // ColPic is a stand-in for a missing picture: its motion field is not the
+    // one the bitstream was coded against.
+    bool col_pic_substituted() const { return col_pic_substituted_; }
     bool no_backward_pred_flag() const { return no_backward_pred_flag_; }
 
     // Current picture being decoded
@@ -201,6 +225,22 @@ public:
     // An entry of RefPicSetStCurrBefore/After or LtCurr is "no reference
     // picture" — inter prediction of the current picture reads a missing ref.
     bool has_missing_curr_refs() const;
+
+    // Error concealment: the stored picture nearest to `target_poc` that can
+    // stand in for `cur` (same format, not `cur`). Within cur's CVS the
+    // nearest POC wins (ties: the more recently decoded); otherwise the most
+    // recently decoded picture. `fallback` (a picture kept alive outside the
+    // DPB) is considered too. nullptr if nothing fits.
+    Picture* concealment_source(const Picture& cur, int32_t target_poc,
+                                Picture* fallback = nullptr) const;
+
+    // Replace every missing entry of the current RPS (StCurrBefore/After,
+    // LtCurr) by concealment_source() for the POC it names. Returns the
+    // number of entries that remain missing.
+    int substitute_missing_refs(const Picture& cur, Picture* fallback);
+
+    // Shared ownership of a stored picture (to keep it alive past eviction)
+    std::shared_ptr<Picture> share(const Picture* pic) const;
 
     // Forget the current-picture pointer before a new picture's RPS is
     // derived: the RPS marking loops skip current_pic_, and the previous
@@ -225,6 +265,18 @@ private:
     int32_t prev_poc_lsb_ = 0;
     int32_t prev_poc_msb_ = 0;
 
+    // POCs the current RPS entries name (parallel to the lists below), so a
+    // missing entry can be substituted by the picture nearest to it
+    std::vector<int32_t> poc_st_curr_before_;
+    std::vector<int32_t> poc_st_curr_after_;
+    std::vector<int32_t> poc_lt_curr_;
+    // Entries filled by substitute_missing_refs() (parallel to the sets)
+    std::vector<bool> sub_st_curr_before_;
+    std::vector<bool> sub_st_curr_after_;
+    std::vector<bool> sub_lt_curr_;
+
+    uint64_t decode_counter_ = 0;
+
     // RPS lists (§8.3.2) — pictures from the DPB
     // "StCurrBefore" = short-term, used by current, POC < current
     std::vector<Picture*> ref_pic_set_st_curr_before_;
@@ -239,6 +291,7 @@ private:
 
     // Collocated picture (§8.3.5)
     Picture* col_pic_ = nullptr;
+    bool col_pic_substituted_ = false;
     bool no_backward_pred_flag_ = false;
 
     // Helper: find picture in DPB by POC

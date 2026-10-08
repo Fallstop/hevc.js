@@ -181,3 +181,23 @@ describe("HEVCDecoder.discontinuity", () => {
     expect(discontinuity).not.toHaveBeenCalled();
   });
 });
+
+describe("HEVCDecoder.setErrorPolicy", () => {
+  it.each([
+    [{}, 0],
+    [{ concealSliceErrors: true }, 1],
+    [{ decodeBeforeIrap: true }, 2],
+    [{ concealSliceErrors: true, decodeBeforeIrap: true }, 3],
+    [{ concealSliceErrors: false, decodeBeforeIrap: false }, 0],
+  ])("maps %j to policy flags %i", (policy, flags) => {
+    const setErrorPolicy = vi.fn().mockReturnValue(0);
+    const d = makeDecoder({}, { setErrorPolicy });
+    d.setErrorPolicy(policy);
+    expect(setErrorPolicy).toHaveBeenCalledWith(7, flags);
+  });
+
+  it("throws on a native error", () => {
+    const d = makeDecoder({}, { setErrorPolicy: vi.fn().mockReturnValue(-1) });
+    expect(() => d.setErrorPolicy({ concealSliceErrors: true })).toThrow(/setErrorPolicy failed/);
+  });
+});

@@ -48,6 +48,9 @@ struct Picture {
     double tag = std::numeric_limits<double>::quiet_NaN();
     uint32_t flags = 0;
 
+    // Position in decoding order (monotonic per decoder)
+    uint64_t decode_order = 0;
+
     // Picture Order Count
     int32_t poc = 0;
     // Coded Video Sequence ID (incremented at each IRAP with NoRaslOutputFlag)
@@ -137,6 +140,17 @@ struct Picture {
     // Is this picture a reference?
     bool is_reference() const {
         return used_for_short_term_ref || used_for_long_term_ref;
+    }
+
+    // Same plane geometry and sample format: one picture's samples (and
+    // motion grid) can stand in for the other's.
+    bool same_format(const Picture& o) const {
+        return pic_width_in_luma == o.pic_width_in_luma &&
+               pic_height_in_luma == o.pic_height_in_luma &&
+               chroma_format == o.chroma_format &&
+               bit_depth_luma == o.bit_depth_luma &&
+               bit_depth_chroma == o.bit_depth_chroma &&
+               bytes_per_sample == o.bytes_per_sample;
     }
 };
 

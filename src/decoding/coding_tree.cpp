@@ -571,6 +571,17 @@ static void load_block(const Picture& pic, int cIdx, int xC, int yC,
         load_block_impl<uint16_t>(pic, cIdx, xC, yC, w, h, dst);
 }
 
+// The CABAC engine pads reads past the end of the slice data with zeros, so a
+// truncated slice would otherwise decode garbage CTUs to the end of the picture
+// without any error. A conforming decoder never reads more than a few bits
+// past the rbsp_slice_segment_trailing_bits; once the read position is well
+// past the end of the data the slice is corrupt.
+static constexpr size_t kSliceOverreadBits = 32;
+static inline void check_slice_data_left(const BitstreamReader& bs) {
+    if (bs.bits_read() > bs.size() * 8 + kSliceOverreadBits)
+        throw std::runtime_error("slice data exhausted");
+}
+
 // ============================================================
 // WPP parallel decode — §7.3.8.1 with wavefront parallelism
 // Each CTU row is a job submitted to the thread pool.
@@ -681,6 +692,7 @@ static bool decode_wpp_parallel(DecodingContext& ctx, BitstreamReader& bs,
             }
 
             decode_coding_tree_unit(row_ctx, xCtb, yCtb);
+            check_slice_data_left(row_bs);
             if (row_ctx.ctb_decoded) row_ctx.ctb_decoded[CtbAddrInRs] = 1;
 
             // §9.3.2.4: save contexts after 2nd CTU (col 1) for next row
@@ -696,6 +708,9 @@ static bool decode_wpp_parallel(DecodingContext& ctx, BitstreamReader& bs,
             row_cv[row].notify_all();
 
             bool end_of_slice = decode_end_of_slice_segment_flag(row_cabac);
+            // The segment's last substream must end with end_of_slice_segment_flag
+            if (!end_of_slice && row == lastRow && col == numCols - 1)
+                throw std::runtime_error("slice segment does not end in its last substream");
             if (end_of_slice || col == numCols - 1)
                 break;
         }
@@ -858,6 +873,7 @@ bool decode_slice_segment_data(DecodingContext& ctx, BitstreamReader& bs,
         }
 
         decode_coding_tree_unit(ctx, xCtb, yCtb);
+        check_slice_data_left(bs);
         if (ctx.ctb_decoded) ctx.ctb_decoded[CtbAddrInRs] = 1;
         HEVC_LOG(TREE, "CTU addr_rs=%d consumed %zu bits, remaining=%zu",
                  CtbAddrInRs, bs.bits_read() - bits_before, bs.bits_remaining());
@@ -872,7 +888,9 @@ bool decode_slice_segment_data(DecodingContext& ctx, BitstreamReader& bs,
 
         if (!end_of_slice) {
             CtbAddrInTs++;
-            if (CtbAddrInTs >= sps.PicSizeInCtbsY) break;
+            // §7.3.8.1: the last CTB of the picture ends its slice segment; a
+            // segment running past it is corrupt.
+            if (CtbAddrInTs >= sps.PicSizeInCtbsY) return false;
             CtbAddrInRs = pps.CtbAddrTsToRs[CtbAddrInTs];
 
             // Tile boundary: subset end + byte alignment + CABAC reinit

@@ -3,6 +3,7 @@
 #include "common/debug.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 
 namespace hevc {
@@ -106,6 +107,18 @@ void DPB::derive_rps(const SliceHeader& sh, const SPS& sps,
         const ShortTermRefPicSet* rps = sh.active_rps;
         if (!rps) {
             HEVC_LOG(PARSE, "WARNING: no active RPS for non-IDR picture%s", "");
+            // Never leave the previous picture's sets (possibly dangling) behind
+            ref_pic_set_st_curr_before_.clear();
+            ref_pic_set_st_curr_after_.clear();
+            ref_pic_set_st_foll_.clear();
+            ref_pic_set_lt_curr_.clear();
+            ref_pic_set_lt_foll_.clear();
+            poc_st_curr_before_.clear();
+            poc_st_curr_after_.clear();
+            poc_lt_curr_.clear();
+            sub_st_curr_before_.clear();
+            sub_st_curr_after_.clear();
+            sub_lt_curr_.clear();
             return;
         }
 
@@ -151,6 +164,13 @@ void DPB::derive_rps(const SliceHeader& sh, const SPS& sps,
             }
         }
     }
+
+    poc_st_curr_before_ = PocStCurrBefore;
+    poc_st_curr_after_ = PocStCurrAfter;
+    poc_lt_curr_ = PocLtCurr;
+    sub_st_curr_before_.assign(PocStCurrBefore.size(), false);
+    sub_st_curr_after_.assign(PocStCurrAfter.size(), false);
+    sub_lt_curr_.assign(PocLtCurr.size(), false);
 
     // §8.3.2 step 1: Build RefPicSetLtCurr and RefPicSetLtFoll (eq 8-6)
     ref_pic_set_lt_curr_.clear();
@@ -260,6 +280,47 @@ void DPB::derive_rps(const SliceHeader& sh, const SPS& sps,
 //   - all-empty RPS: break out of the temp loop instead of spinning forever.
 //   - out-of-range list_entry: a raw bitstream index past the temp list maps
 //     to nullptr (concealed) rather than reading out of bounds.
+std::vector<int> DPB::build_ref_pic_list_indices(
+        size_t n_first, size_t n_second, size_t n_lt,
+        int num_ref_idx_active_minus1,
+        bool modification_flag,
+        const uint32_t* list_entry, size_t list_entry_count) {
+    const int NumPicTotalCurr = static_cast<int>(n_first + n_second + n_lt);
+    const int NumRpsCurrTempList = std::max<int>(num_ref_idx_active_minus1 + 1, NumPicTotalCurr);
+
+    // eq 8-8 / 8-10: RefPicListTempX
+    std::vector<int> temp;
+    if (NumPicTotalCurr > 0) {
+        // Guarantee advancement: with every RPS set empty rIdx would never
+        // increment (concealed instead of spinning forever).
+        int rIdx = 0;
+        while (rIdx < NumRpsCurrTempList) {
+            for (size_t i = 0; i < n_first && rIdx < NumRpsCurrTempList; rIdx++, i++)
+                temp.push_back(static_cast<int>(i));
+            for (size_t i = 0; i < n_second && rIdx < NumRpsCurrTempList; rIdx++, i++)
+                temp.push_back(static_cast<int>(n_first + i));
+            for (size_t i = 0; i < n_lt && rIdx < NumRpsCurrTempList; rIdx++, i++)
+                temp.push_back(static_cast<int>(n_first + n_second + i));
+        }
+    }
+
+    // eq 8-9 / 8-11: RefPicListX
+    std::vector<int> out;
+    for (int rIdx = 0; rIdx <= num_ref_idx_active_minus1; rIdx++) {
+        int idx = -1;
+        if (modification_flag) {
+            int e = (rIdx < static_cast<int>(list_entry_count)) ? static_cast<int>(list_entry[rIdx]) : -1;
+            idx = (e >= 0 && e < static_cast<int>(temp.size())) ? temp[e] : -1;
+        } else {
+            idx = (rIdx < static_cast<int>(temp.size())) ? temp[rIdx] : -1;
+        }
+        out.push_back(idx);
+    }
+    return out;
+}
+
+// §8.3.4 — pure helper shared by L0/L1 (kept for unit tests of the guards:
+// all-empty-RPS hang, out-of-range list_entry clamp).
 std::vector<Picture*> DPB::build_ref_pic_list(
         const std::vector<Picture*>& rps_first,
         const std::vector<Picture*>& rps_second,
@@ -267,37 +328,19 @@ std::vector<Picture*> DPB::build_ref_pic_list(
         int num_ref_idx_active_minus1,
         bool modification_flag,
         const uint32_t* list_entry, size_t list_entry_count) {
-    int NumPicTotalCurr = static_cast<int>(rps_first.size() + rps_second.size() + rps_lt.size());
-    int NumRpsCurrTempList = std::max<int>(num_ref_idx_active_minus1 + 1, NumPicTotalCurr);
-
-    // eq 8-8 / 8-10: RefPicListTempX
-    std::vector<Picture*> temp;
-    {
-        int rIdx = 0;
-        while (rIdx < NumRpsCurrTempList) {
-            // Guarantee advancement: if every RPS set is empty, rIdx would never
-            // increment below -> infinite loop. Break instead (concealed).
-            if (rps_first.empty() && rps_second.empty() && rps_lt.empty()) break;
-            for (int i = 0; i < static_cast<int>(rps_first.size())  && rIdx < NumRpsCurrTempList; rIdx++, i++)
-                temp.push_back(rps_first[i]);
-            for (int i = 0; i < static_cast<int>(rps_second.size()) && rIdx < NumRpsCurrTempList; rIdx++, i++)
-                temp.push_back(rps_second[i]);
-            for (int i = 0; i < static_cast<int>(rps_lt.size())     && rIdx < NumRpsCurrTempList; rIdx++, i++)
-                temp.push_back(rps_lt[i]);
-        }
-    }
-
-    // eq 8-9 / 8-11: RefPicListX
+    auto idx = build_ref_pic_list_indices(rps_first.size(), rps_second.size(), rps_lt.size(),
+                                          num_ref_idx_active_minus1, modification_flag,
+                                          list_entry, list_entry_count);
     std::vector<Picture*> out;
-    for (int rIdx = 0; rIdx <= num_ref_idx_active_minus1; rIdx++) {
-        Picture* pic = nullptr;
-        if (modification_flag) {
-            int e = (rIdx < static_cast<int>(list_entry_count)) ? static_cast<int>(list_entry[rIdx]) : -1;
-            pic = (e >= 0 && e < static_cast<int>(temp.size())) ? temp[e] : nullptr;
-        } else {
-            pic = (rIdx < static_cast<int>(temp.size())) ? temp[rIdx] : nullptr;
+    for (int i : idx) {
+        Picture* p = nullptr;
+        if (i >= 0) {
+            size_t u = static_cast<size_t>(i);
+            if (u < rps_first.size()) p = rps_first[u];
+            else if (u < rps_first.size() + rps_second.size()) p = rps_second[u - rps_first.size()];
+            else p = rps_lt[u - rps_first.size() - rps_second.size()];
         }
-        out.push_back(pic);
+        out.push_back(p);
     }
     return out;
 }
@@ -317,25 +360,57 @@ void DPB::construct_ref_pic_lists(const SliceHeader& sh, const SPS& /*sps*/,
     const int numL0m1 = static_cast<int>(std::min(sh.num_ref_idx_l0_active_minus1, maxIdx));
     const int numL1m1 = static_cast<int>(std::min(sh.num_ref_idx_l1_active_minus1, maxIdx));
 
+    // One RPS entry: the picture (possibly a substituted stand-in), the POC
+    // the RPS names, and whether it is a long-term entry.
+    // A picture found in the DPB reports its own POC; a missing or substituted
+    // entry reports the POC the RPS named (an LT entry without MSB names only
+    // the LSBs, so the found picture's full POC is the one to report).
+    struct RpsItem { Picture* pic; int32_t poc; bool lt; bool sub; };
+    auto items = [](const std::vector<Picture*>& pics, const std::vector<int32_t>& pocs,
+                    const std::vector<bool>& substituted, bool lt) {
+        std::vector<RpsItem> v;
+        for (size_t i = 0; i < pics.size(); i++) {
+            Picture* p = pics[i];
+            const bool sub = i < substituted.size() && substituted[i];
+            const int32_t poc = (p && !sub) ? p->poc : (i < pocs.size() ? pocs[i] : 0);
+            v.push_back({p, poc, lt, sub});
+        }
+        return v;
+    };
+    const auto before = items(ref_pic_set_st_curr_before_, poc_st_curr_before_, sub_st_curr_before_, false);
+    const auto after = items(ref_pic_set_st_curr_after_, poc_st_curr_after_, sub_st_curr_after_, false);
+    const auto lt = items(ref_pic_set_lt_curr_, poc_lt_curr_, sub_lt_curr_, true);
+
+    auto build = [&](const std::vector<RpsItem>& first, const std::vector<RpsItem>& second,
+                     int num_minus1, bool mod_flag, const uint32_t* entries, size_t n_entries,
+                     std::vector<RefPicListEntry>& list) {
+        auto idx = build_ref_pic_list_indices(first.size(), second.size(), lt.size(),
+                                              num_minus1, mod_flag, entries, n_entries);
+        for (int i : idx) {
+            RefPicListEntry e;
+            if (i >= 0) {
+                const size_t u = static_cast<size_t>(i);
+                const RpsItem& it = u < first.size() ? first[u]
+                                  : u < first.size() + second.size() ? second[u - first.size()]
+                                  : lt[u - first.size() - second.size()];
+                e.pic = it.pic;
+                e.poc = it.poc;
+                e.is_long_term = it.lt;
+                e.substituted = it.sub;
+            }
+            list.push_back(e);
+        }
+    };
+
     // §8.3.4 eq 8-8/8-9: RefPicList0 — order: StCurrBefore, StCurrAfter, LtCurr
-    {
-        auto l0 = build_ref_pic_list(
-            ref_pic_set_st_curr_before_, ref_pic_set_st_curr_after_, ref_pic_set_lt_curr_,
-            numL0m1,
-            sh.ref_pic_list_modification_flag_l0,
-            sh.list_entry_l0.data(), sh.list_entry_l0.size());
-        for (Picture* p : l0) ref_pic_list0_.push_back({p, p && p->used_for_long_term_ref});
-    }
+    build(before, after, numL0m1, sh.ref_pic_list_modification_flag_l0,
+          sh.list_entry_l0.data(), sh.list_entry_l0.size(), ref_pic_list0_);
 
     // §8.3.4 eq 8-10/8-11: RefPicList1 (B slices only)
     // Order: StCurrAfter FIRST (reversed vs List0), then StCurrBefore, LtCurr.
     if (sh.slice_type == SliceType::B) {
-        auto l1 = build_ref_pic_list(
-            ref_pic_set_st_curr_after_, ref_pic_set_st_curr_before_, ref_pic_set_lt_curr_,
-            numL1m1,
-            sh.ref_pic_list_modification_flag_l1,
-            sh.list_entry_l1.data(), sh.list_entry_l1.size());
-        for (Picture* p : l1) ref_pic_list1_.push_back({p, p && p->used_for_long_term_ref});
+        build(after, before, numL1m1, sh.ref_pic_list_modification_flag_l1,
+              sh.list_entry_l1.data(), sh.list_entry_l1.size(), ref_pic_list1_);
     }
 
     HEVC_LOG(PARSE, "RefPicLists: L0=%zu entries, L1=%zu entries",
@@ -356,16 +431,18 @@ void DPB::construct_ref_pic_lists(const SliceHeader& sh, const SPS& /*sps*/,
 
 void DPB::derive_colpic(const SliceHeader& sh) {
     col_pic_ = nullptr;
+    col_pic_substituted_ = false;
     no_backward_pred_flag_ = false;
 
     if (!sh.slice_temporal_mvp_enabled_flag) return;
     if (sh.slice_type == SliceType::I) return;
 
     // §8.3.5: derive ColPic
-    if (sh.slice_type == SliceType::B && !sh.collocated_from_l0_flag) {
-        col_pic_ = ref_pic_list1(sh.collocated_ref_idx);
-    } else {
-        col_pic_ = ref_pic_list0(sh.collocated_ref_idx);
+    const auto& col_list = (sh.slice_type == SliceType::B && !sh.collocated_from_l0_flag)
+                           ? ref_pic_list1_ : ref_pic_list0_;
+    if (sh.collocated_ref_idx < col_list.size()) {
+        col_pic_ = col_list[sh.collocated_ref_idx].pic;
+        col_pic_substituted_ = col_list[sh.collocated_ref_idx].substituted;
     }
 
     // §8.3.5: derive NoBackwardPredFlag
@@ -406,6 +483,7 @@ Picture* DPB::alloc_picture(int width, int height, ChromaFormat fmt,
 
     auto pic = std::make_shared<Picture>();
     pic->allocate(width, height, fmt, bd_luma, bd_chroma);
+    pic->decode_order = ++decode_counter_;
     pictures_.push_back(pic);
     current_pic_ = pic.get();
     return current_pic_;
@@ -632,6 +710,56 @@ bool DPB::has_missing_curr_refs() const {
         for (const Picture* p : *list)
             if (!p) return true;
     return false;
+}
+
+Picture* DPB::concealment_source(const Picture& cur, int32_t target_poc,
+                                 Picture* fallback) const {
+    Picture* best = nullptr;
+    bool best_same_cvs = false;
+    auto better = [&](Picture* p) {
+        if (!p || p == &cur || !p->same_format(cur)) return;
+        const bool same_cvs = p->cvs_id == cur.cvs_id;
+        if (!best) { best = p; best_same_cvs = same_cvs; return; }
+        if (same_cvs != best_same_cvs) {
+            if (same_cvs) { best = p; best_same_cvs = true; }
+            return;
+        }
+        if (same_cvs) {
+            const int64_t d = std::llabs(static_cast<int64_t>(p->poc) - target_poc);
+            const int64_t bd = std::llabs(static_cast<int64_t>(best->poc) - target_poc);
+            if (d < bd || (d == bd && p->decode_order > best->decode_order)) best = p;
+        } else if (p->decode_order > best->decode_order) {
+            best = p;
+        }
+    };
+    for (const auto& pic : pictures_) better(pic.get());
+    better(fallback);
+    return best;
+}
+
+int DPB::substitute_missing_refs(const Picture& cur, Picture* fallback) {
+    int still_missing = 0;
+    auto fill = [&](std::vector<Picture*>& list, const std::vector<int32_t>& pocs,
+                    std::vector<bool>& substituted) {
+        substituted.resize(list.size(), false);
+        for (size_t i = 0; i < list.size(); i++) {
+            if (list[i]) continue;
+            const int32_t poc = i < pocs.size() ? pocs[i] : cur.poc;
+            list[i] = concealment_source(cur, poc, fallback);
+            if (list[i]) substituted[i] = true;
+            else still_missing++;
+        }
+    };
+    fill(ref_pic_set_st_curr_before_, poc_st_curr_before_, sub_st_curr_before_);
+    fill(ref_pic_set_st_curr_after_, poc_st_curr_after_, sub_st_curr_after_);
+    fill(ref_pic_set_lt_curr_, poc_lt_curr_, sub_lt_curr_);
+    return still_missing;
+}
+
+std::shared_ptr<Picture> DPB::share(const Picture* pic) const {
+    for (const auto& p : pictures_)
+        if (p.get() == pic) return p;
+    return nullptr;
 }
 
 Picture* DPB::find_short_term_by_poc(int32_t poc) const {

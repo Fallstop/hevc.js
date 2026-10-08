@@ -119,6 +119,25 @@ int hevc_decoder_feed_tagged(HEVCDecoder* dec, const uint8_t* data, size_t size,
 // null argument.
 int hevc_decoder_get_stats(HEVCDecoder* dec, HEVCDecodeStats* stats);
 
+// Error policy flags (hevc_decoder_set_error_policy). 0 — the default — is the
+// conformant behaviour: drop a picture with a decode error and resume at the
+// next IRAP; skip non-IRAP pictures until the first IRAP.
+#define HEVC_POLICY_CONCEAL_SLICE_ERRORS 0x1  // conceal failed/missing slices
+                                              // (HEVC_FRAME_CORRUPT) and missing
+                                              // references (nearest picture,
+                                              // HEVC_FRAME_MISSING_REF) instead of
+                                              // dropping and freezing until an IRAP
+#define HEVC_POLICY_DECODE_BEFORE_IRAP   0x2  // decode non-IRAP pictures at stream
+                                              // start / after reset, discontinuity
+                                              // or an undecodable picture
+                                              // (HEVC_FRAME_PRE_RECOVERY until an
+                                              // IRAP or recovery point)
+
+// Select the error policy (an OR of HEVC_POLICY_* flags; unknown bits are
+// ignored). Takes effect from the next picture. Returns HEVC_OK, or
+// HEVC_ERROR on a null decoder.
+int hevc_decoder_set_error_policy(HEVCDecoder* dec, int policy_flags);
+
 // Drain newly output-ready pictures (§C.5.2 bumping process)
 // Outputs pictures in display order, only when ready per DPB constraints.
 // Returns HEVC_OK and sets *count to the number of available frames.

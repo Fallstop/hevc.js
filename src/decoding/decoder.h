@@ -36,9 +36,33 @@ struct DecodeStats {
     uint32_t nal_errors = 0;
 };
 
+// How damaged input is handled (see Decoder::set_error_policy). The default —
+// both false — is the conformant behaviour: drop a picture with an error and
+// resynchronize at the next IRAP; skip non-IRAP pictures before the first IRAP.
+struct ErrorPolicy {
+    // Conceal instead of dropping. When a slice fails after the picture's
+    // first slice header decoded, or the slices do not cover the picture, the
+    // undecoded CTUs are filled with the co-located samples of the nearest-POC
+    // available picture (mid-grey if none), excluded from deblocking/SAO, and
+    // the picture is kept as a reference and output with PICTURE_CORRUPT —
+    // skip-to-next-IRAP is armed only when the first slice header itself is
+    // undecodable. A missing reference picture is substituted by the nearest
+    // available picture instead of mid-grey prediction (PICTURE_MISSING_REF).
+    bool conceal_slice_errors = false;
+    // Decode non-IRAP pictures at stream start / after reset() /
+    // discontinuity() / an undecodable picture instead of skipping until the
+    // next IRAP. They are flagged PICTURE_PRE_RECOVERY until an IRAP or the
+    // recovery point (§D.3.8) is reached. RASL pictures of an IRAP that opens
+    // the sequence are still skipped (they precede it in output order).
+    bool decode_before_irap = false;
+};
+
 class Decoder {
 public:
     Decoder() = default;
+
+    void set_error_policy(const ErrorPolicy& policy) { policy_ = policy; }
+    const ErrorPolicy& error_policy() const { return policy_; }
 
     // Decode a complete bitstream (batch mode)
     DecodeStatus decode(const uint8_t* data, size_t size);
@@ -172,6 +196,7 @@ private:
         const SliceHeader* last_independent = nullptr;  // nullptr: current slice lost
         bool prev_segment_ok = false;  // the segment a dependent one continues
         bool error = false;            // some slice data failed to decode
+        bool missing_refs = false;     // the RPS named pictures the DPB lacks
         bool pic_output_flag = true;
         DecodingContext ctx;
         CabacEngine cabac;
@@ -180,6 +205,21 @@ private:
 
     // Snapshot the reference lists just built for slice `slice_number`.
     void record_slice_refs(int slice_number);
+
+    // Fill every CTU the slices did not decode from concealment_source()
+    // (mid-grey if none) and keep them out of the in-loop filters.
+    void conceal_undecoded_ctus();
+
+    ErrorPolicy policy_;
+    // Decoding pictures before a clean random access point (decode_before_irap)
+    bool pre_recovery_ = false;
+    // A recovery point SEI bound while pre_recovery_: output is clean from
+    // this POC on (§D.3.8)
+    bool recovery_target_active_ = false;
+    int32_t recovery_target_poc_ = 0;
+    // The last picture decoded, kept alive as a concealment source even after
+    // the DPB released it (an IDR unmarks everything before it)
+    std::shared_ptr<Picture> last_picture_;
     ParameterSetManager ps_mgr_;
     DPB dpb_;
     DPB::OutputLimits output_limits_;

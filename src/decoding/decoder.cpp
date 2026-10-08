@@ -268,6 +268,12 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek) {
         // F4 error resync: an IRAP starts a clean CVS — references are self
         // contained, so we can resume decoding here. Clear the error-skip arm.
         skip_to_next_irap_ = false;
+        pre_recovery_ = false;
+        recovery_target_active_ = false;
+    } else if (policy_.decode_before_irap && (skip_to_next_irap_ || no_irap_yet_)) {
+        // Forgiving tune-in: decode anyway (missing references concealed) and
+        // flag the output until a clean random access point.
+        pre_recovery_ = true;
     } else {
         // F4 error resync: after a picture failed, drop every non-IRAP picture
         // until the next IRAP. Their references may be the corrupted picture
@@ -286,6 +292,8 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek) {
             begin_skip(peek, nut);
             return;
         }
+    }
+    if (!isIRAP) {
         // §8.1: RASL pictures associated with an IRAP whose NoRaslOutputFlag == 1
         // are undecodable — their references were discarded. Skip them.
         if (is_rasl(nut) && prev_irap_no_rasl_output_) {
@@ -312,6 +320,19 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek) {
         recovery_poc_cnt_ = pending_recovery_poc_cnt_;
         recovery_point_poc_ = poc + pending_recovery_poc_cnt_;
         has_pending_recovery_point_ = false;
+        if (pre_recovery_) {
+            recovery_target_active_ = true;
+            recovery_target_poc_ = recovery_point_poc_;
+        }
+    }
+    // Decoding before an IRAP: the recovery point is a random access point —
+    // from its POC on the pictures are clean, and a later CRA is an ordinary
+    // mid-stream CRA (its RASL pictures decodable).
+    if (pre_recovery_ && recovery_target_active_ && poc >= recovery_target_poc_) {
+        pre_recovery_ = false;
+        recovery_target_active_ = false;
+        no_irap_yet_ = false;
+        skip_to_next_irap_ = false;
     }
 
     // §8.3.2 — RPS derivation and picture marking. Runs before the current
@@ -331,7 +352,7 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek) {
         fmt, sps->BitDepthY, sps->BitDepthC);
     pic->poc = poc;
     pic->tag = feed_tag_;
-    pic->flags = 0;
+    pic->flags = pre_recovery_ ? PICTURE_PRE_RECOVERY : 0u;
     // Marked "needed for output" only once the picture is decoded (§C.5.2.3)
     pic->needed_for_output = false;
 
@@ -341,6 +362,12 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek) {
     if (isIRAP && no_rasl_output_flag)
         cvs_id_++;
     pic->cvs_id = cvs_id_;
+
+    // A reference the RPS names but the DPB lacks: with concealment, predict
+    // from the nearest available picture rather than from mid-grey.
+    const bool missing_refs = dpb_.has_missing_curr_refs();
+    if (missing_refs && policy_.conceal_slice_errors)
+        dpb_.substitute_missing_refs(*pic, last_picture_.get());
 
     // Set conformance window
     if (sps->conformance_window_flag) {
@@ -415,6 +442,7 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek) {
     pend_.last_independent = nullptr;
     pend_.prev_segment_ok = false;
     pend_.error = false;
+    pend_.missing_refs = missing_refs;
     pend_.pic_output_flag = first_sh.pic_output_flag;
 
     // Setup decoding context (shared across all slices of the picture).
@@ -466,13 +494,11 @@ void Decoder::record_slice_refs(int slice_number) {
     t.count[0] = static_cast<uint8_t>(std::min(dpb_.num_ref_list0(), 16));
     t.count[1] = static_cast<uint8_t>(std::min(dpb_.num_ref_list1(), 16));
     for (int i = 0; i < t.count[0]; i++) {
-        const Picture* p = dpb_.ref_pic_list0(i);
-        t.poc[0][i] = p ? p->poc : -999999;
+        t.poc[0][i] = dpb_.ref_pic_list0(i) ? dpb_.ref_poc0(i) : -999999;
         t.is_long_term[0][i] = dpb_.ref_is_long_term0(i);
     }
     for (int i = 0; i < t.count[1]; i++) {
-        const Picture* p = dpb_.ref_pic_list1(i);
-        t.poc[1][i] = p ? p->poc : -999999;
+        t.poc[1][i] = dpb_.ref_pic_list1(i) ? dpb_.ref_poc1(i) : -999999;
         t.is_long_term[1][i] = dpb_.ref_is_long_term1(i);
     }
 }
@@ -540,13 +566,13 @@ void Decoder::decode_slice(const NalUnit& nal, const SlicePeek& peek, SliceHeade
         dpb_.construct_ref_pic_lists(sh, *sps, *pps);
         dpb_.derive_colpic(sh);
         record_slice_refs(slice_number);
-        if (sh.slice_type != SliceType::I && dpb_.has_missing_curr_refs())
+        if (sh.slice_type != SliceType::I && pend_.missing_refs)
             pend_.pic->flags |= PICTURE_MISSING_REF;
     }
 
     // Under the default policy a picture with an error is dropped anyway; do
     // not spend time decoding the rest of it.
-    if (pend_.error) {
+    if (pend_.error && !policy_.conceal_slice_errors) {
         pend_.prev_segment_ok = false;
         pend_.next_ctb_ts = std::max(pend_.next_ctb_ts, peek.address_ts + 1);
         return;
@@ -629,8 +655,16 @@ void Decoder::finish_picture() {
     int decoded = 0;
     for (uint8_t d : ctb_decoded_buf_) decoded += d;
     if (pend_.error || decoded != sps->PicSizeInCtbsY || pend_.slices.empty()) {
-        fail_picture();
-        return;
+        // The first slice header decoded (POC, RPS and output order are
+        // known), so a forgiving decoder repairs the picture instead of
+        // dropping it and freezing until the next IRAP.
+        if (!policy_.conceal_slice_errors || pend_.slices.empty()) {
+            fail_picture();
+            return;
+        }
+        conceal_undecoded_ctus();
+        pic->flags |= PICTURE_CORRUPT;
+        stats_.concealed++;
     }
 
     // §8.7: In-loop filters — deblocking then SAO (once, after all slices).
@@ -673,8 +707,76 @@ void Decoder::finish_picture() {
     dpb_.bump_after_decode(output_limits_);
 
     stats_.pictures_decoded++;
+    last_picture_ = dpb_.share(pic);
     pend_.mode = PendingMode::NONE;
     pend_.pic = nullptr;
+}
+
+void Decoder::conceal_undecoded_ctus() {
+    const SPS* sps = pend_.sps;
+    Picture* pic = pend_.pic;
+    DecodingContext& ctx = pend_.ctx;
+    const Picture* src = dpb_.concealment_source(*pic, pic->poc, last_picture_.get());
+
+    const int ctbLog2 = sps->CtbLog2SizeY;
+    const int picW = static_cast<int>(sps->pic_width_in_luma_samples);
+    const int picH = static_cast<int>(sps->pic_height_in_luma_samples);
+    const int grid4W = picW >> 2;
+    const int grid4H = picH >> 2;
+    const int bps = pic->bytes_per_sample;
+
+    for (int rs = 0; rs < sps->PicSizeInCtbsY; rs++) {
+        if (ctb_decoded_buf_[rs]) continue;
+        const int x0 = (rs % sps->PicWidthInCtbsY) << ctbLog2;
+        const int y0 = (rs / sps->PicWidthInCtbsY) << ctbLog2;
+        const int w = std::min(1 << ctbLog2, picW - x0);
+        const int h = std::min(1 << ctbLog2, picH - y0);
+
+        // Samples: co-located copy from the source picture, else mid-grey
+        for (int c = 0; c < 3; c++) {
+            if (pic->plane_bytes[c].empty()) continue;
+            const int sw = (c == 0) ? 1 : SubWidthC(pic->chroma_format);
+            const int sh = (c == 0) ? 1 : SubHeightC(pic->chroma_format);
+            const int cx = x0 / sw, cy = y0 / sh, cw = w / sw, ch = h / sh;
+            const size_t stride_bytes = static_cast<size_t>(pic->stride[c]) * bps;
+            uint8_t* dst = pic->plane_bytes[c].data() + static_cast<size_t>(cy) * stride_bytes +
+                           static_cast<size_t>(cx) * bps;
+            if (src) {
+                const uint8_t* s = src->plane_bytes[c].data() + static_cast<size_t>(cy) * stride_bytes +
+                                   static_cast<size_t>(cx) * bps;
+                for (int y = 0; y < ch; y++)
+                    std::memcpy(dst + y * stride_bytes, s + y * stride_bytes, static_cast<size_t>(cw) * bps);
+            } else {
+                const int depth = (c == 0) ? pic->bit_depth_luma : pic->bit_depth_chroma;
+                const int grey = 1 << (depth - 1);
+                for (int y = 0; y < ch; y++) {
+                    if (bps == 1) {
+                        std::memset(dst + y * stride_bytes, grey, static_cast<size_t>(cw));
+                    } else {
+                        uint16_t* row = reinterpret_cast<uint16_t*>(dst + y * stride_bytes);
+                        std::fill(row, row + cw, static_cast<uint16_t>(grey));
+                    }
+                }
+            }
+        }
+
+        // Keep the CTU out of the in-loop filters: no SAO, and no deblocking
+        // edge inside it or on its boundary with decoded CTUs (the edge flag
+        // of a boundary lives in the block right of / below it).
+        ctx.sao_params[rs] = DecodingContext::SaoParams{};
+        const int gx0 = x0 >> 2, gy0 = y0 >> 2;
+        const int gx1 = (x0 + w) >> 2, gy1 = (y0 + h) >> 2;
+        for (int gy = gy0; gy < gy1; gy++)
+            for (int gx = gx0; gx <= gx1 && gx < grid4W; gx++)
+                edge_flags_v_buf_[static_cast<size_t>(gy) * grid4W + gx] = 0;
+        for (int gy = gy0; gy <= gy1 && gy < grid4H; gy++)
+            for (int gx = gx0; gx < gx1; gx++)
+                edge_flags_h_buf_[static_cast<size_t>(gy) * grid4W + gx] = 0;
+        // No motion for later pictures' TMVP to inherit from the concealed area
+        for (int gy = gy0; gy < gy1; gy++)
+            for (int gx = gx0; gx < gx1; gx++)
+                motion_info_buf_[static_cast<size_t>(gy) * grid4W + gx] = PUMotionInfo{};
+    }
 }
 
 // ============================================================
@@ -741,9 +843,13 @@ void Decoder::discontinuity() {
     // A recovery point announced before the discontinuity belongs to a
     // picture that will not come.
     has_pending_recovery_point_ = false;
+    recovery_target_active_ = false;
 }
 
 void Decoder::reset(bool clear_parameter_sets) {
+    last_picture_.reset();
+    pre_recovery_ = false;
+    recovery_target_active_ = false;
     pend_.mode = PendingMode::NONE;
     pend_.pic = nullptr;
     pend_.headers.clear();

@@ -237,6 +237,15 @@ int hevc_decoder_get_stats(HEVCDecoder* dec, HEVCDecodeStats* stats) {
     return HEVC_OK;
 }
 
+int hevc_decoder_set_error_policy(HEVCDecoder* dec, int policy_flags) {
+    if (!dec) return HEVC_ERROR;
+    hevc::ErrorPolicy policy;
+    policy.conceal_slice_errors = (policy_flags & HEVC_POLICY_CONCEAL_SLICE_ERRORS) != 0;
+    policy.decode_before_irap = (policy_flags & HEVC_POLICY_DECODE_BEFORE_IRAP) != 0;
+    dec->decoder.set_error_policy(policy);
+    return HEVC_OK;
+}
+
 int hevc_decoder_get_recovery_point(HEVCDecoder* dec, int* recovery_poc) {
     if (!dec || !dec->decoder.has_recovery_point()) return HEVC_ERROR;
     if (recovery_poc)
