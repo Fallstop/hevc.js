@@ -5,6 +5,8 @@
 #include "decoding/coding_tree.h"   // DecodingContext
 #include "decoding/dpb.h"
 #include "decoding/interpolation.h"
+#include "syntax/pps.h"
+#include "syntax/slice_header.h"
 #include "syntax/sps.h"
 
 using namespace hevc;
@@ -94,4 +96,63 @@ TEST(InterpConceal, BothRefsMissingChromaNeutral10bit) {
     const int16_t neutral = 1 << (10 - 1);  // 512
     for (int i = 0; i < (W / 2) * (H / 2); i++)
         EXPECT_EQ(cpred[i], neutral) << "sample " << i;
+}
+
+// 4:4:4 chroma prediction blocks are as large as luma ones (64x64). The
+// separable 2-D chroma filter's intermediate buffer was sized for 4:2:0
+// (32x35) and a 64x64 PU with a fractional MV in both directions overran the
+// stack (found by the fuzz smoke; ASan reports it here before the fix).
+TEST(InterpChroma, LargeChromaBlocksIn444) {
+    SPS sps;
+    sps.chroma_format_idc = 3;
+    sps.ChromaArrayType = 3;
+    sps.SubWidthC = 1;
+    sps.SubHeightC = 1;
+    sps.BitDepthY = sps.BitDepthC = 8;
+    sps.pic_width_in_luma_samples = 128;
+    sps.pic_height_in_luma_samples = 128;
+    PPS pps;
+
+    DPB dpb;
+    Picture* ref = dpb.alloc_picture(128, 128, ChromaFormat::YUV444, 8, 8);
+    ref->poc = 0;
+    ref->used_for_short_term_ref = true;
+    for (int c = 0; c < 3; c++)
+        for (size_t i = 0; i < ref->plane_bytes[c].size(); i++)
+            ref->plane_bytes[c][i] = static_cast<uint8_t>((i * 7 + c * 31) & 0xFF);
+
+    ShortTermRefPicSet rps;
+    rps.NumNegativePics = 1;
+    rps.NumDeltaPocs = 1;
+    rps.DeltaPocS0[0] = -1;
+    rps.UsedByCurrPicS0[0] = true;
+    SliceHeader sh;
+    sh.slice_type = SliceType::P;
+    sh.slice_pic_order_cnt_lsb = 1;
+    sh.active_rps = &rps;
+    dpb.clear_current();
+    dpb.derive_rps(sh, sps, NalUnitType::TRAIL_R, 1, false);
+    Picture* cur = dpb.alloc_picture(128, 128, ChromaFormat::YUV444, 8, 8);
+    cur->poc = 1;
+    dpb.construct_ref_pic_lists(sh, sps, pps);
+    ASSERT_EQ(dpb.ref_pic_list0(0), ref);
+
+    DecodingContext ctx;
+    ctx.sps = &sps;
+    ctx.pps = &pps;
+    ctx.sh = &sh;
+    ctx.dpb = &dpb;
+    ctx.pic = cur;
+    int16_t pred[64 * 64];
+    for (int pos : {0, 32}) {       // picture edge (clamped path) and interior (SIMD path)
+        for (int cIdx : {1, 2}) {
+            perform_inter_prediction(ctx, pos, pos, 64, 64, cIdx,
+                                     MV{1, 3}, MV{0, 0}, 0, -1, true, false, pred);
+            // Constant-free sanity: the prediction came from the reference
+            // (shifted to 14-bit), not from the grey concealment value.
+            bool all_grey = true;
+            for (int i = 0; i < 64 * 64; i++) all_grey &= pred[i] == (128 << 6);
+            EXPECT_FALSE(all_grey);
+        }
+    }
 }

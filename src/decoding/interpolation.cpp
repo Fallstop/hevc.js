@@ -327,6 +327,10 @@ static void interpolate_luma(const Picture& refPic,
 // Chroma interpolation — §8.5.3.3.3 (chroma part)
 // ============================================================
 
+// Largest chroma prediction block: 64x64 in 4:4:4 (32x64 in 4:2:2). The
+// separable filter's intermediate rows add the 3-row filter margin.
+static constexpr int kMaxChromaPb = 64;
+
 template<typename Sample>
 static void interpolate_chroma_impl(const Picture& refPic, int cIdx,
                                 int xInt, int yInt, int xFrac, int yFrac,
@@ -375,7 +379,7 @@ static void interpolate_chroma_impl(const Picture& refPic, int cIdx,
                 } \
         } else { \
             int tmpH = nPbHC + 3; \
-            int16_t tmp[32 * 35]; \
+            int16_t tmp[kMaxChromaPb * (kMaxChromaPb + 3)]; \
             const int16_t* fH = chroma_filter[xFrac]; \
             for (int y = 0; y < tmpH; y++) \
                 for (int x = 0; x < nPbWC; x++) { \
@@ -420,7 +424,7 @@ static void interpolate_chroma_impl(const Picture& refPic, int cIdx,
                                    strideC, f, shift1, nPbWC, pred + y * nPbWC);
         } else {
             int tmpH = nPbHC + 3;
-            int16_t tmp[32 * 35];
+            int16_t tmp[kMaxChromaPb * (kMaxChromaPb + 3)];
             const int16_t* fH = chroma_filter[xFrac];
             for (int y = 0; y < tmpH; y++)
                 simd_filter_row<4>(reinterpret_cast<const int16_t*>(base + (y - 1) * strideC - 1),
@@ -450,7 +454,7 @@ static void interpolate_chroma_impl(const Picture& refPic, int cIdx,
                     simd_filter_row_u8<4>(base + (y - 1) * strideC, strideC, f, shift1, nPbWC, pred + y * nPbWC);
             } else {
                 int tmpH = nPbHC + 3;
-                int16_t tmp[32 * 35];
+                int16_t tmp[kMaxChromaPb * (kMaxChromaPb + 3)];
                 const int16_t* fH = chroma_filter[xFrac];
                 for (int y = 0; y < tmpH; y++)
                     simd_filter_row_u8<4>(base + (y - 1) * strideC - 1, 1, fH, shift1, nPbWC, tmp + y * nPbWC);
