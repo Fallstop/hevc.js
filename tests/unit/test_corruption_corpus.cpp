@@ -4,11 +4,14 @@
 // tags, under the default policy and with concealment. Run under ASan (Debug
 // build) a memory error fails the test; beyond that each run must return OK
 // from every feed(), keep the DPB bounded, output frames with sane geometry and
-// tags that were actually fed, and flag every concealed picture. Across the
-// corpus, concealment must drop strictly fewer pictures than skip-to-IRAP.
+// tags that were actually fed, flag every concealed picture, and give the same
+// frames whether the caller drains after every chunk or only at the end.
+// Across the corpus, concealment must drop strictly fewer pictures than
+// skip-to-IRAP.
 
 #include <gtest/gtest.h>
 
+#include <map>
 #include <set>
 
 #include "../fuzz/mutate.h"
@@ -168,6 +171,59 @@ TEST(CorruptionCorpusLowDelay, LossKeepsTagsMonotonicAndConcealmentDropsLess) {
     }
     EXPECT_GT(conceal_frames, default_frames);
     EXPECT_LT(conceal_dropped, default_dropped);
+}
+
+// Corruption that stays inside access units, as a container delivers them
+// (an MP4 sample, an RTP frame): chunk boundaries come from the clean stream
+// and each chunk carries its own tag. Every output frame's tag is then unique
+// — a repeated, dropped, truncated, reordered or garbage NAL never yields a
+// second frame for the same input — except when a bit error turns a slice
+// header into the first slice of another picture; such a frame is flagged
+// CORRUPT.
+TEST(CorruptionCorpusTags, CorruptionInsideAccessUnitsKeepsTagsUnique) {
+    ErrorPolicy both;
+    both.conceal_slice_errors = true;
+    both.decode_before_irap = true;
+    for (const char* name : {"multislice_qcif_8f.265", "multislice_wpp_qcif_8f.265",
+                             "camera_qcif_12f.265", "opengop_qcif_12f.265"}) {
+        const auto clean = hevc_fuzz::split_chunks(read_file(fixture(name)));
+        for (int m = 0; m < static_cast<int>(Mutation::kCount); m++) {
+            const auto mutation = static_cast<Mutation>(m);
+            const bool header_bits = mutation == Mutation::FlipBits || mutation == Mutation::FlipHeaderBits;
+            for (uint32_t k = 0; k < 5; k++) {
+                const uint32_t seed = 20000 + k * 31 + static_cast<uint32_t>(m);
+                std::mt19937 rng(seed);
+                auto chunks = clean;
+                const int n = 1 + static_cast<int>(rng() % 3);
+                for (int i = 0; i < n; i++) hevc_fuzz::apply(mutation, chunks[rng() % chunks.size()], rng);
+                for (const ErrorPolicy& policy : {ErrorPolicy{}, both}) {
+                    SCOPED_TRACE(std::string(name) + " " + hevc_fuzz::mutation_name(mutation) + " seed " +
+                                 std::to_string(seed) + " policy " +
+                                 std::to_string(policy.conceal_slice_errors + 2 * policy.decode_before_irap));
+                    Decoder dec;
+                    dec.set_error_policy(policy);
+                    std::vector<std::pair<double, uint32_t>> frames;
+                    auto take = [&](const std::vector<Picture*>& pics) {
+                        for (const Picture* p : pics) frames.push_back({p->tag, p->flags});
+                    };
+                    for (size_t i = 0; i < chunks.size(); i++) {
+                        if (chunks[i].empty()) continue;
+                        EXPECT_EQ(dec.feed(chunks[i].data(), chunks[i].size(), static_cast<double>(i)),
+                                  DecodeStatus::OK);
+                        take(dec.drain());
+                    }
+                    take(dec.flush());
+                    std::map<double, int> uses;
+                    for (const auto& f : frames) uses[f.first]++;
+                    for (const auto& f : frames) {
+                        if (uses[f.first] < 2) continue;
+                        EXPECT_TRUE(header_bits && policy.conceal_slice_errors) << "tag " << f.first << " repeated";
+                        EXPECT_TRUE(f.second & PICTURE_CORRUPT) << "tag " << f.first << " repeated, not flagged";
+                    }
+                }
+            }
+        }
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(Fixtures, CorruptionCorpus,

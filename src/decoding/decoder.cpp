@@ -7,6 +7,7 @@
 #include "common/debug.h"
 
 #include <algorithm>
+#include <cmath>
 #include <exception>
 #include <cstring>
 #include <cstdio>
@@ -29,6 +30,7 @@ int ceil_log2(int x) {
 // ============================================================
 
 DecodeStatus Decoder::decode(const uint8_t* data, size_t size) {
+    feed_seq_++;
     NalParser parser;
     auto nals = parser.parse(data, size);
 
@@ -206,8 +208,14 @@ Decoder::SliceFit Decoder::fit_pending(const SlicePeek& pk, NalUnitType nut,
     if (pk.first_slice) {
         // §8.3.1: POC is unique within a CVS. A first slice naming the pending
         // picture's POC is not another picture (a corrupt or repeated one).
-        return same_poc && pk.pps_id == pend_.pps_id && !is_irap(nut) ? SliceFit::STRAY
-                                                                       : SliceFit::NEW;
+        if (same_poc && pk.pps_id == pend_.pps_id && !is_irap(nut)) return SliceFit::STRAY;
+        // An IDR's first segment arriving after its other segments, in the
+        // tagged input unit that started the picture without it: out of
+        // order, it cannot be merged back.
+        if (!pend_.first_slice && !pk.has_poc && !pend_.has_poc && nut == pend_.nut &&
+            pk.pps_id == pend_.pps_id && same_tagged_unit(pend_.tag))
+            return SliceFit::STRAY;
+        return SliceFit::NEW;
     }
     // §7.4.2.4.5: the segments of a picture share its PPS and POC ...
     if (pk.pps_id != pend_.pps_id) return SliceFit::NEW;
@@ -244,6 +252,13 @@ void Decoder::process_vcl(const NalUnit& nal) {
                 drop_stray_segment(pk);
                 return;
             case SliceFit::NEW:
+                // A picture cannot begin without its first segment in the
+                // middle of a tagged input unit that already carries one
+                // (one access unit per tag): a corrupt segment header.
+                if (!pk.first_slice && same_tagged_unit(pend_.tag)) {
+                    drop_stray_segment(pk);
+                    return;
+                }
                 break;
             }
         } else if (deferred_ps_.empty()) {
@@ -261,9 +276,7 @@ void Decoder::process_vcl(const NalUnit& nal) {
         const bool sets_changed = !deferred_ps_.empty();
         finish_picture();
         if (sets_changed) peeked = try_peek_slice(nal, pk);
-    } else if (peeked && !pk.first_slice &&
-               std::find(done_sigs_.begin(), done_sigs_.end(), sig) != done_sigs_.end()) {
-        // A repeat of a segment of the picture just completed
+    } else if (peeked && repeats_done_picture(pk, nut, sig)) {
         drop_stray_segment(pk);
         return;
     }
@@ -287,6 +300,30 @@ void Decoder::process_vcl(const NalUnit& nal) {
         return;
     }
     start_picture(nal, pk, sig);
+}
+
+bool Decoder::same_tagged_unit(double tag) const {
+    return !std::isnan(feed_tag_) && feed_tag_ == tag;
+}
+
+bool Decoder::repeats_done_picture(const SlicePeek& pk, NalUnitType nut, const SegmentSig& sig) const {
+    if (done_sigs_.empty()) return false;
+    if (!pk.first_slice)
+        // A segment of the picture just completed cannot start a picture;
+        // neither can a segment of the tagged unit that carried it.
+        return std::find(done_sigs_.begin(), done_sigs_.end(), sig) != done_sigs_.end() ||
+               same_tagged_unit(done_tag_);
+    // The first segment of a picture finished without it (an IDR's segments
+    // out of order within their tagged input unit): too late to merge back.
+    if (!done_first_ && !pk.has_poc && !done_has_poc_ && nut == done_nut_ &&
+        pk.pps_id == done_pps_id_ && same_tagged_unit(done_tag_))
+        return true;
+    // Its first segment again: a duplicate when it comes with the same input
+    // (same tag, or the same untagged feed() call). Fed separately, the same
+    // bytes are another picture — an IDR repeated as a still image.
+    if (!done_first_ || !(done_sigs_.front() == sig)) return false;
+    return std::isnan(feed_tag_) ? std::isnan(done_tag_) && feed_seq_ == done_feed_seq_
+                                 : feed_tag_ == done_tag_;
 }
 
 void Decoder::add_segment(const NalUnit& nal, const SlicePeek& pk, const SegmentSig& sig) {
@@ -313,6 +350,9 @@ void Decoder::begin_skip(const SlicePeek& peek, NalUnitType nut, const SegmentSi
     pend_.next_ctb_ts = peek.address_ts + 1;
     pend_.last_start_ts = peek.address_ts;
     pend_.sigs.assign(1, sig);
+    pend_.first_slice = peek.first_slice;
+    pend_.tag = feed_tag_;
+    pend_.feed_seq = feed_seq_;
     pend_.pic = nullptr;
 }
 
@@ -338,13 +378,13 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek, const Seg
         return;
     }
 
-    // §8.3.1: POC is unique within a CVS. A picture whose first segment was
-    // lost and whose POC is already taken (within the CVS it continues) is a
-    // late, repeated or corrupt segment of that picture, not a picture.
+    // §8.3.1: POC is unique within a CVS. A picture whose POC was already
+    // taken in the CVS it continues (since the last flush) is a late,
+    // repeated or corrupt copy of that picture, not a picture.
     const bool isIRAP = is_irap(nut);
     const bool opens_cvs = is_idr(nut) || is_bla(nut) ||
                            (is_cra(nut) && (handle_cra_as_first_ || no_irap_yet_));
-    if (!first_sh.first_slice_segment_in_pic_flag && !opens_cvs) {
+    if (!opens_cvs) {
         const int32_t taken = dpb_.derive_poc(first_sh, *sps, nut, nal.header.TemporalId(),
                                               false, /*commit=*/false);
         if (std::find(recent_pocs_.begin(), recent_pocs_.end(), std::make_pair(cvs_id_, taken)) !=
@@ -537,6 +577,9 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek, const Seg
     pend_.next_ctb_ts = 0;
     pend_.last_start_ts = peek.address_ts;
     pend_.sigs.assign(1, sig);
+    pend_.first_slice = peek.first_slice;
+    pend_.tag = feed_tag_;
+    pend_.feed_seq = feed_seq_;
     pend_.pic = pic;
     pend_.sps = sps;
     pend_.pps = pps;
@@ -765,6 +808,12 @@ void Decoder::finish_picture() {
         pend_.pic = nullptr;
         done_sigs_.swap(pend_.sigs);
         pend_.sigs.clear();
+        done_first_ = pend_.first_slice;
+        done_tag_ = pend_.tag;
+        done_feed_seq_ = pend_.feed_seq;
+        done_nut_ = pend_.nut;
+        done_pps_id_ = pend_.pps_id;
+        done_has_poc_ = pend_.has_poc;
     }
     if (!deferred_ps_.empty()) {
         std::vector<NalUnit> sets;
@@ -940,8 +989,10 @@ std::vector<Picture*> Decoder::drain() {
 
 std::vector<Picture*> Decoder::flush() {
     finish_picture();
-    // End of the input so far: whatever comes next is not a repeat
+    // End of the input so far: whatever comes next is not a repeat (a
+    // segment re-fed after flush() decodes again)
     done_sigs_.clear();
+    recent_pocs_.clear();
     dpb_.bump_all();
     return dpb_.take_output();
 }

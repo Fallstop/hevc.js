@@ -215,6 +215,9 @@ private:
         int next_ctb_ts = 0;        // tile-scan address just past the decoded segments
         int last_start_ts = -1;     // tile-scan start of the last segment
         std::vector<SegmentSig> sigs;  // every segment received
+        bool first_slice = false;   // sigs[0] is the picture's first segment
+        double tag = 0;             // feed() tag and call that started it
+        uint64_t feed_seq = 0;
         // DECODING only
         Picture* pic = nullptr;
         const SPS* sps = nullptr;
@@ -234,9 +237,21 @@ private:
     // segments arriving after it completed is dropped, not started as a
     // picture of its own. Cleared by flush(), discontinuity() and reset().
     std::vector<SegmentSig> done_sigs_;
-    // (CVS, POC) of the pictures started last: a picture whose first segment
-    // was lost and whose POC is among them is a late or stray segment of
-    // that picture (§8.3.1: POC is unique within a CVS).
+    bool done_first_ = false;
+    double done_tag_ = 0;
+    uint64_t done_feed_seq_ = 0;
+    NalUnitType done_nut_ = NalUnitType::TRAIL_N;
+    uint32_t done_pps_id_ = 0;
+    bool done_has_poc_ = false;
+    // A slice segment repeating the picture just finished (see AD-019)
+    bool repeats_done_picture(const SlicePeek& pk, NalUnitType nut, const SegmentSig& sig) const;
+    // The feed() in progress is tagged with `tag` (never true untagged)
+    bool same_tagged_unit(double tag) const;
+    // decode()/feed() calls so far
+    uint64_t feed_seq_ = 0;
+    // (CVS, POC) of the pictures started last (since the last flush): a
+    // picture continuing a CVS whose POC is among them is a late, repeated
+    // or stray copy of that picture (§8.3.1: POC is unique within a CVS).
     std::vector<std::pair<int32_t, int32_t>> recent_pocs_;
     static constexpr size_t kRecentPocs = 32;
     // Parameter sets that arrived while a picture was being assembled

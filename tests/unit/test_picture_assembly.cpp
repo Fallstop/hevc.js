@@ -501,3 +501,67 @@ TEST(PictureAssembly, ALateSegmentOfAFinishedPictureIsDropped) {
         }
     }
 }
+
+// A whole access unit received twice in one feed() (a duplicating relay) is
+// one picture; the same IDR fed again in a later call — a camera repeating a
+// still image — is another picture each time. A picture re-fed after
+// flush() (a retried segment) decodes again.
+TEST(PictureAssembly, RepeatedAccessUnitsVersusRepeatedStills) {
+    const auto data = read_file(fixture("p_qcif_10f.265"));
+    const auto aus = split_access_units(data);
+    const Output clean = batch(data);
+
+    // Every access unit doubled inside its own feed
+    {
+        Decoder dec;
+        Output got;
+        std::vector<double> tags;
+        for (size_t i = 0; i < aus.size(); i++) {
+            auto twice = aus[i];
+            append(twice, aus[i]);
+            dec.feed(twice.data(), twice.size(), static_cast<double>(i));
+            for (const Picture* p : dec.drain()) { got.pocs.push_back(p->poc); got.luma.push_back(p->plane_bytes[0]); tags.push_back(p->tag); }
+        }
+        for (const Picture* p : dec.flush()) { got.pocs.push_back(p->poc); got.luma.push_back(p->plane_bytes[0]); tags.push_back(p->tag); }
+        EXPECT_EQ(got.pocs, clean.pocs);
+        EXPECT_EQ(got.luma, clean.luma);
+        EXPECT_TRUE(unique(tags));
+        EXPECT_EQ(dec.stats().nal_errors, aus.size());
+    }
+    // The IDR fed five times, tagged and untagged
+    for (bool tagged : {true, false}) {
+        Decoder dec;
+        size_t frames = 0;
+        for (int i = 0; i < 5; i++) {
+            if (tagged) dec.feed(aus[0].data(), aus[0].size(), static_cast<double>(i));
+            else dec.feed(aus[0].data(), aus[0].size());
+            for (const Picture* p : dec.drain()) {
+                frames++;
+                EXPECT_EQ(p->plane_bytes[0], clean.luma[0]);
+                if (tagged) EXPECT_EQ(p->tag, static_cast<double>(i));
+            }
+        }
+        frames += dec.flush().size();
+        EXPECT_EQ(frames, 5u) << (tagged ? "tagged" : "untagged");
+    }
+    // A CRA-led segment, flushed, then fed again
+    {
+        const auto cra = split_access_units(read_file(fixture("opengop_qcif_cra_first.265")));
+        Decoder dec;
+        std::vector<int32_t> first, second;
+        for (size_t i = 0; i < cra.size(); i++) {
+            dec.feed(cra[i].data(), cra[i].size(), static_cast<double>(i));
+            for (const Picture* p : dec.drain()) first.push_back(p->poc);
+        }
+        for (const Picture* p : dec.flush()) first.push_back(p->poc);
+        for (size_t i = 0; i < cra.size(); i++) {
+            dec.feed(cra[i].data(), cra[i].size(), 100.0 + static_cast<double>(i));
+            for (const Picture* p : dec.drain()) second.push_back(p->poc);
+        }
+        for (const Picture* p : dec.flush()) second.push_back(p->poc);
+        ASSERT_EQ(first.size(), 4u);
+        // Every picture of the first pass comes out again
+        for (int32_t poc : first)
+            EXPECT_NE(std::find(second.begin(), second.end(), poc), second.end()) << "POC " << poc;
+    }
+}
