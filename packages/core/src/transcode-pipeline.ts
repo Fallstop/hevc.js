@@ -94,8 +94,9 @@ export class TranscodePipeline {
       this._decoder.feed(nalBuffer);
     }
 
-    // 3. Drain decoded frames
-    const frames = this._decoder.drain();
+    // 3. Flush the segment's frames: the output process holds pictures for
+    //    reordering, and the segment ends on an access-unit boundary
+    const frames = this._decoder.flush();
     if (frames.length === 0) return;
 
     // 4-8. Encode, mux, append to MSE

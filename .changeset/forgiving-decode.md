@@ -15,6 +15,10 @@ Forgiving decode for damaged and non-standard streams.
   next IRAP, and decode pictures before the first IRAP (opt-in; the default is
   unchanged and bit-exact).
 - `discontinuity()`: declare a splice/seek/gap without resetting the decoder.
+- `flushViews()`: zero-copy `flush()`. Output now follows §C.5.2 exactly, so
+  `drain()` holds up to `sps_max_num_reorder_pics` pictures for reordering;
+  `SegmentTranscoder` and `TranscodePipeline` flush at each segment end (the
+  references are kept) so every segment still yields all of its frames.
 - Hardening: spec-range validation of parameter sets, slice headers and CABAC
   values; corrupt parameter sets and SEI are contained; full VUI/HRD parsing;
   pictures are assembled across interleaved SEI/filler and across feed()
