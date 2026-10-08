@@ -964,6 +964,7 @@ void Decoder::discontinuity() {
     done_sigs_.clear();
     recent_pocs_.clear();
     dpb_.discontinuity();
+    last_picture_.reset();
     // §8.1: the next IRAP opens a new CVS — a CRA takes NoRaslOutputFlag = 1
     no_irap_yet_ = true;
     handle_cra_as_first_ = true;

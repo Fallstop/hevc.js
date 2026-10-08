@@ -172,9 +172,10 @@ public:
     static constexpr int kMaxDpbPictures = 16;
 
     // Stream discontinuity (splice / seek / packet gap): every stored picture
-    // stops being a reference, so nothing decoded afterwards can predict from
-    // it, and every picture still awaiting output is bumped to the output
-    // queue. Storage, POC state and parameter sets are kept.
+    // stops being a reference and is no longer a concealment source, so
+    // nothing decoded afterwards can predict from it, and every picture still
+    // awaiting output is bumped to the output queue. Storage, POC state and
+    // parameter sets are kept.
     void discontinuity();
 
     // Reset all decode state to a freshly-constructed condition: drops every
@@ -227,11 +228,12 @@ public:
     // picture" — inter prediction of the current picture reads a missing ref.
     bool has_missing_curr_refs() const;
 
-    // Error concealment: the stored picture nearest to `target_poc` that can
-    // stand in for `cur` (same format, not `cur`). Within cur's CVS the
-    // nearest POC wins (ties: the more recently decoded); otherwise the most
-    // recently decoded picture. `fallback` (a picture kept alive outside the
-    // DPB) is considered too. nullptr if nothing fits.
+    // Error concealment: the reference picture nearest to `target_poc` that
+    // can stand in for `cur` (same format, not `cur`, decoded after the last
+    // discontinuity()). Within cur's CVS the nearest POC wins (ties: the more
+    // recently decoded); otherwise the most recently decoded picture.
+    // `fallback` (a picture kept alive outside the DPB) is considered too.
+    // nullptr if nothing fits.
     Picture* concealment_source(const Picture& cur, int32_t target_poc,
                                 Picture* fallback = nullptr) const;
 
@@ -282,6 +284,9 @@ private:
     std::vector<bool> sub_lt_curr_;
 
     uint64_t decode_counter_ = 0;
+    // Pictures decoded at or before the last discontinuity()/reset() never
+    // stand in for later ones
+    uint64_t cut_decode_order_ = 0;
 
     // RPS lists (§8.3.2) — pictures from the DPB
     // "StCurrBefore" = short-term, used by current, POC < current

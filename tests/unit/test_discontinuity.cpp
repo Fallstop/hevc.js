@@ -141,3 +141,70 @@ TEST(Discontinuity, SpliceKeepsParameterSetsAndTags) {
         EXPECT_EQ(b_out.tags[i], 1000.0 + static_cast<double>(i));
     }
 }
+
+// With concealment, nothing decoded before the cut stands in for anything
+// after it either — not as a substituted reference, not as the source of
+// concealed CTUs. Whatever is fed after discontinuity() decodes exactly as it
+// does on a fresh decoder that was given the parameter sets.
+TEST(Discontinuity, ConcealmentNeverReachesAcrossTheCut) {
+    const auto a = split_access_units(read_file(fixture("p_qcif_10f.265")));
+    const auto ms = split_access_units(read_file(fixture("multislice_qcif_8f.265")));
+    const auto cam = split_access_units(read_file(fixture("camera_qcif_12f.265")));
+
+    auto non_vcl = [](const std::vector<uint8_t>& au) {
+        NalParser parser;
+        std::vector<uint8_t> out;
+        for (const auto& nal : parser.parse(au.data(), au.size()))
+            if (!is_vcl(nal.header.nal_unit_type)) { auto c = nal_chunk(au, nal); out.insert(out.end(), c.begin(), c.end()); }
+        return out;
+    };
+    // The multi-slice IDR without its last slice
+    std::vector<uint8_t> idr_cut;
+    {
+        NalParser parser;
+        const auto nals = parser.parse(ms[0].data(), ms[0].size());
+        size_t nvcl = 0, k = 0;
+        for (const auto& nal : nals) nvcl += is_vcl(nal.header.nal_unit_type);
+        for (const auto& nal : nals) {
+            if (is_vcl(nal.header.nal_unit_type) && ++k == nvcl) break;
+            auto c = nal_chunk(ms[0], nal);
+            idr_cut.insert(idr_cut.end(), c.begin(), c.end());
+        }
+    }
+    // Camera stream joined at its first P picture
+    std::vector<std::vector<uint8_t>> cam_join = {non_vcl(cam[0])};
+    cam_join.insert(cam_join.end(), cam.begin() + 1, cam.end());
+
+    struct Case {
+        const char* what;
+        const std::vector<std::vector<uint8_t>>* before;
+        std::vector<std::vector<uint8_t>> after;
+        ErrorPolicy policy;
+    };
+    ErrorPolicy conceal;
+    conceal.conceal_slice_errors = true;
+    ErrorPolicy both = conceal;
+    both.decode_before_irap = true;
+    const Case cases[] = {
+        {"IDR missing its last slice", &ms, {idr_cut}, conceal},
+        {"stream joined at a P picture", &a, cam_join, both},
+    };
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.what);
+        Decoder fresh;
+        fresh.set_error_policy(c.policy);
+        Out want = feed_aus(fresh, c.after, 0, c.after.size());
+        want.add(fresh.flush());
+        ASSERT_FALSE(want.luma.empty());
+
+        Decoder dec;
+        dec.set_error_policy(c.policy);
+        feed_aus(dec, *c.before, 0, c.before->size());
+        dec.discontinuity();
+        dec.drain();
+        Out got = feed_aus(dec, c.after, 0, c.after.size());
+        got.add(dec.flush());
+        EXPECT_EQ(got.pocs, want.pocs);
+        EXPECT_EQ(got.luma, want.luma);
+    }
+}

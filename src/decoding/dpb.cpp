@@ -746,7 +746,7 @@ Picture* DPB::concealment_source(const Picture& cur, int32_t target_poc,
     Picture* best = nullptr;
     bool best_same_cvs = false;
     auto better = [&](Picture* p) {
-        if (!p || p == &cur || !p->same_format(cur)) return;
+        if (!p || p == &cur || !p->same_format(cur) || p->decode_order <= cut_decode_order_) return;
         const bool same_cvs = p->cvs_id == cur.cvs_id;
         if (!best) { best = p; best_same_cvs = same_cvs; return; }
         if (same_cvs != best_same_cvs) {
@@ -761,7 +761,11 @@ Picture* DPB::concealment_source(const Picture& cur, int32_t target_poc,
             best = p;
         }
     };
-    for (const auto& pic : pictures_) better(pic.get());
+    // Reference pictures only: a non-reference picture stays in storage
+    // until the caller has drained it, so considering it would make the
+    // concealed samples depend on when the caller drains.
+    for (const auto& pic : pictures_)
+        if (pic->is_reference()) better(pic.get());
     better(fallback);
     return best;
 }
@@ -817,6 +821,7 @@ Picture* DPB::find_by_poc_lsb(int32_t poc_lsb, int32_t max_poc_lsb) const {
 }
 
 void DPB::discontinuity() {
+    cut_decode_order_ = decode_counter_;
     for (auto& pic : pictures_) {
         pic->used_for_short_term_ref = false;
         pic->used_for_long_term_ref = false;
@@ -844,6 +849,7 @@ void DPB::reset() {
     current_pic_ = nullptr;
     output_queue_.clear();
     pictures_bumped_ = 0;
+    cut_decode_order_ = decode_counter_;
 
     // §8.3.1 POC carry-over ("prevTid0Pic"). Leaving these stale corrupts POCs
     // (and therefore reference selection) silently, with no crash. The

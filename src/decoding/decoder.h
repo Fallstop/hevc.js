@@ -44,7 +44,8 @@ struct ErrorPolicy {
     // Conceal instead of dropping. When a slice fails after the picture's
     // first slice header decoded, or the slices do not cover the picture, the
     // undecoded CTUs are filled with the co-located samples of the nearest-POC
-    // available picture (mid-grey if none), excluded from deblocking/SAO, and
+    // reference picture or the previous picture (mid-grey if none; never one
+    // decoded before a discontinuity()), excluded from deblocking/SAO, and
     // the picture is kept as a reference and output with PICTURE_CORRUPT —
     // skip-to-next-IRAP is armed only when the first slice header itself is
     // undecodable. A missing reference picture is substituted by the nearest

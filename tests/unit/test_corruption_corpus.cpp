@@ -25,10 +25,23 @@ struct RunResult {
     size_t corrupt_frames = 0;
     size_t max_dpb = 0;
     std::vector<double> tags;  // output order
+    std::vector<uint64_t> frame_hashes;  // POC, flags and samples, output order
     DecodeStats stats;
 };
 
-RunResult run(const std::vector<uint8_t>& data, const ErrorPolicy& policy) {
+uint64_t frame_hash(const Picture* p) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+    mix(static_cast<uint64_t>(static_cast<uint32_t>(p->poc)));
+    mix(p->flags);
+    for (const auto& plane : p->plane_bytes)
+        for (uint8_t b : plane) mix(b);
+    return h;
+}
+
+// drain: drain after every chunk (the live path); otherwise only flush at the
+// end — the output must not depend on it.
+RunResult run(const std::vector<uint8_t>& data, const ErrorPolicy& policy, bool drain = true) {
     RunResult r;
     auto chunks = hevc_fuzz::split_chunks(data);
     Decoder dec;
@@ -47,11 +60,12 @@ RunResult run(const std::vector<uint8_t>& data, const ErrorPolicy& policy) {
             EXPECT_LT(p->tag, static_cast<double>(fed));
             EXPECT_EQ(p->tag, static_cast<double>(static_cast<size_t>(p->tag)));
             r.tags.push_back(p->tag);
+            r.frame_hashes.push_back(frame_hash(p));
         }
     };
     for (size_t i = 0; i < chunks.size(); i++) {
         EXPECT_EQ(dec.feed(chunks[i].data(), chunks[i].size(), static_cast<double>(i)), DecodeStatus::OK);
-        take(dec.drain(), i + 1);
+        if (drain) take(dec.drain(), i + 1);
         r.max_dpb = std::max(r.max_dpb, dec.dpb().pictures().size());
     }
     take(dec.flush(), chunks.size());
@@ -105,6 +119,8 @@ TEST_P(CorruptionCorpus, RandomMutationsAreContained) {
         RunResult c = run(data, conceal);
         check_run(d, data, "default");
         check_run(c, data, "conceal");
+        // Concealed samples never depend on when the caller drains
+        EXPECT_EQ(run(data, conceal, /*drain=*/false).frame_hashes, c.frame_hashes);
         EXPECT_EQ(d.corrupt_frames, 0u);
         agg.default_frames += d.frames;
         agg.conceal_frames += c.frames;
