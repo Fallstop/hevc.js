@@ -301,7 +301,8 @@ export class HEVCDecoder {
    *
    * LIFETIME — the returned views (and all their planes) alias the live WASM
    * heap and are **invalidated by the next decoder call** on this decoder:
-   * `decode()`, `feed()`, `drain()`, `drainViews()`, `flush()`, `reset()`, or
+   * `decode()`, `feed()`, `drain()`, `drainViews()`, `flush()`, `flushViews()`,
+   * `reset()`, `discontinuity()`, or
    * `destroy()`. Any of these may overwrite, free, or — under
    * `ALLOW_MEMORY_GROWTH` — *detach* the underlying `ArrayBuffer`. They must be
    * consumed **synchronously** before any such call or any other WASM-heap
@@ -451,6 +452,30 @@ export class HEVCDecoder {
     } finally {
       m._free(countPtr);
     }
+  }
+
+  /**
+   * Zero-copy variant of {@link flush}: every remaining frame, in display
+   * order, as views into the WASM heap with the same lifetime rules as
+   * {@link drainViews}. Like `flush()`, decoding continues afterwards with the
+   * references kept, so a segment-at-a-time consumer can flush at each segment
+   * end to get all of that segment's frames.
+   */
+  flushViews(): HEVCFrameView[] {
+    this._gen++; // drains the DPB and may overwrite the heap
+    if (this._api.flush(this._dec) !== 0) return [];
+    const m = this._m;
+    const views: HEVCFrameView[] = [];
+    const framePtr = m._malloc(FRAME_STRUCT.SIZE);
+    try {
+      for (let i = 0; ; i++) {
+        if (this._api.getDrainedFrame(this._dec, i, framePtr) !== 0) break;
+        views.push(this._readFrameView(framePtr));
+      }
+    } finally {
+      m._free(framePtr);
+    }
+    return views;
   }
 
   /**

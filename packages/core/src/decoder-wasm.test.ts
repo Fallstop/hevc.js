@@ -211,4 +211,35 @@ describe("HEVCDecoder (real WASM)", () => {
     expect(dec.stats.skippedWaitIrap).toBe(4);
     dec.destroy();
   });
+
+  it("flushViews() at a segment end hands over the frames held for reordering", async (ctx) => {
+    if (!available) ctx.skip();
+    const aus = accessUnits(fixture("opengop_qcif_12f.265"));
+    const { frames: whole } = await decodeTagged(aus);
+    const cut = 5; // the second CRA opens the next segment
+    const dec = await HEVCDecoder.create();
+    const tags: number[] = [];
+    const segment = (from: number, to: number): number => {
+      for (let i = from; i < to; i++) {
+        dec.feed(aus[i]!, i * 1000 + 0.5);
+        tags.push(...dec.drain().map((f) => f.tag));
+      }
+      const views = dec.flushViews();
+      for (const v of views) {
+        expect(v.isValid()).toBe(true);
+        tags.push(v.tag);
+      }
+      return views.length;
+    };
+    expect(segment(0, cut)).toBeGreaterThan(0);
+    // Every access unit of the first segment is out before the next is fed
+    expect([...tags].sort((a, b) => a - b)).toEqual(
+      aus.slice(0, cut).map((_, i) => i * 1000 + 0.5),
+    );
+    segment(cut, aus.length);
+    // References survive the flush: the second segment (RASL included)
+    // decodes exactly as in one pass
+    expect(tags).toEqual(whole.map((f) => f.tag));
+    dec.destroy();
+  });
 });
