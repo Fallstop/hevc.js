@@ -22,6 +22,18 @@ enum class DecodeStatus {
     ERROR,
 };
 
+// Running counters since construction / reset(). See hevc_api.h
+// (HEVCDecodeStats) for the meaning of each.
+struct DecodeStats {
+    uint32_t pictures_decoded = 0;
+    uint32_t pictures_output = 0;
+    uint32_t skipped_wait_irap = 0;
+    uint32_t skipped_rasl = 0;
+    uint32_t skipped_error = 0;
+    uint32_t concealed = 0;
+    uint32_t nal_errors = 0;
+};
+
 class Decoder {
 public:
     Decoder() = default;
@@ -64,6 +76,12 @@ public:
     // Get DPB (for testing)
     const DPB& dpb() const { return dpb_; }
 
+    // Decode counters (since construction or the last reset()).
+    DecodeStats stats() const;
+
+    // Parameter sets (for testing)
+    const ParameterSetManager& parameter_sets() const { return ps_mgr_; }
+
     // Recovery-point SEI state (§D.3.8 — gradual decoding refresh).
     //
     // True once a recovery_point SEI has been seen since the last fresh start /
@@ -87,6 +105,7 @@ private:
     ParameterSetManager ps_mgr_;
     DPB dpb_;
     DPB::OutputLimits output_limits_;
+    DecodeStats stats_;
 
     // Output pictures (accumulated across all decoded pictures)
     std::vector<Picture*> output_pics_;

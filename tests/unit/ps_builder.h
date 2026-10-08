@@ -36,6 +36,8 @@ struct SpsSpec {
     std::function<void(BitWriter&)> vui;
     bool extension_present = false;
     bool range_extension = false;
+    // The 9 sps_range_extension() flags, MSB first (bit 3 = intra_smoothing_disabled_flag)
+    uint32_t range_flags = 0;
     // Bits written after the extension flags, before rbsp_trailing_bits
     std::function<void(BitWriter&)> tail;
     bool trailing = true;
@@ -113,7 +115,7 @@ inline std::vector<uint8_t> build_sps_rbsp(const SpsSpec& s) {
         w.put_bit(0);
         w.put_bit(0);
         w.put_bits(0, 5);
-        if (s.range_extension) w.put_bits(0, 9);
+        if (s.range_extension) w.put_bits(s.range_flags, 9);
     }
     if (s.tail) s.tail(w);
     if (s.trailing) w.trailing();

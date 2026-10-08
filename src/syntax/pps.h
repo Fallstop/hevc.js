@@ -81,9 +81,15 @@ struct PPS {
 
     // True once derive() succeeded for the SPS it was last run against.
     bool derived_valid = false;
+    // ParameterSetManager generation of the SPS derive() last ran against
+    // (0 = never): a replaced SPS invalidates the tile tables.
+    uint32_t derived_sps_generation = 0;
 
     // Parse from bitstream (syntax + range checks), then derive() against sps.
     bool parse(BitstreamReader& bs, const SPS& sps);
+
+    // Parse the RBSP syntax and its SPS-independent range checks only.
+    bool parse_rbsp(BitstreamReader& bs);
 
     // SPS-dependent range checks and derived tables (QG size, tile scan).
     bool derive(const SPS& sps);

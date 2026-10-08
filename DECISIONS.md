@@ -161,3 +161,37 @@ throw, which fails the slice exactly like a bitstream over-read.
 - `NumPicTotalCurr == 0` on a P/B slice is *not* refused (upstream refuses it):
   the list builder already terminates and the PUs conceal, which keeps the
   picture.
+
+## AD-012 : Non-VCL failures are contained; the previous valid set stays in force
+
+**Context**: `Decoder::decode` caught exceptions per picture, but parameter-set
+and SEI processing sat outside that `try`: a truncated SPS threw out of
+`feed()` and the rest of the buffer was lost. The VUI skipper stopped at HRD
+parameters and then read the SPS extension flags out of HRD data. An invalid
+conformance window rejected the whole SPS. A PPS parsed against one SPS kept
+its tile tables when that SPS was replaced by one of another size (out-of-bounds
+CTB-address lookups).
+
+**Decision**:
+- VPS/SPS/PPS/SEI processing is wrapped in `try`; a set that fails to parse is
+  counted (`nal_errors`) and dropped. Sets are only stored once fully parsed, so
+  the previous valid set with that id remains active.
+- `hrd_parameters()` / `sub_layer_hrd_parameters()` (§E.2.2/E.2.3) and the full
+  VUI (§E.2.1) are parsed, for the SPS and the VPS. If the VUI does not parse —
+  over-read or out-of-range value — it is retried with the alternative layout
+  some encoders write (default display window flag set, offsets absent, as
+  libavcodec does); if that fails too the SPS is kept with the extension flags
+  at their inferred 0 (`SPS::vui_tolerated`). The extension flags are also
+  ignored when the RBSP does not end where they do, i.e. when they are really
+  mis-read VUI bits.
+- An invalid conformance window is zeroed (no cropping), not rejected.
+- The PPS syntax is parsed independently of the SPS (§7.3.2.3 has no SPS
+  dependency). SPS-dependent checks and the tile tables are derived against the
+  SPS *generation* the PPS was last derived for; storing an SPS bumps its
+  generation, and activation re-derives any PPS whose generation is stale. A
+  PPS that arrives before its SPS is therefore kept, and an SPS replacement
+  never leaves stale tables.
+
+**Consequence**: a broken VUI can no longer cost a stream, but a stream whose
+range-extension flags sit after a broken VUI loses them — the safe direction
+for Main/Main 10 cameras.

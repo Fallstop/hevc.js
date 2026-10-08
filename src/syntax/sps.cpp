@@ -2,6 +2,7 @@
 #include "bitstream/bitstream_reader.h"
 #include "decoding/cabac_tables.h"  // diag_scan_4x4 / diag_scan_8x8 (up-right diagonal scan)
 #include "common/debug.h"
+#include "syntax/vui.h"
 
 #include <algorithm>
 #include <cstring>
@@ -334,84 +335,6 @@ bool ShortTermRefPicSet::parse(BitstreamReader& bs, int stRpsIdx,
 
 // ---- SPS Parsing ----
 
-// Skip VUI parameters — complex, not needed for basic decoding
-// We just skip to the end of the RBSP
-static void skip_vui_parameters(BitstreamReader& bs) {
-    // aspect_ratio_info_present_flag
-    bool aspect_ratio_info_present = bs.read_flag();
-    if (aspect_ratio_info_present) {
-        uint8_t aspect_ratio_idc = bs.read_bits(8);
-        if (aspect_ratio_idc == 255) {  // EXTENDED_SAR
-            bs.read_bits(16);  // sar_width
-            bs.read_bits(16);  // sar_height
-        }
-    }
-    // overscan_info_present_flag
-    bool overscan_info_present = bs.read_flag();
-    if (overscan_info_present) {
-        bs.read_flag();  // overscan_appropriate_flag
-    }
-    // video_signal_type_present_flag
-    bool video_signal_type_present = bs.read_flag();
-    if (video_signal_type_present) {
-        bs.read_bits(3);  // video_format
-        bs.read_flag();   // video_full_range_flag
-        bool colour_description_present = bs.read_flag();
-        if (colour_description_present) {
-            bs.read_bits(8);   // colour_primaries
-            bs.read_bits(8);   // transfer_characteristics
-            bs.read_bits(8);   // matrix_coeffs
-        }
-    }
-    // chroma_loc_info_present_flag
-    bool chroma_loc_info_present = bs.read_flag();
-    if (chroma_loc_info_present) {
-        bs.read_ue();  // chroma_sample_loc_type_top_field
-        bs.read_ue();  // chroma_sample_loc_type_bottom_field
-    }
-    // neutral_chroma_indication_flag, field_seq_flag, frame_field_info_present_flag
-    bs.read_flag();
-    bs.read_flag();
-    bs.read_flag();
-    // default_display_window_flag
-    bool default_display_window = bs.read_flag();
-    if (default_display_window) {
-        bs.read_ue();  // def_disp_win_left_offset
-        bs.read_ue();  // def_disp_win_right_offset
-        bs.read_ue();  // def_disp_win_top_offset
-        bs.read_ue();  // def_disp_win_bottom_offset
-    }
-    // vui_timing_info_present_flag
-    bool timing_info_present = bs.read_flag();
-    if (timing_info_present) {
-        bs.read_bits(32);  // vui_num_units_in_tick
-        bs.read_bits(32);  // vui_time_scale
-        bool vui_poc_proportional = bs.read_flag();
-        if (vui_poc_proportional) {
-            bs.read_ue();  // vui_num_ticks_poc_diff_one_minus1
-        }
-        bool vui_hrd_parameters_present = bs.read_flag();
-        if (vui_hrd_parameters_present) {
-            // HRD parameters are very complex — skip the rest
-            // This is safe because HRD is not needed for decoding
-            HEVC_LOG(PARSE, "SPS VUI: HRD parameters present, skipping rest of VUI%s", "");
-            return;
-        }
-    }
-    // bitstream_restriction_flag
-    bool bitstream_restriction = bs.read_flag();
-    if (bitstream_restriction) {
-        bs.read_flag();  // tiles_fixed_structure_flag
-        bs.read_flag();  // motion_vectors_over_pic_boundaries_flag
-        bs.read_flag();  // restricted_ref_pic_lists_flag
-        bs.read_ue();    // min_spatial_segmentation_idc
-        bs.read_ue();    // max_bytes_per_pic_denom
-        bs.read_ue();    // max_bits_per_min_cu_denom
-        bs.read_ue();    // log2_max_mv_length_horizontal
-        bs.read_ue();    // log2_max_mv_length_vertical
-    }
-}
-
 // Spec §7.3.2.2.1 — seq_parameter_set_rbsp()
 bool SPS::parse(BitstreamReader& bs) {
     sps_video_parameter_set_id = bs.read_bits(4);
@@ -570,32 +493,78 @@ bool SPS::parse(BitstreamReader& bs) {
     sps_temporal_mvp_enabled_flag = bs.read_flag();
     strong_intra_smoothing_enabled_flag = bs.read_flag();
 
+    // Everything above decides how pictures decode; the VUI and the extension
+    // flags after it are where camera firmware gets the syntax wrong. Neither
+    // may cost the SPS: a VUI that cannot be parsed consistently (over-read,
+    // out-of-range value) or an extension that over-reads keeps the SPS with
+    // the extension flags at their inferred 0.
     vui_parameters_present_flag = bs.read_flag();
+    bool tail_trusted = true;
     if (vui_parameters_present_flag) {
-        skip_vui_parameters(bs);
+        bool vui_ok = false;
+        try {
+            vui_ok = parse_vui_parameters(bs, sps_max_sub_layers_minus1, vui);
+        } catch (...) {
+            vui_ok = false;
+        }
+        if (!vui_ok) {
+            HEVC_LOG(PARSE, "SPS %u: VUI unparseable, keeping SPS without extensions",
+                     sps_seq_parameter_set_id);
+            vui = VuiParameters{};
+            vui_tolerated = true;
+            tail_trusted = false;
+        }
     }
 
-    bool sps_extension_present_flag = bs.read_flag();
-    if (sps_extension_present_flag) {
-        bool sps_range_extension_flag = bs.read_flag();
-        /*bool sps_multilayer_extension_flag =*/ bs.read_flag();
-        /*bool sps_3d_extension_flag =*/ bs.read_flag();
-        /*bool sps_extension_5bits =*/ bs.read_bits(5);
-        if (sps_range_extension_flag) {
-            /*bool transform_skip_rotation_enabled_flag =*/ bs.read_flag();
-            /*bool transform_skip_context_enabled_flag =*/ bs.read_flag();
-            /*bool implicit_rdpcm_enabled_flag =*/ bs.read_flag();
-            /*bool explicit_rdpcm_enabled_flag =*/ bs.read_flag();
-            /*bool extended_precision_processing_flag =*/ bs.read_flag();
-            intra_smoothing_disabled_flag = bs.read_flag();
-            /*bool high_precision_offsets_enabled_flag =*/ bs.read_flag();
-            /*bool persistent_rice_adaptation_enabled_flag =*/ bs.read_flag();
-            cabac_bypass_alignment_enabled_flag = bs.read_flag();
+    if (tail_trusted) {
+        BitstreamReader ext = bs;
+        bool ext_ok = true;
+        bool range_flags[9] = {};
+        bool sps_range_extension_flag = false;
+        bool more_extension_data = false;
+        try {
+            bool sps_extension_present_flag = ext.read_flag();
+            if (sps_extension_present_flag) {
+                sps_range_extension_flag = ext.read_flag();
+                /*bool sps_multilayer_extension_flag =*/ ext.read_flag();
+                /*bool sps_3d_extension_flag =*/ ext.read_flag();
+                uint32_t sps_extension_5bits = ext.read_bits(5);
+                if (sps_range_extension_flag)
+                    for (bool& f : range_flags) f = ext.read_flag();
+                more_extension_data = sps_extension_5bits != 0;
+            }
+        } catch (...) {
+            ext_ok = false;
+        }
+        // The SPS has to end right here (rbsp_trailing_bits) unless further
+        // extension data follows. Ending elsewhere means the VUI was mis-read,
+        // and the "flags" are VUI bits — do not let them switch on RExt tools.
+        if (ext_ok && !more_extension_data && ext.more_rbsp_data()) ext_ok = false;
+        if (ext_ok && sps_range_extension_flag) {
+            // transform_skip_rotation, transform_skip_context, implicit_rdpcm,
+            // explicit_rdpcm, extended_precision_processing, intra_smoothing_disabled,
+            // high_precision_offsets, persistent_rice_adaptation, cabac_bypass_alignment
+            intra_smoothing_disabled_flag = range_flags[5];
+            cabac_bypass_alignment_enabled_flag = range_flags[8];
+        }
+        if (!ext_ok) {
+            HEVC_LOG(PARSE, "SPS %u: extension does not parse, ignoring it", sps_seq_parameter_set_id);
+            vui_tolerated = true;
         }
     }
 
     // Compute derived values
     derive();
+
+    // §7.4.3.2.1 requires the conformance window to leave a picture. Some
+    // encoders write one that does not; like libavcodec, ignore the cropping
+    // rather than lose the stream.
+    if (conformance_window_flag && !conformance_window_valid()) {
+        HEVC_LOG(PARSE, "SPS %u: invalid conformance window ignored", sps_seq_parameter_set_id);
+        conformance_window_flag = false;
+        conf_win_left_offset = conf_win_right_offset = 0;
+        conf_win_top_offset = conf_win_bottom_offset = 0;
+    }
 
     // Reject malformed/hostile dimensions before any allocation downstream.
     if (!validate()) {
@@ -702,24 +671,25 @@ bool SPS::validate() const {
         return false;
     }
 
-    // Conformance window must lie within the picture. Offsets are in chroma
-    // sample units; the cropped region (SubWidthC*(left+right) etc.) must leave
-    // at least one luma sample of picture, matching the spec §7.4.3.2.1
-    // constraint on conf_win_*_offset.
-    if (conformance_window_flag) {
-        const uint64_t crop_w =
-            static_cast<uint64_t>(SubWidthC) *
-            (static_cast<uint64_t>(conf_win_left_offset) + conf_win_right_offset);
-        const uint64_t crop_h =
-            static_cast<uint64_t>(SubHeightC) *
-            (static_cast<uint64_t>(conf_win_top_offset) + conf_win_bottom_offset);
-        if (crop_w >= pic_width_in_luma_samples ||
-            crop_h >= pic_height_in_luma_samples) {
-            return false;
-        }
+    // Conformance window must lie within the picture (parse() zeroes an
+    // invalid one before calling validate()).
+    if (conformance_window_flag && !conformance_window_valid()) {
+        return false;
     }
 
     return true;
+}
+
+// Offsets are in chroma sample units; the cropped region (SubWidthC*(left+right)
+// etc.) must leave at least one luma sample of picture (§7.4.3.2.1).
+bool SPS::conformance_window_valid() const {
+    const uint64_t crop_w =
+        static_cast<uint64_t>(SubWidthC) *
+        (static_cast<uint64_t>(conf_win_left_offset) + conf_win_right_offset);
+    const uint64_t crop_h =
+        static_cast<uint64_t>(SubHeightC) *
+        (static_cast<uint64_t>(conf_win_top_offset) + conf_win_bottom_offset);
+    return crop_w < pic_width_in_luma_samples && crop_h < pic_height_in_luma_samples;
 }
 
 } // namespace hevc

@@ -13,8 +13,13 @@ namespace hevc {
         }                                                           \
     } while (0)
 
-// Spec §7.3.2.3.1 — pic_parameter_set_rbsp()
 bool PPS::parse(BitstreamReader& bs, const SPS& sps) {
+    return parse_rbsp(bs) && derive(sps);
+}
+
+// Spec §7.3.2.3.1 — pic_parameter_set_rbsp(). The syntax does not depend on
+// the SPS; only derive() does.
+bool PPS::parse_rbsp(BitstreamReader& bs) {
     pps_pic_parameter_set_id = bs.read_ue();
     pps_seq_parameter_set_id = bs.read_ue();
     // §7.4.3.3.1: ids index the 64-entry PPS / 16-entry SPS stores
@@ -153,7 +158,8 @@ bool PPS::parse(BitstreamReader& bs, const SPS& sps) {
         }
     }
 
-    return derive(sps);
+    derived_valid = false;
+    return true;
 }
 
 // SPS-dependent derivation and range checks. Re-run whenever the SPS this PPS

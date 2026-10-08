@@ -139,6 +139,9 @@ public:
     // pictures stay allocated until the next alloc_picture().
     std::vector<Picture*> take_output();
 
+    // Pictures released by the output process since construction / reset().
+    uint64_t pictures_bumped() const { return pictures_bumped_; }
+
     // Pictures bumped but not yet handed off, in output order.
     const std::vector<Picture*>& output_queue() const { return output_queue_; }
 
@@ -192,6 +195,7 @@ private:
 
     // Bumped pictures awaiting hand-off (§C.5.2), in output order
     std::vector<Picture*> output_queue_;
+    uint64_t pictures_bumped_ = 0;
 
     // Pictures occupying DPB storage (§C.5.2.2): reference or awaiting output,
     // excluding the current picture and pictures already bumped.

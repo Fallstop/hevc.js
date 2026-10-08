@@ -1,6 +1,7 @@
 #include "syntax/vps.h"
 #include "bitstream/bitstream_reader.h"
 #include "common/debug.h"
+#include "syntax/vui.h"
 
 namespace hevc {
 
@@ -53,16 +54,15 @@ bool VPS::parse(BitstreamReader& bs) {
             bs.read_ue();  // vps_num_ticks_poc_diff_one_minus1
         }
         uint32_t vps_num_hrd_parameters = bs.read_ue();
+        // §7.4.3.1: 0..vps_num_layer_sets_minus1 + 1
+        if (vps_num_hrd_parameters > static_cast<uint32_t>(vps_num_layer_sets_minus1) + 1)
+            return false;
         for (uint32_t i = 0; i < vps_num_hrd_parameters; i++) {
             bs.read_ue();  // hrd_layer_set_idx[i]
-            if (i > 0) {
-                bs.read_flag();  // cprms_present_flag[i]
-            }
-            // Skip hrd_parameters() — complex, not needed for decoding
-            // For now, if HRD params are present, we just stop parsing VPS here
-            // This is safe because VPS extension data is not critical
-            HEVC_LOG(PARSE, "VPS: HRD parameters present, skipping rest of VPS%s", "");
-            break;
+            bool cprms_present_flag = true;  // inferred 1 for i == 0
+            if (i > 0) cprms_present_flag = bs.read_flag();
+            if (!parse_hrd_parameters(bs, cprms_present_flag, vps_max_sub_layers_minus1))
+                return false;
         }
     }
 

@@ -43,6 +43,11 @@ public:
     const SPS* active_sps() const { return (active_sps_id_ >= 0) ? get_sps(active_sps_id_) : nullptr; }
     const PPS* active_pps() const { return (active_pps_id_ >= 0) ? get_pps(active_pps_id_) : nullptr; }
 
+    // Look up a PPS for activation by a slice, (re-)deriving it against its
+    // SPS when that SPS changed since. nullptr if either is missing or they
+    // are inconsistent.
+    const PPS* activate(int pps_id);
+
     // Forget all stored parameter sets and the active selection. Use when
     // switching to a stream that supplies its own VPS/SPS/PPS; do NOT call
     // when seeking within a stream whose parameter sets were sent once,
@@ -51,6 +56,7 @@ public:
         for (auto& v : vps_) v.reset();
         for (auto& s : sps_) s.reset();
         for (auto& p : pps_) p.reset();
+        sps_generation_.fill(0);
         active_sps_id_ = -1;
         active_pps_id_ = -1;
     }
@@ -59,6 +65,10 @@ private:
     std::array<std::optional<VPS>, 16> vps_;
     std::array<std::optional<SPS>, 16> sps_;
     std::array<std::optional<PPS>, 64> pps_;
+    // Bumped whenever an SPS id is (re)stored; PPS::derived_sps_generation
+    // records which one its derived tables belong to.
+    std::array<uint32_t, 16> sps_generation_ = {};
+    uint32_t generation_counter_ = 0;
 
     int active_sps_id_ = -1;
     int active_pps_id_ = -1;

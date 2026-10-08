@@ -476,6 +476,7 @@ Picture* DPB::bump() {
         smallest->needed_for_output = false;  // §C.5.2.4 step 2
         smallest->output_queued = true;
         output_queue_.push_back(smallest);
+        pictures_bumped_++;
     }
     return smallest;
 }
@@ -642,6 +643,7 @@ void DPB::reset() {
     pictures_.clear();
     current_pic_ = nullptr;
     output_queue_.clear();
+    pictures_bumped_ = 0;
 
     // §8.3.1 POC carry-over ("prevTid0Pic"). Leaving these stale corrupts POCs
     // (and therefore reference selection) silently, with no crash. The

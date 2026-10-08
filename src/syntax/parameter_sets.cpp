@@ -21,31 +21,62 @@ bool ParameterSetManager::process_nal(const NalUnit& nal) {
             int id = static_cast<int>(sps.sps_seq_parameter_set_id);
             if (id > 15) return false;
             sps_[id] = std::move(sps);
+            sps_generation_[id] = ++generation_counter_;
+            // Derive the PPSs that reference it now, so a bad combination is
+            // known early; derive_for_activation() re-checks at activation.
+            for (auto& p : pps_) {
+                if (p && static_cast<int>(p->pps_seq_parameter_set_id) == id) {
+                    if (p->derive(*sps_[id])) p->derived_sps_generation = sps_generation_[id];
+                    else p->derived_sps_generation = 0;
+                }
+            }
             return true;
         }
         case NalUnitType::PPS_NUT: {
-            // PPS needs the referenced SPS for parsing
-            // First, peek the PPS and SPS IDs
-            uint32_t pps_id = bs.read_ue();
-            uint32_t sps_id = bs.read_ue();
-            if (pps_id > 63 || sps_id > 15) return false;
-
-            const SPS* sps = get_sps(static_cast<int>(sps_id));
-            if (!sps) {
-                fprintf(stderr, "PPS references SPS %u which is not available\n", sps_id);
-                return false;
-            }
-
-            // Re-parse from the beginning
-            BitstreamReader bs2(nal.rbsp.data(), nal.rbsp.size());
+            // The PPS syntax does not depend on the SPS; it is parsed alone and
+            // derived (tile tables, SPS-dependent ranges) against its SPS when
+            // that SPS is available — now, or when a slice activates it. A PPS
+            // that arrives before its SPS is therefore kept.
             PPS pps;
-            if (!pps.parse(bs2, *sps)) return false;
-            pps_[pps.pps_pic_parameter_set_id] = std::move(pps);
+            if (!pps.parse_rbsp(bs)) return false;
+            int id = static_cast<int>(pps.pps_pic_parameter_set_id);
+            int sps_id = static_cast<int>(pps.pps_seq_parameter_set_id);
+            if (id > 63 || sps_id > 15) return false;
+            if (const SPS* sps = get_sps(sps_id)) {
+                // Inconsistent with the SPS in force: keep the previous PPS
+                if (!pps.derive(*sps)) return false;
+                pps.derived_sps_generation = sps_generation_[sps_id];
+            }
+            pps_[id] = std::move(pps);
             return true;
         }
         default:
             return false;
     }
+}
+
+const PPS* ParameterSetManager::activate(int pps_id) {
+    if (pps_id < 0 || pps_id > 63 || !pps_[pps_id]) {
+        HEVC_LOG(PARSE, "Slice references PPS %d which is not available", pps_id);
+        return nullptr;
+    }
+    PPS& pps = *pps_[pps_id];
+    const int sps_id = static_cast<int>(pps.pps_seq_parameter_set_id);
+    const SPS* sps = get_sps(sps_id);
+    if (!sps) {
+        HEVC_LOG(PARSE, "PPS %d references SPS %d which is not available", pps_id, sps_id);
+        return nullptr;
+    }
+    // Re-derive when the SPS was replaced since (or the PPS was never derived):
+    // its tile tables are sized by the SPS picture dimensions.
+    if (pps.derived_sps_generation != sps_generation_[sps_id]) {
+        if (!pps.derive(*sps)) {
+            pps.derived_sps_generation = 0;
+            return nullptr;
+        }
+        pps.derived_sps_generation = sps_generation_[sps_id];
+    }
+    return &pps;
 }
 
 bool ParameterSetManager::parse_slice_header(SliceHeader& sh, const NalUnit& nal) {
@@ -62,18 +93,9 @@ bool ParameterSetManager::parse_slice_header(SliceHeader& sh, const NalUnit& nal
     uint32_t pps_id = bs.read_ue();
     if (pps_id > 63) return false;
 
-    const PPS* pps = get_pps(static_cast<int>(pps_id));
-    if (!pps) {
-        fprintf(stderr, "Slice references PPS %u which is not available\n", pps_id);
-        return false;
-    }
-
+    const PPS* pps = activate(static_cast<int>(pps_id));
+    if (!pps) return false;
     const SPS* sps = get_sps(static_cast<int>(pps->pps_seq_parameter_set_id));
-    if (!sps) {
-        fprintf(stderr, "PPS %u references SPS %u which is not available\n",
-                pps_id, pps->pps_seq_parameter_set_id);
-        return false;
-    }
 
     // Update active parameter set IDs (safe against PS replacement)
     active_sps_id_ = static_cast<int>(pps->pps_seq_parameter_set_id);

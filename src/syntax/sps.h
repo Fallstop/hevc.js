@@ -6,6 +6,7 @@
 
 #include "common/types.h"
 #include "syntax/profile_tier_level.h"
+#include "syntax/vui.h"
 
 namespace hevc {
 
@@ -126,6 +127,10 @@ struct SPS {
     bool intra_smoothing_disabled_flag = false;
 
     bool vui_parameters_present_flag = false;
+    VuiParameters vui;
+    // The VUI or the extension after it did not parse; the SPS was kept with
+    // the extension flags at 0.
+    bool vui_tolerated = false;
 
     // SPS range extension flags (§7.3.2.2.2) — inferred 0 for Main profile
     bool cabac_bypass_alignment_enabled_flag = false;
@@ -171,6 +176,9 @@ struct SPS {
     // picture size or conformance window offsets are out of range, so the
     // caller can reject the SPS instead of allocating an oversized/OOB buffer.
     bool validate() const;
+
+    // §7.4.3.2.1: the conformance window leaves at least one luma sample.
+    bool conformance_window_valid() const;
 };
 
 } // namespace hevc

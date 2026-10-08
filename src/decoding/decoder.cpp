@@ -25,7 +25,20 @@ DecodeStatus Decoder::decode(const uint8_t* data, size_t size) {
         if (type == NalUnitType::VPS_NUT ||
             type == NalUnitType::SPS_NUT ||
             type == NalUnitType::PPS_NUT) {
-            ps_mgr_.process_nal(nals[i]);
+            // A corrupt or truncated parameter set must not throw out of feed()
+            // and lose the rest of the buffer. The manager only stores a set
+            // that parsed completely, so the previous valid one stays in force.
+            bool ok = false;
+            try {
+                ok = ps_mgr_.process_nal(nals[i]);
+            } catch (...) {
+                ok = false;
+            }
+            if (!ok) {
+                stats_.nal_errors++;
+                HEVC_LOG(PARSE, "Parameter set NAL type %d rejected; keeping the previous one",
+                         static_cast<int>(type));
+            }
             i++;
         } else if (is_vcl(type)) {
             // Collect all VCL NALs belonging to the same picture
@@ -64,14 +77,19 @@ DecodeStatus Decoder::decode(const uint8_t* data, size_t size) {
                    type == NalUnitType::SUFFIX_SEI) {
             // §7.3.5 — parse the SEI RBSP. The recovery_point message (§D.3.8)
             // tells a non-IDR (gradual-refresh) tune-in when output is reliable.
-            BitstreamReader bs(nals[i].rbsp.data(), nals[i].rbsp.size());
-            SeiMessages sei = parse_sei(bs);
-            // recovery_point is a prefix-only message (§D.1): bind it to the next
-            // picture in decoding order. A PREFIX_SEI precedes its associated
-            // picture, so defer until that picture's POC is known.
-            if (sei.has_recovery_point && type == NalUnitType::PREFIX_SEI) {
-                has_pending_recovery_point_ = true;
-                pending_recovery_poc_cnt_ = sei.recovery_point.recovery_poc_cnt;
+            // A malformed SEI is contained like a malformed parameter set.
+            try {
+                BitstreamReader bs(nals[i].rbsp.data(), nals[i].rbsp.size());
+                SeiMessages sei = parse_sei(bs);
+                // recovery_point is a prefix-only message (§D.1): bind it to the
+                // next picture in decoding order. A PREFIX_SEI precedes its
+                // associated picture, so defer until that picture's POC is known.
+                if (sei.has_recovery_point && type == NalUnitType::PREFIX_SEI) {
+                    has_pending_recovery_point_ = true;
+                    pending_recovery_poc_cnt_ = sei.recovery_point.recovery_poc_cnt;
+                }
+            } catch (...) {
+                stats_.nal_errors++;
             }
             i++;
         } else {
@@ -395,6 +413,12 @@ DecodeStatus Decoder::decode_picture(const std::vector<NalUnit>& nals,
     return DecodeStatus::OK;
 }
 
+DecodeStats Decoder::stats() const {
+    DecodeStats s = stats_;
+    s.pictures_output = static_cast<uint32_t>(dpb_.pictures_bumped());
+    return s;
+}
+
 DecodeStatus Decoder::feed(const uint8_t* data, size_t size) {
     return decode(data, size);
 }
@@ -411,9 +435,10 @@ std::vector<Picture*> Decoder::flush() {
 }
 
 std::vector<Picture*> Decoder::output_pictures() {
-    // Every picture the DPB still holds for output (bumped or not), sorted by
-    // CVS then POC. Pictures with PicOutputFlag = 0 are skipped, as the
-    // incremental path skips them.
+    // Batch mode is end-of-stream: release every remaining picture, then
+    // return all the DPB holds for output, sorted by CVS then POC. Pictures
+    // with PicOutputFlag = 0 are skipped, as the incremental path skips them.
+    dpb_.bump_all();
     std::vector<Picture*> out;
     for (auto& pic : dpb_.pictures()) {
         if (!pic->needed_for_output && !pic->output_queued) continue;
@@ -438,6 +463,7 @@ void Decoder::reset(bool clear_parameter_sets) {
     handle_cra_as_first_ = true;
     // A reset() is a clean tune-in: clear any pending error-resync state.
     skip_to_next_irap_ = false;
+    stats_ = DecodeStats{};
     // §D.3.8: a reset() is a tune-in — drop any recovery-point state so the next
     // stream's recovery_point SEI is reported fresh.
     has_pending_recovery_point_ = false;

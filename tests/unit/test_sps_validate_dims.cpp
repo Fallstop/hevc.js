@@ -170,13 +170,19 @@ TEST(SpsValidateDims, ParseRejectsNonMultipleOfMinCb) {
     EXPECT_FALSE(parse_sps(make_sps_rbsp(64, 70, false, 0, 0, 0, 0), sps_h));
 }
 
-// Conformance window that crops away the whole picture (or more) must be
-// rejected. Offsets are in chroma units; SubWidthC == SubHeightC == 2 for 4:2:0,
-// so left+right == 32 crops 64 luma samples == full width.
-TEST(SpsValidateDims, ParseRejectsConfWindowExceedingPicture) {
+// A conformance window that crops away the whole picture (or more) is ignored,
+// as libavcodec does: the SPS is kept with no cropping rather than rejected.
+// Offsets are in chroma units; SubWidthC == SubHeightC == 2 for 4:2:0, so
+// left+right == 32 crops 64 luma samples == full width.
+TEST(SpsValidateDims, ParseZeroesConfWindowExceedingPicture) {
     SPS sps_w, sps_h;
-    EXPECT_FALSE(parse_sps(make_sps_rbsp(64, 64, true, 16, 16, 0, 0), sps_w));
-    EXPECT_FALSE(parse_sps(make_sps_rbsp(64, 64, true, 0, 0, 16, 16), sps_h));
+    ASSERT_TRUE(parse_sps(make_sps_rbsp(64, 64, true, 16, 16, 0, 0), sps_w));
+    EXPECT_FALSE(sps_w.conformance_window_flag);
+    EXPECT_EQ(sps_w.conf_win_left_offset + sps_w.conf_win_right_offset, 0u);
+    ASSERT_TRUE(parse_sps(make_sps_rbsp(64, 64, true, 0, 0, 16, 16), sps_h));
+    EXPECT_FALSE(sps_h.conformance_window_flag);
+    EXPECT_EQ(sps_h.conf_win_top_offset + sps_h.conf_win_bottom_offset, 0u);
+    EXPECT_TRUE(sps_h.validate());
 }
 
 // A small, valid conformance window (crop < picture) must be accepted.

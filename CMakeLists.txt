@@ -37,6 +37,7 @@ add_library(hevc-decode-lib
     src/syntax/slice_header.cpp
     src/syntax/parameter_sets.cpp
     src/syntax/sei.cpp
+    src/syntax/vui.cpp
     src/decoding/cabac.cpp
     src/decoding/syntax_elements.cpp
     src/decoding/coding_tree.cpp
@@ -137,6 +138,7 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
         tests/unit/test_monochrome_output.cpp
         tests/unit/test_output_process.cpp
         tests/unit/test_validation.cpp
+        tests/unit/test_nonvcl_tolerance.cpp
     )
 
     target_link_libraries(hevc_tests PRIVATE
