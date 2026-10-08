@@ -29,12 +29,18 @@ beforeAll(async () => {
   fixturesDir = path.resolve(here, "../../../tests/conformance/fixtures");
   const js = path.join(wasmDir, "hevc-decode.js");
   if (!fs.existsSync(js)) return;
-  const factory = nodeRequire!(js);
-  // The artifact must export the tagged-output API this wrapper needs
-  const probe = await factory();
-  if (typeof probe._hevc_decoder_feed_tagged !== "function") return;
-  g.HEVCDecoderModule = factory;
-  available = true;
+  try {
+    const loaded = nodeRequire!(js);
+    const factory = typeof loaded === "function" ? loaded : loaded?.default;
+    if (typeof factory !== "function") return;
+    // The artifact must export the tagged-output API this wrapper needs
+    const probe = await factory();
+    if (typeof probe._hevc_decoder_feed_tagged !== "function") return;
+    g.HEVCDecoderModule = factory;
+    available = true;
+  } catch {
+    // An artifact that cannot load here (e.g. a browser-only build) is skipped
+  }
 });
 
 function fixture(name: string): Uint8Array {

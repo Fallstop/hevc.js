@@ -125,6 +125,11 @@ export function copyPlane(
 ): Uint8Array | Uint16Array {
   if (bytesPerSample === 1) {
     const out = new Uint8Array(width * height);
+    // Rows are contiguous when nothing is cropped horizontally: one copy.
+    if (stride === width) {
+      out.set(m.HEAPU8.subarray(ptr, ptr + width * height));
+      return out;
+    }
     for (let y = 0; y < height; y++) {
       out.set(m.HEAPU8.subarray(ptr + y * stride, ptr + y * stride + width), y * width);
     }
@@ -132,6 +137,10 @@ export function copyPlane(
   }
   const out = new Uint16Array(width * height);
   const base = ptr >> 1;
+  if (stride === width) {
+    out.set(m.HEAPU16.subarray(base, base + width * height));
+    return out;
+  }
   for (let y = 0; y < height; y++) {
     out.set(m.HEAPU16.subarray(base + y * stride, base + y * stride + width), y * width);
   }

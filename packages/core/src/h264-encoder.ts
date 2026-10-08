@@ -5,6 +5,7 @@
  */
 
 import type { HEVCFrame, HEVCFrameView } from "./types.js";
+import { packI420 } from "./i420.js";
 
 export interface H264EncoderConfig {
   width: number;
@@ -91,52 +92,12 @@ export class H264Encoder {
   encode(frame: HEVCFrame | HEVCFrameView, timestampUs: number, keyFrame = false): void {
     const w = frame.width;
     const h = frame.height;
-    const cw = frame.chromaWidth;
-    const ch = frame.chromaHeight;
-    const shift = frame.bitDepth > 8 ? frame.bitDepth - 8 : 0;
-    // Packed HEVCFrame has no stride (rows are contiguous → stride == width);
-    // a zero-copy HEVCFrameView carries the heap stride.
-    const strideY = "strideY" in frame ? frame.strideY : w;
-    const strideC = "strideC" in frame ? frame.strideC : cw;
+    // Build the I420 buffer into a single scratch reused across frames
+    // (VideoFrame copies it synchronously).
+    const i420 = packI420(frame, this._i420);
+    if (i420.buffer !== this._i420?.buffer) this._i420 = i420;
 
-    // Build I420 buffer: Y plane + U (Cb) plane + V (Cr) plane, reusing a
-    // single scratch buffer across frames (VideoFrame copies it synchronously).
-    const ySize = w * h;
-    const cSize = cw * ch;
-    const need = ySize + cSize * 2;
-    if (!this._i420 || this._i420.length < need) this._i420 = new Uint8Array(need);
-    const i420 = this._i420;
-
-    let di = 0;
-    // Y plane
-    const y = frame.y;
-    for (let r = 0; r < h; r++) {
-      const base = r * strideY;
-      for (let c = 0; c < w; c++) {
-        const v = y[base + c]! >> shift;
-        i420[di++] = v > 255 ? 255 : v;
-      }
-    }
-    // U (Cb) plane
-    const cb = frame.cb;
-    for (let r = 0; r < ch; r++) {
-      const base = r * strideC;
-      for (let c = 0; c < cw; c++) {
-        const v = cb[base + c]! >> shift;
-        i420[di++] = v > 255 ? 255 : v;
-      }
-    }
-    // V (Cr) plane
-    const cr = frame.cr;
-    for (let r = 0; r < ch; r++) {
-      const base = r * strideC;
-      for (let c = 0; c < cw; c++) {
-        const v = cr[base + c]! >> shift;
-        i420[di++] = v > 255 ? 255 : v;
-      }
-    }
-
-    const videoFrame = new VideoFrame(i420.subarray(0, need), {
+    const videoFrame = new VideoFrame(i420, {
       format: "I420",
       codedWidth: w,
       codedHeight: h,

@@ -191,6 +191,20 @@ describe("copyPlane", () => {
   });
 });
 
+describe("copyPlane contiguous fast path", () => {
+  it("copies stride == width planes in one block, same result as row by row", () => {
+    const HEAPU8 = new Uint8Array(64).map((_, i) => i);
+    const HEAPU16 = new Uint16Array(64).map((_, i) => 1000 + i);
+    const m = { getValue: () => 0, HEAPU8, HEAPU16 };
+    expect(Array.from(copyPlane(m, 4, 3, 2, 3, 1))).toEqual([4, 5, 6, 7, 8, 9]);
+    expect(Array.from(copyPlane(m, 8, 3, 2, 3, 2))).toEqual([1004, 1005, 1006, 1007, 1008, 1009]);
+    // Mutating the heap afterwards does not change the copy
+    const out = copyPlane(m, 0, 2, 2, 2, 1);
+    HEAPU8[0] = 99;
+    expect(out[0]).toBe(0);
+  });
+});
+
 describe("readDecodeStats", () => {
   it("reads the seven uint32 counters from their offsets", () => {
     expect(STATS_STRUCT.SIZE).toBe(28);
