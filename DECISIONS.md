@@ -209,13 +209,16 @@ picture had to arrive whole in one `feed()`; and reserved VCL types,
 **Decision**:
 - A pending picture is assembled one slice segment at a time. A segment
   continues it when it is not a first segment, shares its PPS and POC LSB, and
-  starts at a tile-scan address past the previous segment's end; anything else
-  finishes the pending picture first. The picture is also finished as soon as
-  its segments reach the last CTB (so per-access-unit feeding outputs in the
-  same call), at AUD/EOS/EOB or a parameter-set NAL (an AU boundary that may
-  also replace the sets it uses), and at `flush()`/batch output. Prefix SEI,
-  suffix SEI, filler and reserved/unspecified non-VCL NALs never split a
-  picture. A picture may therefore span `feed()` calls (NAL-at-a-time input).
+  starts at a tile-scan address past the previous segment's *start* (a failed
+  segment claims only its start CTB, so the segment after it still fits and
+  re-decodes the CTBs it overran). Repeated and stray segments are dropped
+  (AD-019); anything else finishes the pending picture first. The picture is
+  also finished as soon as its segments reach the last CTB (so
+  per-access-unit feeding outputs in the same call), at AUD/EOS/EOB, and at
+  `flush()`/batch output. A VPS/SPS/PPS arriving while a picture is pending is
+  held back and applied once it finishes (AD-019). Prefix SEI, suffix SEI,
+  filler and reserved/unspecified non-VCL NALs never split a picture. A
+  picture may therefore span `feed()` calls (NAL-at-a-time input).
 - Reference lists and ColPic are built per independent slice. Each slice's
   lists are snapshot (POC + long-term flag) into the picture, with a per-CTB
   slice map when there is more than one: deblocking compares references
@@ -281,8 +284,11 @@ know that the next CRA's RASL pictures cannot be decoded.
 
 **Decision**: `hevc_decoder_discontinuity(dec)` / `discontinuity()`:
 - finishes the picture being assembled;
-- marks every stored picture unused for reference, so nothing fed afterwards is
-  predicted from a picture before the call;
+- marks every stored picture unused for reference and drops the decoder's
+  last-picture concealment fallback; the DPB records the cut in decoding
+  order and never uses a picture from before it as a concealment source — so
+  nothing fed afterwards is predicted from, or patched with, a picture before
+  the call, whatever the error policy;
 - bumps every picture awaiting output into the output queue (the next `drain()`
   returns them in output order — nothing decoded is lost);
 - re-arms the §8.1 tune-in state: the next CRA gets NoRaslOutputFlag = 1 (as
@@ -304,9 +310,12 @@ MD5 oracle are unchanged.
 - `HEVC_POLICY_CONCEAL_SLICE_ERRORS`: when the first slice header of a picture
   decoded (POC, RPS, output order known) but a slice fails, is missing, or the
   slices do not cover the picture, the undecoded CTUs are filled with the
-  co-located samples of the stored picture nearest in POC (same CVS; otherwise
-  the most recently decoded one — kept alive for this even after an IDR
-  released it; mid-grey only if nothing fits). Their SAO parameters, motion and
+  co-located samples of the reference picture nearest in POC (same CVS;
+  otherwise the most recently decoded one — the previous picture is kept alive
+  for this even after an IDR released it; mid-grey only if nothing fits; never
+  a picture from before a `discontinuity()`). Only reference pictures qualify:
+  a non-reference picture stays in storage until the caller drains it, and
+  using it would make the concealed samples depend on drain timing. Their SAO parameters, motion and
   every deblocking edge inside or on the boundary of the area are cleared, so
   the filters neither run inside the concealed area nor across its seam. The
   picture is kept as a reference and output with `CORRUPT`; skip-to-IRAP is
@@ -315,7 +324,11 @@ MD5 oracle are unchanged.
   RPS names (`MISSING_REF`); the list entry keeps the *named* POC so MV
   scaling and reference comparisons follow the bitstream, and a substituted
   ColPic contributes zero temporal motion (the lost picture's motion field is
-  unknowable; zero is right for the static scenes cameras mostly see).
+  unknowable; zero is right for the static scenes cameras mostly see). A list
+  entry with no picture at all (an RPS naming nothing current, a `list_entry`
+  past the candidates) is filled the same way, entry i of list 0 (1) taken to
+  name the picture i+1 before (after) the current one; under either policy
+  such a slice flags its picture `MISSING_REF`.
 - `HEVC_POLICY_DECODE_BEFORE_IRAP`: non-IRAP pictures at stream start, after
   `reset()`/`discontinuity()` or after an undecodable picture are decoded
   (missing references concealed as above) and flagged `PRE_RECOVERY` until an
@@ -401,3 +414,76 @@ does not (SAODBLK_A/B, VPSSPSPPS_A, TSUNEQBD_A_MAIN10). The remaining 4
 (BUMPING_A, NoOutPrior_A/B, RAP_B) differ by design: pictures still waiting
 for output at an IRAP with NoOutputOfPriorPicsFlag = 1 (including a CRA after
 EOS) are output instead of discarded (AD-010), so every fed frame comes back.
+
+## AD-019 : Review fixes — assembly of damaged input, DPB cap, concealment boundaries
+
+**Context**: two adversarial reviews of this branch found: a heap-use-after-free
+when the DPB cap dropped a picture the current RPS still listed; one corrupted
+slice turning into two output frames with the same POC and tag (the failed
+slice claimed the CTBs it overran, so the next slice of the picture looked like
+a new picture), and the orphaned dependent segment arming skip-to-IRAP under
+concealment; a repeated slice NAL ending the picture and freezing the default
+policy until the next IRAP (the base build decoded such a stream cleanly); a
+VPS/SPS/PPS between two slices of one picture splitting it; concealment after
+`discontinuity()` using pictures from before the cut; P/B slices with no
+reference picture at all decoding mid-grey with no flag; and concealed samples
+depending on when the caller drained.
+
+**Decision**:
+- DPB cap: the picture dropped to stay at 16 is one the current picture does
+  not predict from if possible, and is removed from every RPS set — it becomes
+  a missing reference (flagged, substituted under concealment). The RPS is
+  *not* additionally bounded by `sps_max_dec_pic_buffering_minus1` (§7.4.8,
+  §7.4.7.1): refusing such a slice would drop the picture and freeze; keeping
+  it costs one missing reference. ffmpeg does not enforce it either.
+- Assembly (AD-013): a segment joins the pending picture when it starts after
+  the last segment's start; one that overlaps what an earlier segment decoded
+  marks the picture in error. Dropped and counted in `nal_errors`:
+  - a NAL whose signature (type, size, first and last 64 payload bytes)
+    repeats a segment of the pending picture, or a non-first segment of the
+    picture just finished;
+  - the first segment of the picture just finished repeated *with the same
+    input* (same tag, or the same untagged `feed()` call). Fed again in a
+    later call it is another picture: a camera repeating an IDR as a still
+    image gets a frame per input;
+  - a segment behind the last one carrying the picture's POC, and a first
+    slice naming the pending picture's POC (non-IRAP);
+  - a picture continuing a CVS whose (CVS, POC) is among the last 32
+    pictures started (§8.3.1: POC is unique within a CVS). The history is
+    cleared by `flush()`, `discontinuity()` and `reset()`, so a segment
+    re-fed after `flush()` (a retried transcode) decodes again;
+  - with tagged input (one access unit per tag, as an MP4 sample or RTP
+    frame delivers it): a non-first segment that cannot continue the picture
+    pending or just finished in the same tagged unit (no picture begins
+    mid-unit without its first segment), and an IDR's first segment arriving
+    after its other segments in the same unit. Untagged (NaN) feeds are not
+    subject to these two rules; callers packing several access units under
+    one tag lose the pictures whose first segment was lost.
+  An orphan dependent segment arms skip-to-IRAP only under the default
+  policy. The finished-picture record is cleared by `flush()`,
+  `discontinuity()`, `reset()` and EOS/EOB.
+- Parameter sets between the slices of a picture (§7.4.2.4.4; §7.4.3.3) are
+  held back (up to 32; more are counted in `nal_errors`) and applied when the
+  picture finishes, before the next picture is set up — they take effect from
+  the next picture, and the pending picture keeps the sets it started with.
+  `reset(false)` applies them; `reset()` drops them with the stored sets.
+- A CTB decoded a second time (the slice after a failed one re-covering it)
+  has its SAO parameters and deblocking edges reset first.
+- Concealment boundaries: see AD-015 (the cut) and AD-016 (reference pictures
+  only, empty list entries).
+
+**Measured** (seven QCIF fixtures, single- and multi-slice, 2100 runs per
+mutation type, corruption kept inside access units, one tag per access
+unit): runs with frames sharing a tag went from 1455/2100 (repeated NAL,
+every policy) and up to 224/2100 (reordered NALs, concealment) to 0, except
+3 of the 23100 runs under concealment, where a bit error made a slice header
+parse as another picture's first slice; those frames are flagged `CORRUPT`. Dropping such a header would also drop the next
+picture of a caller packing several access units under one tag.
+
+**Not changed**: a slice that runs past the last CTB without
+`end_of_slice_segment_flag`, or whose CABAC reads run past its data, stays an
+error under the default policy (dropped, skip-to-IRAP), as AD-016 decided: the
+old build output such pictures as clean. Batch `decode()` sorts all pictures by
+(CVS, POC) at the end; when NAL units arrive out of decoding order (a slice of
+an earlier picture after a later one), streaming output, which cannot wait for
+them, can differ in order from batch output.

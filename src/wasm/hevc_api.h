@@ -52,7 +52,9 @@ typedef struct {
     uint32_t skipped_rasl;       // RASL pictures skipped (associated IRAP opened decoding)
     uint32_t skipped_error;      // pictures dropped or skipped because of decode errors
     uint32_t concealed;          // pictures output with concealed errors (HEVC_FRAME_CORRUPT)
-    uint32_t nal_errors;         // non-VCL NAL units rejected and contained
+    uint32_t nal_errors;         // NAL units rejected and contained: corrupt parameter
+                                 // sets / SEI, forbidden-bit NALs, repeated or stray
+                                 // slice segments
 } HEVCDecodeStats;
 
 // Stream info — available after first frame is decoded
@@ -153,8 +155,9 @@ int hevc_decoder_flush(HEVCDecoder* dec);
 // Declare a discontinuity in the input (splice, seek, gap in a live feed).
 // Much cheaper than hevc_decoder_reset(dec, 0): parameter sets, allocations,
 // stats and the pictures already decoded are kept. The picture being assembled
-// is finished; every decoded picture stops being a reference, so nothing fed
-// afterwards is predicted from data before the call; pictures awaiting output
+// is finished; every decoded picture stops being a reference and a
+// concealment source, so nothing fed afterwards is predicted from (or, with
+// concealment, patched with) data before the call; pictures awaiting output
 // are released to the next hevc_decoder_drain() (or flush). Decoding restarts
 // at the next IRAP as if it opened the bitstream: a CRA is handled like a BLA
 // (NoRaslOutputFlag = 1, its RASL pictures skipped), and non-IRAP pictures

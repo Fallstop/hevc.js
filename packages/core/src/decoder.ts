@@ -507,8 +507,9 @@ export class HEVCDecoder {
    * live feed — far cheaper than `reset(false)`: parameter sets, WASM memory
    * and stats are kept, and pictures already decoded but awaiting output are
    * released to the next `drain()` (they are not lost). Every decoded picture
-   * stops being a reference, so nothing fed afterwards is predicted from data
-   * before the call; decoding restarts at the next IRAP as if it opened the
+   * stops being a reference and a concealment source, so nothing fed
+   * afterwards is predicted from or patched with data before the call, under
+   * any error policy; decoding restarts at the next IRAP as if it opened the
    * stream (a CRA's RASL pictures are skipped). Non-IRAP pictures before that
    * IRAP are skipped unless `setErrorPolicy({ decodeBeforeIrap: true })`.
    *
@@ -528,10 +529,11 @@ export class HEVCDecoder {
    * next picture; call it right after `create()` to cover the whole stream.
    *
    * - `concealSliceErrors`: repair instead of dropping — undecodable or missing
-   *   slices are filled from the nearest decoded picture and the frame is
-   *   output with `HEVC_FRAME_CORRUPT`; a missing reference is replaced by the
-   *   nearest picture (`HEVC_FRAME_MISSING_REF`). Decoding only waits for an
-   *   IRAP when a picture's first slice header is unreadable.
+   *   slices are filled from the nearest reference picture (or the previous
+   *   picture) and the frame is output with `HEVC_FRAME_CORRUPT`; a missing
+   *   reference is replaced by the nearest picture (`HEVC_FRAME_MISSING_REF`).
+   *   Decoding only waits for an IRAP when a picture's first slice header is
+   *   unreadable.
    * - `decodeBeforeIrap`: decode pictures that precede the first IRAP (stream
    *   joined mid-GOP, after `reset()`/`discontinuity()`, or after an
    *   unreadable picture), flagged `HEVC_FRAME_PRE_RECOVERY` until an IRAP or

@@ -173,7 +173,11 @@ export interface HEVCDecodeStats {
   skippedError: number;
   /** Pictures output with concealed errors (`HEVC_FRAME_CORRUPT`). */
   concealed: number;
-  /** Non-VCL NAL units (parameter sets, SEI, corrupt headers) rejected and contained. */
+  /**
+   * NAL units rejected and contained: corrupt parameter sets or SEI, NAL units
+   * with the forbidden bit set, and repeated or stray slice segments (a NAL
+   * unit received twice, a segment arriving after its picture was finished).
+   */
   nalErrors: number;
 }
 
