@@ -719,7 +719,8 @@ void perform_inter_prediction(DecodingContext& ctx,
     // Both lists lost their reference: conceal the PU with neutral mid-gray
     // rather than blending uninitialized prediction buffers (UB on lost refs).
     if (!predFlagL0 && !predFlagL1) {
-        int16_t neutral = static_cast<int16_t>(1 << (bitDepth - 1));
+        // 1 << 15 wraps in int16_t at bit depth 16: clamp to the largest value.
+        int16_t neutral = static_cast<int16_t>(std::min(1 << (bitDepth - 1), 32767));
         for (int i = 0; i < nSamples; i++)
             pred_samples[i] = neutral;
         return;

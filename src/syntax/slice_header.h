@@ -65,6 +65,9 @@ struct SliceHeader {
     std::array<bool, 32> used_by_curr_pic_lt_flag = {};
     std::array<bool, 32> delta_poc_msb_present_flag = {};
     std::array<uint32_t, 32> delta_poc_msb_cycle_lt = {};
+    // §7.4.7.1 eq 7-52: derived, accumulating within each run of entries
+    // (the SPS-sourced run and the slice-coded run restart separately)
+    std::array<uint32_t, 32> DeltaPocMsbCycleLt = {};
 
     bool slice_temporal_mvp_enabled_flag = false;
 

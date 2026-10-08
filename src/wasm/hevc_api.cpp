@@ -119,6 +119,11 @@ int hevc_decoder_get_frame(HEVCDecoder* dec, int index, HEVCFrame* frame) {
 int hevc_decoder_feed(HEVCDecoder* dec, const uint8_t* data, size_t size) {
     if (!dec || !data || size == 0) return HEVC_ERROR;
 
+    // Frames from the previous drain are only valid until the next feed: the
+    // decode below may release their storage. Forget them so a late
+    // get_drained_frame() reports an error instead of reading freed memory.
+    dec->drained.clear();
+
     try {
         auto status = dec->decoder.feed(data, size);
         return (status == hevc::DecodeStatus::OK) ? HEVC_OK : HEVC_ERROR;

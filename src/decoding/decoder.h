@@ -86,6 +86,7 @@ private:
 
     ParameterSetManager ps_mgr_;
     DPB dpb_;
+    DPB::OutputLimits output_limits_;
 
     // Output pictures (accumulated across all decoded pictures)
     std::vector<Picture*> output_pics_;

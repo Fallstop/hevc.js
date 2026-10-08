@@ -196,6 +196,7 @@ bool SliceHeader::parse(BitstreamReader& bs, const SPS& sps, const PPS& pps,
 
             for (uint32_t i = 0; i < num_long_term_sps + num_long_term_pics; i++) {
                 if (i < num_long_term_sps) {
+                    lt_idx_sps[i] = 0;  // §7.4.7.1: inferred 0 when not coded
                     if (sps.num_long_term_ref_pics_sps > 1) {
                         lt_idx_sps[i] = bs.read_bits(lt_sps_bits);
                     }
@@ -213,7 +214,13 @@ bool SliceHeader::parse(BitstreamReader& bs, const SPS& sps, const PPS& pps,
                 delta_poc_msb_present_flag[i] = bs.read_flag();
                 if (delta_poc_msb_present_flag[i]) {
                     delta_poc_msb_cycle_lt[i] = bs.read_ue();
+                } else {
+                    delta_poc_msb_cycle_lt[i] = 0;  // §7.4.7.1: inferred 0
                 }
+                // §7.4.7.1 eq 7-52
+                DeltaPocMsbCycleLt[i] = (i == 0 || i == num_long_term_sps)
+                    ? delta_poc_msb_cycle_lt[i]
+                    : delta_poc_msb_cycle_lt[i] + DeltaPocMsbCycleLt[i - 1];
             }
         }
 

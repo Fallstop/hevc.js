@@ -135,6 +135,7 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
         tests/unit/test_decoder_resync.cpp
         tests/unit/test_sei.cpp
         tests/unit/test_monochrome_output.cpp
+        tests/unit/test_output_process.cpp
     )
 
     target_link_libraries(hevc_tests PRIVATE
@@ -147,7 +148,8 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
     )
 
     include(GoogleTest)
-    gtest_discover_tests(hevc_tests)
+    # A non-terminating decode loop must fail the suite, not stall it.
+    gtest_discover_tests(hevc_tests PROPERTIES TIMEOUT 300)
 
     # Oracle tests — compare decoded YUV MD5 against reference
     # These tests require the decoder to produce YUV output (-o flag)
@@ -193,6 +195,21 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
         COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/opengop_cra_rasl.265 176 144
             9fba759b58ff8cd4a9a7ac5473cc1b1b $<TARGET_FILE:hevc-decode>)
     set_tests_properties(oracle_opengop_cra_rasl PROPERTIES LABELS "oracle;feature"
+        SKIP_RETURN_CODE 2)
+
+    # Upstream open-GOP fixtures (§8.1 RASL PicOutputFlag override). The CRA of
+    # opengop_qcif_12f is mid-stream (NoRaslOutputFlag = 0, RASL output); the cut
+    # stream opens on that CRA, whose three RASL pictures must not be output.
+    add_test(NAME oracle_opengop_qcif_12f
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/opengop_qcif_12f.265 176 144
+            06e53846ff51cf35cadc97a080147e82 $<TARGET_FILE:hevc-decode>)
+    set_tests_properties(oracle_opengop_qcif_12f PROPERTIES LABELS "oracle;feature"
+        SKIP_RETURN_CODE 2)
+
+    add_test(NAME oracle_opengop_qcif_cra_first
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/opengop_qcif_cra_first.265 176 144
+            9c249fb00174f2f6e6fbb3457c10679b $<TARGET_FILE:hevc-decode>)
+    set_tests_properties(oracle_opengop_qcif_cra_first PROPERTIES LABELS "oracle;feature"
         SKIP_RETURN_CODE 2)
 
     # Recovery-point SEI (gradual decoding refresh, feature F2). An intra-refresh

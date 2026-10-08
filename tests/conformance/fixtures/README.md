@@ -101,3 +101,15 @@ TEST(Oracle, I_64x64_QP22) {
     EXPECT_EQ(md5(output), "48c64cd2de381113913149e92065d66c");
 }
 ```
+
+## Open-GOP RASL bitstreams (ported from upstream)
+
+| Fichier | Taille | Resolution | Coded | Output | Type | MD5 (YUV decode) |
+|---------|--------|------------|-------|--------|------|------------------|
+| `opengop_qcif_12f.265` | 4.9K | 176x144 | 12 | 12 | IDR + 2x(CRA + 3 RASL) + trailing | `06e53846ff51cf35cadc97a080147e82` |
+| `opengop_qcif_cra_first.265` | 1.9K | 176x144 | 7 | **4** | CRA + 3 RASL + 3 trailing | `9c249fb00174f2f6e6fbb3457c10679b` |
+
+The CRA of `opengop_qcif_12f.265` is mid-stream (NoRaslOutputFlag = 0): its RASL
+pictures are decodable and output. `opengop_qcif_cra_first.265` is the same stream cut
+at that CRA, which then opens the bitstream (NoRaslOutputFlag = 1): its three RASL
+pictures must not be output (§8.1). Generated upstream by `tools/gen_open_gop_fixtures.sh`.

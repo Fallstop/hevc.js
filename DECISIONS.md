@@ -93,3 +93,38 @@ int32_t transform_buf[64 * 64];  // precision etendue pour transform
 - Pas d'allocation dynamique dans le hot path
 - 64*64*4 = 16KB par buffer, ~48KB total — acceptable sur la stack
 - WASM : la stack par defaut Emscripten est ~64KB (le heap est extensible, pas la stack). Prevoir `-sSTACK_SIZE=1048576` en Phase 8, ou restructurer pour allouer les buffers au niveau CTU
+
+## AD-010 : Upstream merge (privaloops/hevc.js core 1.4.0..1.4.8) — re-implemented, not merged
+
+*English, per the repo's documentation convention. Upstream's own AD-007..AD-009
+are not copied here; the numbering skips them to avoid a collision.*
+
+**Context**: origin/main is 281 commits past our merge base (b32f001). Its decoder
+fixes touch the same functions this fork rewrote (decoder-level NoRaslOutputFlag,
+uint8 planes, 4:2:2/4:4:4, reset(), recovery-point SEI), so a git merge or a
+cherry-pick conflicts everywhere and would also bring upstream's rejection of
+4:2:2/4:4:4 SPSs.
+
+**Decision**: Re-implement each decoder correctness fix against this fork, with
+tests, and record the disposition of every upstream item:
+
+| Upstream fix | Disposition |
+|---|---|
+| Hang on P/B slices with zero references (#248) | Already guarded in `DPB::build_ref_pic_list` (all-empty RPS breaks out, list conceals to null). The parser-side rejection of `NumPicTotalCurr == 0` is not ported: a forgiving decoder conceals that picture instead of dropping it. |
+| Out-of-range `list_entry_lX` | Rejected in the slice header (P0, AD-011); the DPB keeps its null-conceal guard. |
+| Missing references read uninitialised prediction buffers | Already in the fork (`perform_inter_prediction` drops the predFlag and conceals grey). Ported the 16-bit clamp of the grey value. |
+| Long-term refs signalled in the SPS dropped (#249) | Already in the fork (`test_slice_ltrp_sps`). Ported the missing `DeltaPocMsbCycleLt` accumulation (eq 7-52) and the inferred zeros for `lt_idx_sps` / `delta_poc_msb_cycle_lt`. |
+| `pic_output_flag` honoured (§C.3.1) | Ported: the flag is no longer overwritten with 1 after decoding; batch output skips such pictures. Upstream's `take_suppressed_pictures()` API is **not** ported: tagged output (AD-014) gives the caller exact per-frame timestamps, which supersedes positional re-mapping. |
+| RASL suppression after an opening CRA (§8.1) | Already in the fork as a skip (RASL of an IRAP with NoRaslOutputFlag = 1 is never decoded). Upstream's fixtures and MD5 oracles (`opengop_qcif_12f`, `opengop_qcif_cra_first`) are ported and pass unchanged. |
+| Reference lists built on I slices too (heap-use-after-free on the TMVP ref-POC snapshot after an IRAP) | Ported; `construct_ref_pic_lists` clears both lists before any early return, and `derive_colpic` runs on I slices to clear ColPic. |
+| Negative / oversized ref index in `ref_pic_list0/1()`, `num_ref_idx` int overflow | Ported. |
+| Bounded decoder memory during transcode / drain order | Re-implemented rather than ported. Upstream excludes the just-decoded picture from `drain()`'s §C.5.2.2 counts, which delays every frame of a low-delay stream by one picture — unacceptable for live view. This fork bumps at the two points §C.5.2 defines (§C.5.2.2 before the current picture is stored, §C.5.2.3 after it is decoded, including PicLatencyCount) into an output queue that `drain()`/`flush()` hand over. Output order is spec-exact for any drain cadence, and `sps_max_num_reorder_pics = 0` streams come out in the same call that decoded them. |
+| SPS/PPS/slice-header bounds (4d09a13) | Ported into the P0 validation work (AD-011), **minus** the 4:2:2/4:4:4 rejection (this fork decodes both) and with the invalid conformance window zeroed instead of rejected (AD-012). |
+| `HEVCFrame.cvs_id` | Not ported: tags (AD-014) carry the caller's own timestamp, which is what the field was for. |
+| TS changes (DisplayPtsAssigner, transcode pipeline, dash/shaka plugins) | Not ported (out of scope for this fork's consumer). |
+| Perf: SAO per-CTB uniform test, 32-bit dequant, shift-indexed grids | Evaluated separately in the perf pass (AD-017). |
+
+**Consequence**: `prior pictures` are never discarded at an IRAP with
+NoRaslOutputFlag = 1, whatever `no_output_of_prior_pics_flag` says — every frame
+the caller fed comes back out (upstream and the previous code behaved the same).
+`DPB` storage is additionally capped at 16 pictures (P0).

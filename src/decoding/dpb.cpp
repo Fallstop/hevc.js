@@ -139,7 +139,7 @@ void DPB::derive_rps(const SliceHeader& sh, const SPS& sps,
             int32_t pocLt = static_cast<int32_t>(sh.poc_lsb_lt[i]);
             if (sh.delta_poc_msb_present_flag[i]) {
                 pocLt += picOrderCntVal
-                         - static_cast<int32_t>(sh.delta_poc_msb_cycle_lt[i]) * MaxPicOrderCntLsb
+                         - static_cast<int32_t>(sh.DeltaPocMsbCycleLt[i]) * MaxPicOrderCntLsb
                          - (picOrderCntVal & (MaxPicOrderCntLsb - 1));
             }
             if (sh.used_by_curr_pic_lt_flag[i]) {
@@ -288,16 +288,26 @@ std::vector<Picture*> DPB::build_ref_pic_list(
 
 void DPB::construct_ref_pic_lists(const SliceHeader& sh, const SPS& /*sps*/,
                                    const PPS& /*pps*/) {
+    // Cleared before any early return: on an I slice the lists must be empty,
+    // not the previous picture's (whose entries may have been evicted since),
+    // and a P slice must not keep a previous B slice's L1.
+    ref_pic_list0_.clear();
+    ref_pic_list1_.clear();
     if (sh.slice_type == SliceType::I) return;  // No ref lists for I slices
+
+    // num_ref_idx_lX_active_minus1 is a uint32_t; clamp to what list_entry_lX
+    // can index while still unsigned, so the int conversion cannot overflow.
+    const uint32_t maxIdx = static_cast<uint32_t>(sh.list_entry_l0.size()) - 1;
+    const int numL0m1 = static_cast<int>(std::min(sh.num_ref_idx_l0_active_minus1, maxIdx));
+    const int numL1m1 = static_cast<int>(std::min(sh.num_ref_idx_l1_active_minus1, maxIdx));
 
     // §8.3.4 eq 8-8/8-9: RefPicList0 — order: StCurrBefore, StCurrAfter, LtCurr
     {
         auto l0 = build_ref_pic_list(
             ref_pic_set_st_curr_before_, ref_pic_set_st_curr_after_, ref_pic_set_lt_curr_,
-            static_cast<int>(sh.num_ref_idx_l0_active_minus1),
+            numL0m1,
             sh.ref_pic_list_modification_flag_l0,
             sh.list_entry_l0.data(), sh.list_entry_l0.size());
-        ref_pic_list0_.clear();
         for (Picture* p : l0) ref_pic_list0_.push_back({p});
     }
 
@@ -306,10 +316,9 @@ void DPB::construct_ref_pic_lists(const SliceHeader& sh, const SPS& /*sps*/,
     if (sh.slice_type == SliceType::B) {
         auto l1 = build_ref_pic_list(
             ref_pic_set_st_curr_after_, ref_pic_set_st_curr_before_, ref_pic_set_lt_curr_,
-            static_cast<int>(sh.num_ref_idx_l1_active_minus1),
+            numL1m1,
             sh.ref_pic_list_modification_flag_l1,
             sh.list_entry_l1.data(), sh.list_entry_l1.size());
-        ref_pic_list1_.clear();
         for (Picture* p : l1) ref_pic_list1_.push_back({p});
     }
 
@@ -374,13 +383,10 @@ void DPB::derive_colpic(const SliceHeader& sh) {
 
 Picture* DPB::alloc_picture(int width, int height, ChromaFormat fmt,
                              int bd_luma, int bd_chroma) {
-    // Remove pictures that are no longer referenced and not needed for output
-    pictures_.erase(
-        std::remove_if(pictures_.begin(), pictures_.end(),
-            [](const std::shared_ptr<Picture>& p) {
-                return !p->is_reference() && !p->needed_for_output;
-            }),
-        pictures_.end());
+    // §C.5.2.2 — free storage buffers that are neither reference nor pending
+    // output (bumped pictures are kept until they have been handed off).
+    current_pic_ = nullptr;
+    evict_unused();
 
     auto pic = std::make_shared<Picture>();
     pic->allocate(width, height, fmt, bd_luma, bd_chroma);
@@ -404,6 +410,8 @@ void DPB::drop_current() {
     // output or referenced. The cached RPS/ref-list/colpic state may also hold a
     // dangling pointer to it; clear those too (they are rebuilt per picture).
     if (!current_pic_) return;
+    output_queue_.erase(std::remove(output_queue_.begin(), output_queue_.end(), current_pic_),
+                        output_queue_.end());
     pictures_.erase(
         std::remove_if(pictures_.begin(), pictures_.end(),
             [this](const std::shared_ptr<Picture>& p) {
@@ -425,7 +433,7 @@ std::vector<Picture*> DPB::get_output_pictures() {
     // Simplified bumping: return all pictures marked for output, in POC order
     std::vector<Picture*> out;
     for (auto& pic : pictures_) {
-        if (pic->needed_for_output) {
+        if (pic->needed_for_output || pic->output_queued) {
             out.push_back(pic.get());
         }
     }
@@ -438,7 +446,9 @@ std::vector<Picture*> DPB::get_output_pictures() {
     // Mark as output
     for (auto* pic : out) {
         pic->needed_for_output = false;
+        pic->output_queued = false;
     }
+    output_queue_.clear();
     return out;
 }
 
@@ -449,11 +459,9 @@ std::vector<Picture*> DPB::get_output_pictures() {
 //    marked as "needed for output".
 // 2. Output it and mark as "not needed for output".
 // 3. If the picture storage buffer is also "unused for reference",
-//    it is emptied (handled by evict_unused).
+//    it is emptied (deferred to evict_unused, after the hand-off).
 
 Picture* DPB::bump() {
-    // §C.5.2.4 step 1: select the picture with the smallest PicOrderCntVal
-    // that is marked as "needed for output".
     // Within multiple CVS, earlier CVS pictures are output first.
     Picture* smallest = nullptr;
     for (auto& pic : pictures_) {
@@ -466,87 +474,119 @@ Picture* DPB::bump() {
     }
     if (smallest) {
         smallest->needed_for_output = false;  // §C.5.2.4 step 2
+        smallest->output_queued = true;
+        output_queue_.push_back(smallest);
     }
     return smallest;
 }
 
-// ============================================================
-// §C.5.2.2 / §C.5.2.3 — Drain (incremental bumping)
-// ============================================================
-// Bumps pictures while any of the following conditions are true:
-// - The number of pictures marked "needed for output" >
-//   sps_max_num_reorder_pics[HighestTid]
-// - The number of pictures in the DPB >=
-//   sps_max_dec_pic_buffering_minus1[HighestTid] + 1
-// - sps_max_latency_increase_plus1 != 0 and a picture has
-//   PicLatencyCount >= SpsMaxLatencyPictures
-//
-// Note: PicLatencyCount tracking is not implemented (would require
-// per-picture counter incremented at each subsequent picture decode).
-// For most real-world streams, the reorder_pics and DPB size conditions
-// are sufficient. Latency-based bumping is a conformance refinement
-// that can be added later if needed.
-
-std::vector<Picture*> DPB::drain(const SPS& sps) {
-    std::vector<Picture*> out;
-
-    // §C.5.2.2: use HighestTid = sps_max_sub_layers_minus1
-    int tid = sps.sps_max_sub_layers_minus1;
-    int max_reorder = static_cast<int>(sps.sub_layer_ordering[tid].max_num_reorder_pics);
-    int max_dpb_size = static_cast<int>(sps.sub_layer_ordering[tid].max_dec_pic_buffering_minus1) + 1;
-
-    auto count_needed_for_output = [this]() {
-        int count = 0;
-        for (auto& pic : pictures_) {
-            if (pic->needed_for_output) count++;
-        }
-        return count;
-    };
-
-    // §C.5.2.2: bump while conditions are met
-    while (true) {
-        bool should_bump = false;
-
-        // Condition 1: too many pictures waiting for output
-        if (count_needed_for_output() > max_reorder) {
-            should_bump = true;
-        }
-
-        // Condition 2: DPB is full
-        if (static_cast<int>(pictures_.size()) >= max_dpb_size) {
-            if (count_needed_for_output() > 0) {
-                should_bump = true;
-            }
-        }
-
-        if (!should_bump) break;
-
-        Picture* pic = bump();
-        if (!pic) break;
-        out.push_back(pic);
-
-        // NOTE: Do NOT evict here — the returned raw pointers must stay valid
-        // until the next feed() call. alloc_picture() handles eviction.
+DPB::OutputLimits DPB::output_limits(const SPS& sps) {
+    // §C.5.2.2: HighestTid = sps_max_sub_layers_minus1. The array holds 7
+    // entries; clamp so a stray value can never index past it.
+    int tid = std::min<int>(sps.sps_max_sub_layers_minus1,
+                            static_cast<int>(sps.sub_layer_ordering.size()) - 1);
+    const auto& o = sps.sub_layer_ordering[tid];
+    OutputLimits lim;
+    lim.max_num_reorder = static_cast<int>(std::min<uint32_t>(o.max_num_reorder_pics, kMaxDpbPictures));
+    lim.max_dec_pic_buffering =
+        static_cast<int>(std::min<uint32_t>(o.max_dec_pic_buffering_minus1, kMaxDpbPictures - 1)) + 1;
+    // §7.4.3.2.1 eq 7-9: SpsMaxLatencyPictures
+    if (o.max_latency_increase_plus1 != 0) {
+        uint64_t v = static_cast<uint64_t>(o.max_num_reorder_pics) +
+                     o.max_latency_increase_plus1 - 1;
+        lim.max_latency_pictures = static_cast<int>(std::min<uint64_t>(v, 1u << 30));
     }
-
-    return out;
+    return lim;
 }
 
-// ============================================================
-// Flush — output ALL remaining pictures (end of stream)
-// ============================================================
+int DPB::count_occupied() const {
+    int count = 0;
+    for (auto& pic : pictures_) {
+        if (pic.get() == current_pic_) continue;
+        if (pic->is_reference() || pic->needed_for_output) count++;
+    }
+    return count;
+}
 
-std::vector<Picture*> DPB::flush() {
-    std::vector<Picture*> out;
+int DPB::count_needed_for_output() const {
+    int count = 0;
+    for (auto& pic : pictures_)
+        if (pic->needed_for_output) count++;
+    return count;
+}
 
-    // Bump all pictures marked as "needed for output", in POC order
-    while (true) {
-        Picture* pic = bump();
-        if (!pic) break;
-        out.push_back(pic);
+// §C.5.2.2 — output and removal of pictures from the DPB, before the current
+// picture is decoded (but after its RPS has marked the references).
+void DPB::bump_before_decode(const OutputLimits& lim, bool irap_no_rasl) {
+    if (irap_no_rasl) {
+        // An IRAP with NoRaslOutputFlag = 1 empties the DPB. Prior pictures
+        // are output rather than discarded (see header).
+        bump_all();
+    } else {
+        auto latency_hit = [&]() {
+            if (lim.max_latency_pictures <= 0) return false;
+            for (auto& pic : pictures_)
+                if (pic->needed_for_output &&
+                    pic->pic_latency_count >= static_cast<uint32_t>(lim.max_latency_pictures))
+                    return true;
+            return false;
+        };
+        while (count_needed_for_output() > lim.max_num_reorder ||
+               latency_hit() ||
+               count_occupied() >= lim.max_dec_pic_buffering) {
+            if (!bump()) break;
+        }
     }
 
-    // NOTE: Do NOT evict here — raw pointers must stay valid.
+    // Hard storage bound: never hold more than kMaxDpbPictures pictures in the
+    // DPB, whatever the SPS or RPS claim. Output first; if that is not enough
+    // the RPS is keeping too many references alive — drop the oldest.
+    while (count_occupied() >= kMaxDpbPictures) {
+        if (bump()) continue;
+        Picture* oldest = nullptr;
+        for (auto& pic : pictures_) {
+            if (pic.get() == current_pic_ || !pic->is_reference()) continue;
+            if (!oldest || pic->cvs_id < oldest->cvs_id ||
+                (pic->cvs_id == oldest->cvs_id && pic->poc < oldest->poc))
+                oldest = pic.get();
+        }
+        if (!oldest) break;
+        oldest->used_for_short_term_ref = false;
+        oldest->used_for_long_term_ref = false;
+    }
+}
+
+// §C.5.2.3 — "additional bumping" once the current picture is decoded.
+void DPB::bump_after_decode(const OutputLimits& lim) {
+    if (current_pic_ && current_pic_->needed_for_output) {
+        for (auto& pic : pictures_) {
+            if (pic.get() != current_pic_ && pic->needed_for_output)
+                pic->pic_latency_count++;
+        }
+        current_pic_->pic_latency_count = 0;
+    }
+    auto latency_hit = [&]() {
+        if (lim.max_latency_pictures <= 0) return false;
+        for (auto& pic : pictures_)
+            if (pic->needed_for_output &&
+                pic->pic_latency_count >= static_cast<uint32_t>(lim.max_latency_pictures))
+                return true;
+        return false;
+    };
+    while (count_needed_for_output() > lim.max_num_reorder || latency_hit()) {
+        if (!bump()) break;
+    }
+}
+
+void DPB::bump_all() {
+    while (bump()) {}
+}
+
+std::vector<Picture*> DPB::take_output() {
+    std::vector<Picture*> out;
+    out.swap(output_queue_);
+    // Handed off: the storage may be reclaimed at the next alloc_picture().
+    for (Picture* p : out) p->output_queued = false;
     return out;
 }
 
@@ -560,7 +600,7 @@ void DPB::evict_unused() {
             [this](const std::shared_ptr<Picture>& p) {
                 // Don't evict the current picture being decoded
                 if (p.get() == current_pic_) return false;
-                return !p->is_reference() && !p->needed_for_output;
+                return !p->is_reference() && !p->needed_for_output && !p->output_queued;
             }),
         pictures_.end());
 }
@@ -601,6 +641,7 @@ void DPB::reset() {
     // copy out frames they still need before reset).
     pictures_.clear();
     current_pic_ = nullptr;
+    output_queue_.clear();
 
     // §8.3.1 POC carry-over ("prevTid0Pic"). Leaving these stale corrupts POCs
     // (and therefore reference selection) silently, with no crash. The

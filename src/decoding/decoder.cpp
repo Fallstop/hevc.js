@@ -163,6 +163,15 @@ DecodeStatus Decoder::decode_picture(const std::vector<NalUnit>& nals,
         has_pending_recovery_point_ = false;
     }
 
+    // §8.3.2 — RPS derivation and picture marking. Runs before the current
+    // picture is stored: the previous picture is an ordinary DPB entry now.
+    dpb_.clear_current();
+    dpb_.derive_rps(first_sh, *sps, nut, poc, no_rasl_output_flag);
+
+    // §C.5.2.2 — output/removal of pictures before the current one is stored.
+    output_limits_ = DPB::output_limits(*sps);
+    dpb_.bump_before_decode(output_limits_, isIRAP && no_rasl_output_flag);
+
     // Allocate picture in DPB
     ChromaFormat fmt = static_cast<ChromaFormat>(sps->chroma_format_idc);
     Picture* pic = dpb_.alloc_picture(
@@ -170,7 +179,11 @@ DecodeStatus Decoder::decode_picture(const std::vector<NalUnit>& nals,
         static_cast<int>(sps->pic_height_in_luma_samples),
         fmt, sps->BitDepthY, sps->BitDepthC);
     pic->poc = poc;
-    pic->needed_for_output = first_sh.pic_output_flag;
+    // §8.1 PicOutputFlag; RASL pictures of an IRAP with NoRaslOutputFlag = 1
+    // never reach here (skipped above). Marked "needed for output" only once
+    // the picture is decoded (§C.5.2.3).
+    const bool pic_output_flag = first_sh.pic_output_flag;
+    pic->needed_for_output = false;
 
     // §8.1: IRAP with NoRaslOutputFlag == 1 starts a new CVS. This now covers a
     // CRA at the start of the bitstream / after EOS / after reset() too, not
@@ -187,15 +200,12 @@ DecodeStatus Decoder::decode_picture(const std::vector<NalUnit>& nals,
         pic->conf_win_bottom = sps->conf_win_bottom_offset * sps->SubHeightC;
     }
 
-    // §8.3.2 — RPS derivation and picture marking
-    dpb_.derive_rps(first_sh, *sps, nut, poc, no_rasl_output_flag);
-
-    // §8.3.4 — Reference picture list construction (P and B slices)
-    if (first_sh.slice_type != SliceType::I) {
-        dpb_.construct_ref_pic_lists(first_sh, *sps, *pps);
-        // §8.3.5 — Collocated picture derivation
-        dpb_.derive_colpic(first_sh);
-    }
+    // §8.3.4 — Reference picture list construction. Called on I slices too,
+    // where it clears the lists: the TMVP ref-POC snapshot below reads them
+    // unconditionally, and stale entries could point at evicted pictures.
+    dpb_.construct_ref_pic_lists(first_sh, *sps, *pps);
+    // §8.3.5 — Collocated picture derivation (clears it on I slices)
+    dpb_.derive_colpic(first_sh);
 
     // Allocate CU info grid (min-CB granularity)
     int cuGridW = sps->PicWidthInMinCbsY;
@@ -377,11 +387,10 @@ DecodeStatus Decoder::decode_picture(const std::vector<NalUnit>& nals,
     // §8.1 step 4: mark current picture as short-term reference
     dpb_.mark_current_as_short_term_ref();
 
-    // §C.5.2.3: mark current picture as "needed for output"
-    // (PicOutputFlag is 1 for all pictures in Main profile)
-    if (dpb_.current_pic()) {
-        dpb_.current_pic()->needed_for_output = true;
-    }
+    // §C.5.2.3: the decoded picture is marked "needed for output" iff
+    // PicOutputFlag is 1, then the "additional bumping" runs.
+    pic->needed_for_output = pic_output_flag;
+    dpb_.bump_after_decode(output_limits_);
 
     return DecodeStatus::OK;
 }
@@ -391,19 +400,23 @@ DecodeStatus Decoder::feed(const uint8_t* data, size_t size) {
 }
 
 std::vector<Picture*> Decoder::drain() {
-    const SPS* sps = ps_mgr_.active_sps();
-    if (!sps) return {};
-    return dpb_.drain(*sps);
+    // Pictures are bumped into the output queue during decoding (§C.5.2.2 /
+    // §C.5.2.3); drain hands over whatever is ready.
+    return dpb_.take_output();
 }
 
 std::vector<Picture*> Decoder::flush() {
-    return dpb_.flush();
+    dpb_.bump_all();
+    return dpb_.take_output();
 }
 
 std::vector<Picture*> Decoder::output_pictures() {
-    // Collect all pictures from the DPB, sort by CVS then POC
+    // Every picture the DPB still holds for output (bumped or not), sorted by
+    // CVS then POC. Pictures with PicOutputFlag = 0 are skipped, as the
+    // incremental path skips them.
     std::vector<Picture*> out;
     for (auto& pic : dpb_.pictures()) {
+        if (!pic->needed_for_output && !pic->output_queued) continue;
         out.push_back(pic.get());
     }
     std::sort(out.begin(), out.end(),

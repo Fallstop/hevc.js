@@ -41,6 +41,11 @@ struct Picture {
     bool used_for_short_term_ref = false;
     bool used_for_long_term_ref = false;
     bool needed_for_output = false;
+    // Bumped (§C.5.2.4) but not yet handed to the caller by drain()/flush();
+    // keeps the storage alive until the hand-off.
+    bool output_queued = false;
+    // §C.5.2.3 PicLatencyCount
+    uint32_t pic_latency_count = 0;
 
     // Inter: per-PU motion info for TMVP (stored after decoding)
     struct PUMotionInfoCompact {
