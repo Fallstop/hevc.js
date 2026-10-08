@@ -113,3 +113,19 @@ The CRA of `opengop_qcif_12f.265` is mid-stream (NoRaslOutputFlag = 0): its RASL
 pictures are decodable and output. `opengop_qcif_cra_first.265` is the same stream cut
 at that CRA, which then opens the bitstream (NoRaslOutputFlag = 1): its three RASL
 pictures must not be output (§8.1). Generated upstream by `tools/gen_open_gop_fixtures.sh`.
+
+## JCT-VC conformance streams (ITU-T H.265.1)
+
+Unmodified bitstreams from the JCT-VC HEVC_v1 conformance suite, except
+`jctvc_MAXBINS_B_TI_5_2f.265`: its first two access units, cut with
+`ffmpeg -i MAXBINS_B_TI_5.bit -c copy -frames:v 2 -f hevc`. Each MD5 is the
+ffmpeg decode, which matches the suite's reference YUV where one is shipped.
+
+| Fichier | Taille | Resolution | Frames | Guards | MD5 (YUV decode) |
+|---------|--------|------------|--------|--------|------------------|
+| `jctvc_ipcm_C_NEC_3.265` | 5.7K | 416x240 | 1 | PCM alignment, PCM QpY, PCM edges with `pcm_loop_filter_disabled_flag` | `c3e74c399b73a5ab2dbd20523f583464` |
+| `jctvc_ipcm_D_NEC_3.265` | 5.7K | 416x240 | 1 | PCM with `cu_transquant_bypass` | `aa64a16240064bc2a90fadf979a62a7b` |
+| `jctvc_PMERGE_B_TI_3.265` | 16K | 416x240 | 8 | parallel merge level, 8x4 bi-pred restriction on the coded PU size | `7d0e57ebdbbc6633c972083a17d97550` |
+| `jctvc_CIP_A_Panasonic_3.265` | 12K | 416x240 | 2 | constrained intra prediction | `4cbf601ba98d63f642defab5eaa12c8d` |
+| `jctvc_POC_A_Bossen_3.265` | 83K | 416x240 | 5 | prevTid0Pic excludes TRAIL_N at TemporalId 0 | `faf33bec64d3e58c426ed2772903a0bf` |
+| `jctvc_MAXBINS_B_TI_5_2f.265` | 220K | 416x240 | 2 | merge pruning ignores the unused list after the 8x4 restriction | `7522b8154651a696e053057f440cd11f` |

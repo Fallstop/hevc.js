@@ -271,6 +271,42 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
     set_tests_properties(oracle_camera_qcif_12f PROPERTIES LABELS "oracle;feature"
         SKIP_RETURN_CODE 2)
 
+    # JCT-VC conformance streams (ITU-T H.265.1) that guard specific fixes:
+    # PCM alignment / QP / loop-filter skipping (ipcm_C, ipcm_D), parallel
+    # merge level (PMERGE_B), constrained intra prediction (CIP_A), prevTid0Pic
+    # (POC_A), and merge pruning after the 8x4 bi-prediction restriction (the
+    # first two pictures of MAXBINS_B).
+    add_test(NAME oracle_jctvc_ipcm_C_NEC_3
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/jctvc_ipcm_C_NEC_3.265 416 240
+            c3e74c399b73a5ab2dbd20523f583464 $<TARGET_FILE:hevc-decode>)
+    set_tests_properties(oracle_jctvc_ipcm_C_NEC_3 PROPERTIES LABELS "oracle;conformance"
+        SKIP_RETURN_CODE 2)
+    add_test(NAME oracle_jctvc_ipcm_D_NEC_3
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/jctvc_ipcm_D_NEC_3.265 416 240
+            aa64a16240064bc2a90fadf979a62a7b $<TARGET_FILE:hevc-decode>)
+    set_tests_properties(oracle_jctvc_ipcm_D_NEC_3 PROPERTIES LABELS "oracle;conformance"
+        SKIP_RETURN_CODE 2)
+    add_test(NAME oracle_jctvc_PMERGE_B_TI_3
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/jctvc_PMERGE_B_TI_3.265 416 240
+            7d0e57ebdbbc6633c972083a17d97550 $<TARGET_FILE:hevc-decode>)
+    set_tests_properties(oracle_jctvc_PMERGE_B_TI_3 PROPERTIES LABELS "oracle;conformance"
+        SKIP_RETURN_CODE 2)
+    add_test(NAME oracle_jctvc_CIP_A_Panasonic_3
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/jctvc_CIP_A_Panasonic_3.265 416 240
+            4cbf601ba98d63f642defab5eaa12c8d $<TARGET_FILE:hevc-decode>)
+    set_tests_properties(oracle_jctvc_CIP_A_Panasonic_3 PROPERTIES LABELS "oracle;conformance"
+        SKIP_RETURN_CODE 2)
+    add_test(NAME oracle_jctvc_POC_A_Bossen_3
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/jctvc_POC_A_Bossen_3.265 416 240
+            faf33bec64d3e58c426ed2772903a0bf $<TARGET_FILE:hevc-decode>)
+    set_tests_properties(oracle_jctvc_POC_A_Bossen_3 PROPERTIES LABELS "oracle;conformance"
+        SKIP_RETURN_CODE 2)
+    add_test(NAME oracle_jctvc_MAXBINS_B_TI_5_2f
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/jctvc_MAXBINS_B_TI_5_2f.265 416 240
+            7522b8154651a696e053057f440cd11f $<TARGET_FILE:hevc-decode>)
+    set_tests_properties(oracle_jctvc_MAXBINS_B_TI_5_2f PROPERTIES LABELS "oracle;conformance"
+        SKIP_RETURN_CODE 2)
+
     # Recovery-point SEI (gradual decoding refresh, feature F2). An intra-refresh
     # clip with x265 idr-recovery-sei: the IDR carries a recovery_point PREFIX_SEI.
     # SEI is now parsed but pixel output is unchanged — this guards that the SEI
