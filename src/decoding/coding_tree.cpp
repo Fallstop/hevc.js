@@ -753,19 +753,21 @@ static bool decode_wpp_parallel(DecodingContext& ctx, BitstreamReader& bs,
     return !wpp_failed.load(std::memory_order_relaxed);
 }
 
-// §9.3.1: the first CTB of a CTB row synchronizes its contexts from the CTB at
-// (1, row - 1) when that CTB is available (§6.4.1): inside the picture, in the
-// same slice and tile, and already decoded. Otherwise the contexts initialize.
-static bool wpp_sync_available(const DecodingContext& ctx, int row) {
+// §9.3.1: the first CTB of a CTB row (of a tile) synchronizes its contexts from
+// the CTB above-right of it, (xCtb + CtbSizeY, yCtb - CtbSizeY), when that CTB
+// is available (§6.4.1): inside the picture, in the same slice and tile, and
+// already decoded. Otherwise the contexts initialize.
+static bool wpp_sync_available_at(const DecodingContext& ctx, int ctbAddrRs) {
     const auto& sps = *ctx.sps;
     const auto& pps = *ctx.pps;
-    if (row <= 0 || sps.PicWidthInCtbsY < 2) return false;
-    const int rsT = (row - 1) * sps.PicWidthInCtbsY + 1;
-    const int rsCur = row * sps.PicWidthInCtbsY;
+    const int W = sps.PicWidthInCtbsY;
+    const int col = ctbAddrRs % W, row = ctbAddrRs / W;
+    if (row <= 0 || col + 1 >= W) return false;
+    const int rsT = (row - 1) * W + col + 1;
     if (ctx.slice_idx && ctx.slice_idx[rsT] != ctx.current_slice_idx) return false;
     if (ctx.ctb_decoded && !ctx.ctb_decoded[rsT]) return false;
     if (!pps.TileId.empty() &&
-        pps.TileId[pps.CtbAddrRsToTs[rsT]] != pps.TileId[pps.CtbAddrRsToTs[rsCur]])
+        pps.TileId[pps.CtbAddrRsToTs[rsT]] != pps.TileId[pps.CtbAddrRsToTs[ctbAddrRs]])
         return false;
     return ctx.wpp_contexts_available;
 }
@@ -833,9 +835,11 @@ bool decode_slice_segment_data(DecodingContext& ctx, BitstreamReader& bs,
         if (!sh.dependent_slice_segment_flag || firstInTile) {
             cabac.init_contexts(sliceType, sh.SliceQpY, sh.cabac_init_flag);
         } else if (pps.entropy_coding_sync_enabled_flag &&
-                   startRs % sps.PicWidthInCtbsY == 0) {
+                   (startRs % sps.PicWidthInCtbsY == 0 ||
+                    (!pps.TileId.empty() &&
+                     pps.TileId[startTs] != pps.TileId[pps.CtbAddrRsToTs[startRs - 1]]))) {
             if (ctx.slice_idx) ctx.slice_idx[startRs] = static_cast<uint16_t>(ctx.current_slice_idx);
-            if (wpp_sync_available(ctx, startRs / sps.PicWidthInCtbsY))
+            if (wpp_sync_available_at(ctx, startRs))
                 cabac.load_contexts(ctx.wpp_saved_contexts);
             else
                 cabac.init_contexts(sliceType, sh.SliceQpY, sh.cabac_init_flag);
@@ -878,8 +882,13 @@ bool decode_slice_segment_data(DecodingContext& ctx, BitstreamReader& bs,
         HEVC_LOG(TREE, "CTU addr_rs=%d consumed %zu bits, remaining=%zu",
                  CtbAddrInRs, bs.bits_read() - bits_before, bs.bits_remaining());
 
-        // §9.2.2: WPP — save contexts after the 2nd CTU of each row (col index 1)
-        if (pps.entropy_coding_sync_enabled_flag && ctuCol == 1) {
+        // §9.3.2.4: with WPP, store the contexts after the second CTB of a
+        // CTB row of a tile (CtbAddrInRs % W == 1, or the CTB two to the left
+        // lies in another tile — which also covers one-CTB-wide tiles).
+        if (pps.entropy_coding_sync_enabled_flag &&
+            (ctuCol == 1 ||
+             (CtbAddrInRs > 1 && !pps.TileId.empty() &&
+              pps.TileId[CtbAddrInTs] != pps.TileId[pps.CtbAddrRsToTs[CtbAddrInRs - 2]]))) {
             cabac.save_contexts(ctx.wpp_saved_contexts);
             ctx.wpp_contexts_available = true;
         }
@@ -893,41 +902,42 @@ bool decode_slice_segment_data(DecodingContext& ctx, BitstreamReader& bs,
             if (CtbAddrInTs >= sps.PicSizeInCtbsY) return false;
             CtbAddrInRs = pps.CtbAddrTsToRs[CtbAddrInTs];
 
-            // Tile boundary: subset end + byte alignment + CABAC reinit
-            if (pps.tiles_enabled_flag &&
-                pps.TileId[CtbAddrInTs] != pps.TileId[CtbAddrInTs - 1]) {
-                cabac.decode_terminate(); // end_of_subset_one_bit
-                bs.byte_alignment();
+            // §7.3.8.1: a new substream starts at the first CTB of a tile, and
+            // with WPP at the first CTB of a CTB row (of a tile).
+            const bool newTile = pps.tiles_enabled_flag &&
+                pps.TileId[CtbAddrInTs] != pps.TileId[CtbAddrInTs - 1];
+            const bool newWppRow = pps.entropy_coding_sync_enabled_flag &&
+                (CtbAddrInRs % sps.PicWidthInCtbsY == 0 ||
+                 (!pps.TileId.empty() &&
+                  pps.TileId[CtbAddrInTs] != pps.TileId[pps.CtbAddrRsToTs[CtbAddrInRs - 1]]));
+            if (newTile || newWppRow) {
+                cabac.decode_terminate();  // end_of_subset_one_bit
+                // The substream starts at its entry point. The arithmetic
+                // decoder has read ahead of the logical position, so byte-
+                // aligning the reader is only a fallback for a (non-conforming)
+                // segment without entry points.
+                wpp_substream_idx++;
+                if (wpp_substream_idx < substream_byte_pos.size())
+                    bs.seek_to_byte(substream_byte_pos[wpp_substream_idx]);
+                else
+                    bs.byte_alignment();
                 cabac.init_decoder(bs);
-                // §8.6.1: Reset QpY_prev at first QG in a tile
+                // §8.6.1: qPY_PREV = SliceQpY at the first QG of a tile and,
+                // with WPP, of a CTB row in a tile
                 ctx.QpY_prev = sh.SliceQpY;
                 ctx.QpY_prev_qg = sh.SliceQpY;
-            }
-
-            // WPP boundary (§7.3.8.1 / §9.2.2): at end of each CTU row,
-            // seek to the next substream (via entry_point_offset), reinit CABAC,
-            // and restore contexts from the 2nd CTU of the previous row.
-            if (pps.entropy_coding_sync_enabled_flag) {
-                int prevRs = pps.CtbAddrTsToRs[CtbAddrInTs - 1];
-                int prevRow = prevRs / sps.PicWidthInCtbsY;
-                int curRow  = CtbAddrInRs / sps.PicWidthInCtbsY;
-                if (curRow != prevRow) {
-                    wpp_substream_idx++;
-                    // Seek to the exact byte position of this substream
-                    if (wpp_substream_idx < substream_byte_pos.size()) {
-                        bs.seek_to_byte(substream_byte_pos[wpp_substream_idx]);
-                    }
-                    cabac.init_decoder(bs);
-                    // §8.6.1: Reset QpY_prev at first QG of each CTB row (WPP)
-                    ctx.QpY_prev = sh.SliceQpY;
-                    ctx.QpY_prev_qg = sh.SliceQpY;
-                    // §9.2.2: restore contexts from 2nd CTU of previous row
-                    if (wpp_sync_available(ctx, curRow)) {
+                // §9.3.1: initialize at a tile start; at a WPP row start
+                // synchronize from the CTB above-right when it is available
+                if (newTile) {
+                    cabac.init_contexts(static_cast<int>(sh.slice_type),
+                                        sh.SliceQpY, sh.cabac_init_flag);
+                } else {
+                    if (ctx.slice_idx) ctx.slice_idx[CtbAddrInRs] = static_cast<uint16_t>(ctx.current_slice_idx);
+                    if (wpp_sync_available_at(ctx, CtbAddrInRs))
                         cabac.load_contexts(ctx.wpp_saved_contexts);
-                    } else {
+                    else
                         cabac.init_contexts(static_cast<int>(sh.slice_type),
                                             sh.SliceQpY, sh.cabac_init_flag);
-                    }
                 }
             }
         }
