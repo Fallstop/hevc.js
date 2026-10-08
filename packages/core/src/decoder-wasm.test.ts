@@ -11,7 +11,6 @@ import type { HEVCFrame } from "./types.js";
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 const g = globalThis as any;
-let nodeRequire: ((id: string) => any) | null = null;
 let fs: any = null;
 let wasmDir = "";
 let fixturesDir = "";
@@ -23,20 +22,35 @@ beforeAll(async () => {
   const path = await import(/* @vite-ignore */ "node:path" as string);
   const url = await import(/* @vite-ignore */ "node:url" as string);
   fs = await import(/* @vite-ignore */ "node:fs" as string);
-  nodeRequire = mod.createRequire(import.meta.url);
   const here = path.dirname(url.fileURLToPath(import.meta.url));
   wasmDir = g.process.env.HEVC_WASM_DIR ?? path.resolve(here, "../wasm");
   fixturesDir = path.resolve(here, "../../../tests/conformance/fixtures");
   const js = path.join(wasmDir, "hevc-decode.js");
   if (!fs.existsSync(js)) return;
   try {
-    const loaded = nodeRequire!(js);
-    const factory = typeof loaded === "function" ? loaded : loaded?.default;
+    // Evaluate the Emscripten glue as a classic script: inside this package
+    // ("type": "module") require() would load it as an ES module, where its
+    // CommonJS export never runs.
+    const vm = await import(/* @vite-ignore */ "node:vm" as string);
+    const code = fs.readFileSync(js, "utf8") as string;
+    const context = vm.createContext({
+      ...globalThis,
+      __filename: js,
+      __dirname: wasmDir,
+      require: mod.createRequire(js),
+      process: g.process,
+      console,
+      URL,
+      Buffer: g.Buffer,
+      WebAssembly,
+    });
+    const factory = new vm.Script(`${code}\nHEVCDecoderModule;`, { filename: js }).runInContext(context);
     if (typeof factory !== "function") return;
+    const locateFile = (p: string) => path.join(wasmDir, p);
     // The artifact must export the tagged-output API this wrapper needs
-    const probe = await factory();
+    const probe = await factory({ locateFile });
     if (typeof probe._hevc_decoder_feed_tagged !== "function") return;
-    g.HEVCDecoderModule = factory;
+    g.HEVCDecoderModule = (opts: Record<string, unknown> = {}) => factory({ locateFile, ...opts });
     available = true;
   } catch {
     // An artifact that cannot load here (e.g. a browser-only build) is skipped
