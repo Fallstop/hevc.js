@@ -129,3 +129,11 @@ ffmpeg decode, which matches the suite's reference YUV where one is shipped.
 | `jctvc_CIP_A_Panasonic_3.265` | 12K | 416x240 | 2 | constrained intra prediction | `4cbf601ba98d63f642defab5eaa12c8d` |
 | `jctvc_POC_A_Bossen_3.265` | 83K | 416x240 | 5 | prevTid0Pic excludes TRAIL_N at TemporalId 0 | `faf33bec64d3e58c426ed2772903a0bf` |
 | `jctvc_MAXBINS_B_TI_5_2f.265` | 220K | 416x240 | 2 | merge pruning ignores the unused list after the 8x4 restriction | `7522b8154651a696e053057f440cd11f` |
+
+## Robustness bitstreams
+
+Non-conforming on purpose; used by the unit tests, not by the MD5 oracles.
+
+| File | Size | Resolution | Frames | What it breaks |
+|------|------|------------|--------|----------------|
+| `rps17_qcif_40f.265` | 27K | 176x144 | 40 | `x265 --ref 16 --bframes 0 --allow-non-conformance`, then from picture 16 on each P slice's inline RPS names one more picture (POC n-16): 16 references plus the current picture exceed the 16-picture DPB |

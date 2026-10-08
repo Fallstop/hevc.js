@@ -643,19 +643,37 @@ void DPB::bump_before_decode(const OutputLimits& lim, bool irap_no_rasl) {
 
     // Hard storage bound: never hold more than kMaxDpbPictures pictures in the
     // DPB, whatever the SPS or RPS claim. Output first; if that is not enough
-    // the RPS is keeping too many references alive — drop the oldest.
+    // the RPS is keeping too many references alive — drop one, preferring a
+    // picture the current picture does not predict from, then the oldest.
     while (count_occupied() >= kMaxDpbPictures) {
         if (bump()) continue;
-        Picture* oldest = nullptr;
+        auto in_curr = [&](const Picture* p) {
+            for (const auto* list : {&ref_pic_set_st_curr_before_, &ref_pic_set_st_curr_after_,
+                                     &ref_pic_set_lt_curr_})
+                if (std::find(list->begin(), list->end(), p) != list->end()) return true;
+            return false;
+        };
+        Picture* victim = nullptr;
+        bool victim_curr = true;
         for (auto& pic : pictures_) {
             if (pic.get() == current_pic_ || !pic->is_reference()) continue;
-            if (!oldest || pic->cvs_id < oldest->cvs_id ||
-                (pic->cvs_id == oldest->cvs_id && pic->poc < oldest->poc))
-                oldest = pic.get();
+            const bool curr = in_curr(pic.get());
+            if (!victim || (victim_curr && !curr) ||
+                (curr == victim_curr &&
+                 (pic->cvs_id < victim->cvs_id ||
+                  (pic->cvs_id == victim->cvs_id && pic->poc < victim->poc)))) {
+                victim = pic.get();
+                victim_curr = curr;
+            }
         }
-        if (!oldest) break;
-        oldest->used_for_short_term_ref = false;
-        oldest->used_for_long_term_ref = false;
+        if (!victim) break;
+        victim->used_for_short_term_ref = false;
+        victim->used_for_long_term_ref = false;
+        // It is freed at the next allocation: the RPS must not keep pointing
+        // at it. It becomes "no reference picture" (missing, concealable).
+        for (auto* list : {&ref_pic_set_st_curr_before_, &ref_pic_set_st_curr_after_,
+                           &ref_pic_set_st_foll_, &ref_pic_set_lt_curr_, &ref_pic_set_lt_foll_})
+            std::replace(list->begin(), list->end(), victim, static_cast<Picture*>(nullptr));
     }
 }
 

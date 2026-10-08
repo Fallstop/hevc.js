@@ -412,3 +412,33 @@ TEST(Validation, DpbStorageIsCappedAtSixteenPictures) {
     }
     EXPECT_LE(peak, static_cast<size_t>(DPB::kMaxDpbPictures + 1));
 }
+
+// An RPS naming 16 pictures (x265 --ref 16, plus one more entry from picture
+// 16 on): with the current picture that is 17 pictures, one past the cap. The
+// picture the cap drops must leave the RPS too — it is freed at the next
+// allocation, and constructing the reference lists read it after the free
+// (ASan heap-use-after-free) when the caller drained after every picture.
+TEST(Validation, DpbCapNeverLeavesTheRpsPointingAtADroppedPicture) {
+    const auto data = read_file(fixture("rps17_qcif_40f.265"));
+    ASSERT_FALSE(data.empty());
+    for (bool conceal : {false, true}) {
+        Decoder dec;
+        ErrorPolicy policy;
+        policy.conceal_slice_errors = conceal;
+        dec.set_error_policy(policy);
+        std::vector<std::pair<int32_t, uint32_t>> out;
+        for (const auto& au : split_access_units(data)) {
+            ASSERT_EQ(dec.feed(au.data(), au.size()), DecodeStatus::OK);
+            for (const Picture* p : dec.drain()) out.push_back({p->poc, p->flags});
+            EXPECT_LE(dec.dpb().pictures().size(), static_cast<size_t>(DPB::kMaxDpbPictures + 1));
+        }
+        for (const Picture* p : dec.flush()) out.push_back({p->poc, p->flags});
+        ASSERT_EQ(out.size(), 40u) << "conceal=" << conceal;
+        for (size_t i = 0; i < out.size(); i++) {
+            EXPECT_EQ(out[i].first, static_cast<int32_t>(i));
+            // From POC 16 on one named reference no longer fits: flagged
+            const uint32_t want = i >= 16 ? PICTURE_MISSING_REF : 0u;
+            EXPECT_EQ(out[i].second, want) << "POC " << i << " conceal=" << conceal;
+        }
+    }
+}
