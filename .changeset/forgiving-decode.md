@@ -21,5 +21,11 @@ Forgiving decode for damaged and non-standard streams.
   calls; per-slice reference lists; bounded DPB; output order fixed when
   draining per picture; `pic_output_flag` honoured; a 4:2:2/4:4:4 chroma
   interpolation stack overflow and a WPP thread-pool hang fixed.
+- Conformance: tile and WPP substreams, dependent slice segments, PCM, the
+  parallel merge level, merge pruning, constrained intra prediction and POC
+  derivation fixed. Of the 147 JCT-VC HEVC_v1 streams, 139 now match ffmpeg
+  (58 before, with 6 hangs) and 4 more match the suite's own MD5 where ffmpeg
+  is wrong; the last 4 differ by design: pictures waiting for output at an
+  IRAP with NoOutputOfPriorPicsFlag are output, not discarded.
 - Faster: native WebAssembly exception handling, recycled picture buffers,
   32-bit dequantization, and bulk plane/I420 copies in JS.

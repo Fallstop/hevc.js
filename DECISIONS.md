@@ -332,3 +332,72 @@ decode garbage silently and be output as clean.
 **Measured** (camera-like fixture, one access unit lost): luma SAD of the next
 picture against the clean decode 591k with mid-grey prediction, 85k with
 substitution (~3 per sample, about the freeze error).
+
+## AD-017 : Performance pass — native EH, recycled pictures, upstream hot-path ports
+
+**Context**: the forgiving-decode work adds per-slice bookkeeping (reference
+tables, assembly state, validation) to the hot path, and the task allowed no
+unexplained regression above 2% at 1080p or 4K. Two in-house perf branches
+existed: `Fallstop/perf/simd-wasm-decode` and `feat/performance-focus`.
+
+**Decision**:
+- `HEVC_WASM_NATIVE_EH` (default ON): `-fwasm-exceptions` with the legacy EH
+  proposal (Chrome 95+, Firefox 100+, Safari 15.2+, below the SIMD floor the
+  build already requires) instead of JS-emulated exceptions, which route every
+  call that may throw through an `invoke_*` trampoline. The decoder relies on
+  exceptions to contain corrupt NALs, so they stay; their cost does not.
+- Released pictures go to a two-entry pool and the next picture of the same
+  format takes over their sample and motion buffers (no zero-fill: every sample
+  is written by decoding or concealment). Pictures still referenced elsewhere
+  (`use_count() > 1`, e.g. the concealment fallback) are never recycled.
+- Ported from upstream: shift-indexed CU/intra-mode grids and 32-bit
+  dequantization when `qpPer <= bdShift` (the 64-bit path now clips before
+  narrowing). Not ported: upstream's per-CTB uniform-SAO test, which assumes a
+  single slice per picture.
+- JS: one `TypedArray.set` per contiguous plane; 8-bit I420 packing by rows.
+- `Fallstop/perf/simd-wasm-decode` is already fully contained in this branch's
+  base. From `feat/performance-focus` the picture pool, the release
+  `ASSERTIONS=0` (already in base) and the JS copies were taken; its scalar SAO
+  fast paths and row-pointer interpolation were written against the pre-SIMD
+  code and are superseded by the SIMD SAO/interpolation already in base.
+
+**Measured** (Node 24, emscripten 6.0.10, `-O3 -msimd128`, Apple M3;
+median of three alternating rounds, each the median of 10 decodes after 2
+warm-up; `tools/bench_wasm_stats.mjs` batch, `tools/bench_wasm_stream.mjs`
+one access unit per feed with a drain after each):
+
+| Stream | Mode | 6b390dc | this branch | Change |
+|---|---|---|---|---|
+| bbb1080_50f | batch | 612.0 ms (81.7 fps) | 582.7 ms (85.8 fps) | -4.8% |
+| bbb1080_50f | streaming | 609.0 ms (82.1 fps) | 592.3 ms (84.4 fps) | -2.7% |
+| bbb4k_25f | batch | 1132.7 ms (22.1 fps) | 1093.7 ms (22.9 fps) | -3.4% |
+| bbb4k_25f | streaming | 1130.9 ms (22.1 fps) | 1080.8 ms (23.1 fps) | -4.4% |
+
+`tools/bench_wasm.mjs` (best of 3 per round): 1080p 81.7/81.9/82.3 fps before,
+85.5/85.9/86.6 after; 4K 22.0/21.8/22.1 before, 21.6/22.8/23.1 after. Output is
+byte-identical between the WASM build and the native CLI on all 38 fixtures.
+`hevc-decode.wasm` grows from 234,546 to 254,968 bytes (validation, VUI/HRD,
+assembly and concealment); the JS glue shrinks from 18,628 to 13,222 bytes.
+
+## AD-018 : JCT-VC conformance is the regression net for decoder changes
+
+**Context**: the fixture oracles are x265 streams, which exercise few of the
+tools a camera or a third-party encoder may use. On the HEVC_v1 suite the base
+of this branch matched ffmpeg on 58 of 147 streams and hung on 6.
+
+**Decision**: `tools/jctvc_conformance.py` downloads the suite once, compares
+the CLI with ffmpeg and, where they differ, with the suite's own whole-YUV MD5
+(status `pass-suite`). `--compare` against an earlier results file lists
+regressions. Every decoder fix on this branch was checked with it, and streams
+that guard a fix are committed as oracles (`jctvc_*` in
+tests/conformance/fixtures). Fixes found this way: tile substreams (entry
+points, context initialisation), WPP on one-CTB-wide pictures, entry-point
+offsets with emulation prevention, the QP predictor of dependent slice
+segments, PCM (alignment, QpY, filter grids, sample depth), the parallel merge
+level and merge pruning, constrained intra prediction, and prevTid0Pic.
+
+**Result**: 139 of 147 match ffmpeg; 4 more match the suite's MD5 where ffmpeg
+does not (SAODBLK_A/B, VPSSPSPPS_A, TSUNEQBD_A_MAIN10). The remaining 4
+(BUMPING_A, NoOutPrior_A/B, RAP_B) differ by design: pictures still waiting
+for output at an IRAP with NoOutputOfPriorPicsFlag = 1 (including a CRA after
+EOS) are output instead of discarded (AD-010), so every fed frame comes back.
