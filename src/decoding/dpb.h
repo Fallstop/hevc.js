@@ -250,6 +250,11 @@ public:
 private:
     // DPB storage
     std::vector<std::shared_ptr<Picture>> pictures_;
+    // Released pictures whose sample buffers the next allocations reuse
+    // (avoids a multi-MB allocation + zero-fill per frame). Small: in steady
+    // state one picture is released per picture allocated.
+    std::vector<std::shared_ptr<Picture>> pool_;
+    static constexpr size_t kPoolMax = 2;
     Picture* current_pic_ = nullptr;
 
     // Bumped pictures awaiting hand-off (§C.5.2), in output order

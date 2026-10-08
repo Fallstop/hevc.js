@@ -39,8 +39,11 @@ void Picture::allocate(int w, int h, ChromaFormat fmt, int bd_luma, int bd_chrom
 
     for (int c = 0; c < 3; c++) {
         if (width[c] > 0 && height[c] > 0) {
-            plane_bytes[c].assign(
-                static_cast<size_t>(stride[c]) * height[c] * bytes_per_sample, 0);
+            const size_t bytes = static_cast<size_t>(stride[c]) * height[c] * bytes_per_sample;
+            // A recycled buffer of the right size is kept as is: decoding (or
+            // concealment) writes every sample of a picture that is output or
+            // referenced, so zero-filling it again is wasted memory traffic.
+            if (plane_bytes[c].size() != bytes) plane_bytes[c].assign(bytes, 0);
         } else {
             plane_bytes[c].clear();
         }

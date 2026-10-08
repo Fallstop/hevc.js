@@ -482,6 +482,18 @@ Picture* DPB::alloc_picture(int width, int height, ChromaFormat fmt,
     evict_unused();
 
     auto pic = std::make_shared<Picture>();
+    // Reuse the sample buffers of a released picture of the same format
+    const int bps = (bd_luma <= 8 && bd_chroma <= 8) ? 1 : 2;
+    for (auto it = pool_.begin(); it != pool_.end(); ++it) {
+        const Picture& old = **it;
+        if (old.pic_width_in_luma == width && old.pic_height_in_luma == height &&
+            old.chroma_format == fmt && old.bytes_per_sample == bps) {
+            for (int c = 0; c < 3; c++) pic->plane_bytes[c] = std::move((*it)->plane_bytes[c]);
+            pic->motion_info_buf = std::move((*it)->motion_info_buf);
+            pool_.erase(it);
+            break;
+        }
+    }
     pic->allocate(width, height, fmt, bd_luma, bd_chroma);
     pic->decode_order = ++decode_counter_;
     pictures_.push_back(pic);
@@ -690,14 +702,17 @@ std::vector<Picture*> DPB::take_output() {
 // ============================================================
 
 void DPB::evict_unused() {
-    pictures_.erase(
-        std::remove_if(pictures_.begin(), pictures_.end(),
-            [this](const std::shared_ptr<Picture>& p) {
-                // Don't evict the current picture being decoded
-                if (p.get() == current_pic_) return false;
-                return !p->is_reference() && !p->needed_for_output && !p->output_queued;
-            }),
-        pictures_.end());
+    for (auto it = pictures_.begin(); it != pictures_.end();) {
+        Picture* p = it->get();
+        // Don't evict the current picture being decoded
+        if (p == current_pic_ || p->is_reference() || p->needed_for_output || p->output_queued) {
+            ++it;
+            continue;
+        }
+        // Recycle the buffers unless someone else still holds the picture
+        if (it->use_count() == 1 && pool_.size() < kPoolMax) pool_.push_back(std::move(*it));
+        it = pictures_.erase(it);
+    }
 }
 
 // ============================================================
@@ -811,6 +826,7 @@ void DPB::reset() {
     // handed out by a prior drain()/flush() is invalidated here (callers must
     // copy out frames they still need before reset).
     pictures_.clear();
+    pool_.clear();
     current_pic_ = nullptr;
     output_queue_.clear();
     pictures_bumped_ = 0;
