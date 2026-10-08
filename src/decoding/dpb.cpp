@@ -48,20 +48,16 @@ int32_t DPB::derive_poc(const SliceHeader& sh, const SPS& sps,
     // §8.3.1: Update prevTid0Pic state
     // "Let prevTid0Pic be the previous picture in decoding order that has
     //  TemporalId equal to 0 and that is not a RASL, RADL or SLNR picture."
+    // SLNR (§3) is every sub-layer non-reference type, at any TemporalId. An
+    // IRAP is never excluded, so a CRA that opens a CVS with a non-zero
+    // slice_pic_order_cnt_lsb carries that LSB forward.
+    const int t = static_cast<int>(nal_type);
     bool isRASL = (nal_type == NalUnitType::RASL_R || nal_type == NalUnitType::RASL_N);
     bool isRADL = (nal_type == NalUnitType::RADL_R || nal_type == NalUnitType::RADL_N);
-    bool isSLNR = (nuh_temporal_id != 0) &&
-                  (nal_type == NalUnitType::TRAIL_N || nal_type == NalUnitType::TSA_N ||
-                   nal_type == NalUnitType::STSA_N);
+    bool isSLNR = t <= 14 && (t % 2) == 0;
     if (nuh_temporal_id == 0 && !isRASL && !isRADL && !isSLNR) {
         prev_poc_lsb_ = static_cast<int32_t>(sh.slice_pic_order_cnt_lsb);
         prev_poc_msb_ = PicOrderCntMsb;
-    }
-
-    // Reset for IRAP with NoRaslOutputFlag
-    if (isIRAP && NoRaslOutputFlag) {
-        prev_poc_lsb_ = 0;
-        prev_poc_msb_ = 0;
     }
 
     HEVC_LOG(PARSE, "POC derived: %d (lsb=%d, msb=%d)",

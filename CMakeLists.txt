@@ -158,6 +158,7 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
         tests/unit/test_discontinuity.cpp
         tests/unit/test_error_policy.cpp
         tests/unit/test_corruption_corpus.cpp
+        tests/unit/test_poc.cpp
     )
 
     target_link_libraries(hevc_tests PRIVATE
