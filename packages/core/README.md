@@ -70,6 +70,33 @@ await transcoder.processInitSegment(initSegmentBytes);
 const h264Segment = await transcoder.processMediaSegment(hevcSegmentBytes);
 ```
 
+### Decoding damaged streams (security cameras, lossy links)
+
+```js
+import { HEVCDecoder, HEVC_FRAME_CORRUPT } from '@hevcjs/core';
+
+const decoder = await HEVCDecoder.create();
+// Opt in to concealment: repair lost slices / missing references instead of
+// freezing until the next IRAP, and decode a stream joined mid-GOP.
+decoder.setErrorPolicy({ concealSliceErrors: true, decodeBeforeIrap: true });
+
+for (const sample of accessUnits) {
+  decoder.feed(sample.data, sample.timestampUs);  // tag = the sample's timestamp
+  for (const frame of decoder.drain()) {
+    // frame.tag is the timestamp of the access unit the picture was coded in —
+    // exact even when the decoder skipped or reordered pictures.
+    render(frame, frame.tag, (frame.flags & HEVC_FRAME_CORRUPT) !== 0);
+  }
+}
+decoder.discontinuity();   // after a gap or splice: no prediction across it
+console.log(decoder.stats); // { picturesDecoded, picturesOutput, skippedWaitIrap, skippedRasl, skippedError, concealed, nalErrors }
+```
+
+`frame.flags`: `HEVC_FRAME_CORRUPT` (errors were concealed), `HEVC_FRAME_MISSING_REF`
+(predicted from an unavailable reference), `HEVC_FRAME_PRE_RECOVERY` (decoded before
+a clean random access point). With the default policy the decoder drops damaged pictures
+and waits for the next IRAP, bit-exact with the reference decoder.
+
 ### Compute-aware ABR primitives
 
 `@hevcjs/core` publishes a `SegmentPerfStat` on every successful segment transcode. Both `@hevcjs/shaka-plugin` and `@hevcjs/dashjs-plugin` consume this bus to cap variants when the device can't keep up. You can subscribe directly if you're integrating with a different player or building custom telemetry:
