@@ -72,20 +72,20 @@ void perform_intra_prediction(DecodingContext& ctx, int x0, int y0,
 // ============================================================
 
 void DecodingContext::set_intra_mode(int x, int y, int size, int mode) {
-    int minTbSize = sps->MinTbSizeY;
-    int x0 = x / minTbSize;
-    int y0 = y / minTbSize;
-    int n = std::max(1, size / minTbSize);
+    const int shift = sps->MinTbLog2SizeY;
+    int x0 = x >> shift;
+    int y0 = y >> shift;
+    int n = std::max(1, size >> shift);
     for (int j = 0; j < n; j++)
         for (int i = 0; i < n; i++)
             intra_pred_mode_y[(y0 + j) * intra_pred_mode_stride + (x0 + i)] = mode;
 }
 
 void DecodingContext::set_chroma_mode(int x, int y, int size, int mode) {
-    int minTbSize = sps->MinTbSizeY;
-    int x0 = x / minTbSize;
-    int y0 = y / minTbSize;
-    int n = std::max(1, size / minTbSize);
+    const int shift = sps->MinTbLog2SizeY;
+    int x0 = x >> shift;
+    int y0 = y >> shift;
+    int n = std::max(1, size >> shift);
     for (int j = 0; j < n; j++)
         for (int i = 0; i < n; i++)
             intra_pred_mode_c[(y0 + j) * intra_pred_mode_stride + (x0 + i)] = mode;
@@ -222,9 +222,9 @@ static bool is_ctb_available(const DecodingContext& ctx, int curX, int curY, int
         nbX >= static_cast<int>(sps.pic_width_in_luma_samples) ||
         nbY >= static_cast<int>(sps.pic_height_in_luma_samples))
         return false;
-    int ctbSize = 1 << sps.CtbLog2SizeY;
-    int curAddr = (curY / ctbSize) * sps.PicWidthInCtbsY + (curX / ctbSize);
-    int nbAddr  = (nbY / ctbSize) * sps.PicWidthInCtbsY + (nbX / ctbSize);
+    const int ctbLog2 = sps.CtbLog2SizeY;
+    int curAddr = (curY >> ctbLog2) * sps.PicWidthInCtbsY + (curX >> ctbLog2);
+    int nbAddr  = (nbY >> ctbLog2) * sps.PicWidthInCtbsY + (nbX >> ctbLog2);
     // Must be already decoded (in tile scan order)
     if (pps.CtbAddrRsToTs[nbAddr] > pps.CtbAddrRsToTs[curAddr])
         return false;

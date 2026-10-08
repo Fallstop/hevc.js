@@ -591,6 +591,16 @@ void perform_dequant(DecodingContext& ctx, int x0, int y0,
     int qpRem = qp % 6;
     int scale = levelScale[qpRem];
 
+    // §8.6.3 collapses to 32-bit arithmetic whenever qpPer <= bdShift:
+    // coeff * m * scale always fits in int32 (|32768 * 255 * 72| < 2^31); only
+    // the << qpPer overflows, and dividing numerator and denominator by
+    // 2^qpPer turns ((X << qpPer) + (1 << (bdShift-1))) >> bdShift into
+    // (X + (1 << (s-1))) >> s with s = bdShift - qpPer (X itself when s == 0).
+    // i64 arithmetic is markedly slower than i32 in WebAssembly. (From upstream.)
+    const int shiftDown = bdShift - qpPer;
+    const bool narrow = (bdShift > 0) && (shiftDown >= 0);
+    const int narrowAdd = (shiftDown >= 1) ? (1 << (shiftDown - 1)) : 0;
+
     // Check scaling lists
     bool useScalingList = ctx.sps->scaling_list_enabled_flag;
 
@@ -660,10 +670,19 @@ void perform_dequant(DecodingContext& ctx, int x0, int y0,
 
             // §8.6.3: d[x][y] = Clip3(coeffMin, coeffMax,
             //   ((coeff * m * levelScale[qP%6] << (qP/6)) + (1<<(bdShift-1))) >> bdShift)
-            int64_t val = static_cast<int64_t>(coeff) * m * scale;
-            val = (val << qpPer) + add;
-            val >>= bdShift;
-            scaled[y * trSize + x] = static_cast<int16_t>(Clip3(-32768, 32767, static_cast<int>(val)));
+            int val32;
+            if (narrow) {
+                const int prod = coeff * m * scale;
+                val32 = (shiftDown >= 1) ? ((prod + narrowAdd) >> shiftDown) : prod;
+            } else {
+                int64_t val = static_cast<int64_t>(coeff) * m * scale;
+                val = (val << qpPer) + add;
+                val >>= bdShift;
+                // Clip while still 64-bit: narrowing first wrapped values past
+                // 2^31 (extreme coefficient levels) to the wrong sign.
+                val32 = static_cast<int>(Clip3<int64_t>(-32768, 32767, val));
+            }
+            scaled[y * trSize + x] = static_cast<int16_t>(Clip3(-32768, 32767, val32));
         }
     }
 
