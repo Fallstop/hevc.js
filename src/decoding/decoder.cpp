@@ -7,6 +7,7 @@
 #include "common/debug.h"
 
 #include <algorithm>
+#include <exception>
 #include <cstring>
 #include <cstdio>
 
@@ -600,18 +601,23 @@ void Decoder::decode_slice_data(const NalUnit& nal, SliceHeader& sh, int slice_n
     bs.seek_to_byte(sh.slice_data_byte_offset);
 
     // Coded size of the slice header, for converting entry-point offsets
-    // (counted in coded bytes, EP bytes included) to RBSP positions. The
-    // RBSP starts after the 2-byte NAL header; EP positions count from there.
+    // (counted in coded bytes, emulation-prevention bytes included) to RBSP
+    // positions. EP positions index the NAL payload after its 2-byte header —
+    // the same coordinates as the header size — and are ascending: every one
+    // before the (growing) coded size belongs to the header.
     size_t slice_header_coded_size = sh.slice_data_byte_offset;
     for (size_t ep : nal.epb_positions) {
-        if (ep < slice_header_coded_size + 2)
-            slice_header_coded_size++;
+        if (ep >= slice_header_coded_size) break;
+        slice_header_coded_size++;
     }
 
     const int start_ts = pps->CtbAddrRsToTs[sh.slice_segment_address];
     bool ok = false;
     try {
         ok = decode_slice_segment_data(ctx, bs, nal.epb_positions, slice_header_coded_size);
+    } catch (const std::exception& e) {
+        HEVC_LOG(PARSE, "Slice %d data: %s", slice_number, e.what());
+        ok = false;
     } catch (...) {
         ok = false;
     }

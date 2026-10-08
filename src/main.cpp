@@ -16,6 +16,8 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --dump-nals      List all NAL units\n");
     fprintf(stderr, "  --dump-headers   Dump parameter sets and slice headers\n");
     fprintf(stderr, "  -o output.yuv    Decode and write YUV output\n");
+    fprintf(stderr, "  --conceal        Conceal slice errors / missing references\n");
+    fprintf(stderr, "  --decode-before-irap  Decode pictures preceding the first IRAP\n");
     fprintf(stderr, "  -h, --help       Show this help\n");
 }
 
@@ -166,10 +168,15 @@ int main(int argc, char* argv[]) {
     const char* output_path = nullptr;
     bool dump_nals = false;
     bool dump_headers = false;
+    hevc::ErrorPolicy policy;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-nals") == 0) {
             dump_nals = true;
+        } else if (strcmp(argv[i], "--conceal") == 0) {
+            policy.conceal_slice_errors = true;
+        } else if (strcmp(argv[i], "--decode-before-irap") == 0) {
+            policy.decode_before_irap = true;
         } else if (strcmp(argv[i], "--dump-headers") == 0) {
             dump_headers = true;
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -258,6 +265,7 @@ int main(int argc, char* argv[]) {
     if (output_path) {
         auto t0 = std::chrono::high_resolution_clock::now();
         hevc::Decoder decoder;
+        decoder.set_error_policy(policy);
         auto status = decoder.decode(data.data(), data.size());
         auto t1 = std::chrono::high_resolution_clock::now();
         double decode_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();

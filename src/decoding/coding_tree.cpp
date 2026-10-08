@@ -648,19 +648,21 @@ static bool decode_wpp_parallel(DecodingContext& ctx, BitstreamReader& bs,
             row_bs.seek_to_byte(substream_byte_pos[substreamIdx]);
         }
 
-        // Init CABAC contexts. A one-CTB-wide picture has no CTB (1, row-1)
-        // to synchronize from (§9.3.1): every row initializes — and waiting
-        // for that CTB would never finish.
+        // A row starts once the row above has decoded the CTB above-right of
+        // its first CTB (or, one CTB wide, the CTB above): intra prediction
+        // and the context synchronization read it.
+        if (row > startRow) {
+            const int needed = std::min(1, numCols - 1);
+            std::unique_lock<std::mutex> lock(row_mutex[row - 1]);
+            row_cv[row - 1].wait(lock, [&] {
+                return completed_col[row - 1].load(std::memory_order_acquire) >= needed;
+            });
+        }
+        // Init CABAC contexts. A one-CTB-wide picture has no CTB above-right
+        // to synchronize from (§9.3.1): every row initializes.
         if (row == startRow || numCols < 2) {
             row_cabac.init_contexts(sliceType, sh.SliceQpY, sh.cabac_init_flag);
         } else {
-            // Wait for row-1 col 1 (2nd CTU) before restoring contexts
-            {
-                std::unique_lock<std::mutex> lock(row_mutex[row - 1]);
-                row_cv[row - 1].wait(lock, [&] {
-                    return completed_col[row - 1].load(std::memory_order_acquire) >= 1;
-                });
-            }
             row_cabac.load_contexts(wpp_ctx_ptr(row - 1));
         }
         row_cabac.init_decoder(row_bs);
@@ -715,6 +717,9 @@ static bool decode_wpp_parallel(DecodingContext& ctx, BitstreamReader& bs,
                 break;
         }
         if (row == lastRow) row_cabac.save_contexts(final_ctx.data());
+        } catch (const std::exception& e) {
+            HEVC_LOG(PARSE, "WPP row %d failed: %s", row, e.what());
+            wpp_failed.store(true, std::memory_order_relaxed);
         } catch (...) {
             wpp_failed.store(true, std::memory_order_relaxed);
         }
