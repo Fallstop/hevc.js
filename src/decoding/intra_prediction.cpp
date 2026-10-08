@@ -103,12 +103,20 @@ static void build_reference_samples(const DecodingContext& ctx, int x0, int y0,
     uint32_t curZScan = zscan_addr((x0 - ctbOriginX) / minBlkSize,
                                     (y0 - ctbOriginY) / minBlkSize);
 
+    // §8.4.4.2.2: with constrained_intra_pred_flag, samples of CUs not coded
+    // in intra mode are not available for intra prediction (and are
+    // substituted like any other unavailable sample).
+    const bool constrainedIntra = ctx.pps->constrained_intra_pred_flag;
+
     auto is_reconstructed = [&](int rx, int ry) -> bool {
         if (rx < 0 || ry < 0 || rx >= picW || ry >= picH) return false;
 
         // Map component coords back to luma for the luma-space availability checks.
         int lumaRx = (cIdx > 0) ? rx * sps.SubWidthC : rx;
         int lumaRy = (cIdx > 0) ? ry * sps.SubHeightC : ry;
+
+        if (constrainedIntra && ctx.cu_at(lumaRx, lumaRy).pred_mode != PredMode::MODE_INTRA)
+            return false;
 
         int refCtbX = lumaRx / ctbSize;
         int refCtbY = lumaRy / ctbSize;
