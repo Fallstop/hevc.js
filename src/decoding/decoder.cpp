@@ -661,6 +661,7 @@ void Decoder::finish_picture() {
     int decoded = 0;
     for (uint8_t d : ctb_decoded_buf_) decoded += d;
     if (pend_.error || decoded != sps->PicSizeInCtbsY || pend_.slices.empty()) {
+        HEVC_LOG(PARSE, "Picture incomplete: %d of %d CTBs decoded", decoded, sps->PicSizeInCtbsY);
         // The first slice header decoded (POC, RPS and output order are
         // known), so a forgiving decoder repairs the picture instead of
         // dropping it and freezing until the next IRAP.
@@ -681,6 +682,10 @@ void Decoder::finish_picture() {
     try {
         apply_deblocking(ctx);
         apply_sao(ctx);
+    } catch (const std::exception& e) {
+        HEVC_LOG(PARSE, "In-loop filters failed: %s", e.what());
+        fail_picture();
+        return;
     } catch (...) {
         fail_picture();
         return;
