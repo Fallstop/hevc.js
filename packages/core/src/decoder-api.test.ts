@@ -151,3 +151,33 @@ describe("HEVCDecoder.stats", () => {
     expect(m._free).toHaveBeenCalledWith(512);
   });
 });
+
+describe("HEVCDecoder.discontinuity", () => {
+  it("forwards to hevc_decoder_discontinuity", () => {
+    const discontinuity = vi.fn().mockReturnValue(0);
+    const d = makeDecoder({}, { discontinuity });
+    d.discontinuity();
+    expect(discontinuity).toHaveBeenCalledWith(7);
+  });
+
+  it("invalidates outstanding views (bumps the generation)", () => {
+    const discontinuity = vi.fn().mockReturnValue(0);
+    const d = makeDecoder({}, { discontinuity });
+    const gen = d._gen;
+    d.discontinuity();
+    expect(d._gen).toBe(gen + 1);
+  });
+
+  it("throws on a native error", () => {
+    const d = makeDecoder({}, { discontinuity: vi.fn().mockReturnValue(-1) });
+    expect(() => d.discontinuity()).toThrow(/Discontinuity failed/);
+  });
+
+  it("is a no-op once destroyed", () => {
+    const discontinuity = vi.fn().mockReturnValue(0);
+    const d = makeDecoder({}, { discontinuity });
+    d._dec = 0;
+    d.discontinuity();
+    expect(discontinuity).not.toHaveBeenCalled();
+  });
+});

@@ -726,6 +726,18 @@ std::vector<Picture*> Decoder::output_pictures() {
     return out;
 }
 
+void Decoder::discontinuity() {
+    finish_picture();
+    dpb_.discontinuity();
+    // §8.1: the next IRAP opens a new CVS — a CRA takes NoRaslOutputFlag = 1
+    no_irap_yet_ = true;
+    handle_cra_as_first_ = true;
+    skip_to_next_irap_ = false;
+    // A recovery point announced before the discontinuity belongs to a
+    // picture that will not come.
+    has_pending_recovery_point_ = false;
+}
+
 void Decoder::reset(bool clear_parameter_sets) {
     pend_.mode = PendingMode::NONE;
     pend_.pic = nullptr;

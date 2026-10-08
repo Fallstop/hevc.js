@@ -659,6 +659,24 @@ Picture* DPB::find_by_poc_lsb(int32_t poc_lsb, int32_t max_poc_lsb) const {
     return nullptr;
 }
 
+void DPB::discontinuity() {
+    for (auto& pic : pictures_) {
+        pic->used_for_short_term_ref = false;
+        pic->used_for_long_term_ref = false;
+    }
+    bump_all();
+    current_pic_ = nullptr;
+    ref_pic_set_st_curr_before_.clear();
+    ref_pic_set_st_curr_after_.clear();
+    ref_pic_set_st_foll_.clear();
+    ref_pic_set_lt_curr_.clear();
+    ref_pic_set_lt_foll_.clear();
+    ref_pic_list0_.clear();
+    ref_pic_list1_.clear();
+    col_pic_ = nullptr;
+    no_backward_pred_flag_ = false;
+}
+
 void DPB::reset() {
     // Drop all decoded pictures. These shared_ptrs are the sole owners of the
     // Picture pixel buffers, so clearing frees that memory; any raw Picture*

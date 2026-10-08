@@ -39,6 +39,7 @@ interface DecoderAPI {
   getDrainedFrame: (dec: number, index: number, framePtr: number) => number;
   flush: (dec: number) => number;
   reset: (dec: number, clearParameterSets: number) => number;
+  discontinuity: (dec: number) => number;
 }
 
 /**
@@ -80,6 +81,7 @@ export class HEVCDecoder {
       getDrainedFrame: module.cwrap("hevc_decoder_get_drained_frame", "number", ["number", "number", "number"]) as (dec: number, index: number, framePtr: number) => number,
       flush: module.cwrap("hevc_decoder_flush", "number", ["number"]) as (dec: number) => number,
       reset: module.cwrap("hevc_decoder_reset", "number", ["number", "number"]) as (dec: number, clearParameterSets: number) => number,
+      discontinuity: module.cwrap("hevc_decoder_discontinuity", "number", ["number"]) as (dec: number) => number,
     };
     this._dec = this._api.create();
     if (!this._dec) throw new Error("Failed to create HEVC decoder");
@@ -466,6 +468,25 @@ export class HEVCDecoder {
     this._gen++; // drops DPB/POC state — invalidates any outstanding views
     const ret = this._api.reset(this._dec, clearParameterSets ? 1 : 0);
     if (ret !== 0) throw new Error(`Reset failed (code ${ret})`);
+  }
+
+  /**
+   * Declare a discontinuity in the input — a splice, a seek, or a gap in a
+   * live feed — far cheaper than `reset(false)`: parameter sets, WASM memory
+   * and stats are kept, and pictures already decoded but awaiting output are
+   * released to the next `drain()` (they are not lost). Every decoded picture
+   * stops being a reference, so nothing fed afterwards is predicted from data
+   * before the call; decoding restarts at the next IRAP as if it opened the
+   * stream (a CRA's RASL pictures are skipped). Non-IRAP pictures before that
+   * IRAP are skipped unless `setErrorPolicy({ decodeBeforeIrap: true })`.
+   *
+   * Frames from an earlier `drain()` stay valid; views are invalidated.
+   */
+  discontinuity(): void {
+    if (!this._dec) return;
+    this._gen++; // releases pictures to the output queue
+    const ret = this._api.discontinuity(this._dec);
+    if (ret !== 0) throw new Error(`Discontinuity failed (code ${ret})`);
   }
 
   /** Release decoder resources */

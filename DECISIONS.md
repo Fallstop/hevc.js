@@ -271,3 +271,21 @@ are cumulative `uint32` (reset by `reset()`); the caller diffs them.
 **Consequence**: `MISSING_REF` is now visible under the default policy too: a
 picture whose RPS names a picture the decoder never saw (a whole access unit
 lost) is decoded with neutral-grey prediction where it references it, and says so.
+
+## AD-015 : discontinuity() — a cut in the input, not a new decoder
+
+**Context**: a live feed with a gap, a splice of archive clips or a seek within
+one stream needed `reset(false)`, which also throws away every decoded picture
+not yet output and the decoder's statistics, and still relies on the caller to
+know that the next CRA's RASL pictures cannot be decoded.
+
+**Decision**: `hevc_decoder_discontinuity(dec)` / `discontinuity()`:
+- finishes the picture being assembled;
+- marks every stored picture unused for reference, so nothing fed afterwards is
+  predicted from a picture before the call;
+- bumps every picture awaiting output into the output queue (the next `drain()`
+  returns them in output order — nothing decoded is lost);
+- re-arms the §8.1 tune-in state: the next CRA gets NoRaslOutputFlag = 1 (as
+  HandleCraAsBlaFlag would), and non-IRAP pictures before the next IRAP are
+  skipped (`skipped_wait_irap`) unless the error policy decodes them;
+- keeps parameter sets, scratch allocations, POC carry-over and statistics.

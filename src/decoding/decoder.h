@@ -81,6 +81,16 @@ public:
     // invalidated by reset(); drain out every frame you still need first.
     void reset(bool clear_parameter_sets = true);
 
+    // Declare a discontinuity in the input (a splice, a seek, a gap in a live
+    // feed). Cheaper than reset(false): parameter sets, buffers, stats and
+    // the pictures still awaiting output are kept — the latter are released
+    // to the next drain(). The picture being assembled is finished, every
+    // decoded picture stops being a reference, and decoding restarts at the
+    // next IRAP as if it opened the bitstream: a CRA is handled like a BLA
+    // (NoRaslOutputFlag = 1, its RASL pictures skipped), and non-IRAP pictures
+    // before it are skipped (or, with decode_before_irap, decoded concealed).
+    void discontinuity();
+
     // Get DPB (for testing)
     const DPB& dpb() const { return dpb_; }
 

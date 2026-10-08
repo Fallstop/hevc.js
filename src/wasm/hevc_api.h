@@ -131,6 +131,19 @@ int hevc_decoder_get_drained_frame(HEVCDecoder* dec, int index, HEVCFrame* frame
 // After flush, drain to get the remaining frames.
 int hevc_decoder_flush(HEVCDecoder* dec);
 
+// Declare a discontinuity in the input (splice, seek, gap in a live feed).
+// Much cheaper than hevc_decoder_reset(dec, 0): parameter sets, allocations,
+// stats and the pictures already decoded are kept. The picture being assembled
+// is finished; every decoded picture stops being a reference, so nothing fed
+// afterwards is predicted from data before the call; pictures awaiting output
+// are released to the next hevc_decoder_drain() (or flush). Decoding restarts
+// at the next IRAP as if it opened the bitstream: a CRA is handled like a BLA
+// (NoRaslOutputFlag = 1, its RASL pictures skipped), and non-IRAP pictures
+// before it are skipped unless the error policy decodes them.
+// Frame pointers from a prior drain/flush stay valid until the next feed.
+// Returns HEVC_OK, or HEVC_ERROR on a null decoder.
+int hevc_decoder_discontinuity(HEVCDecoder* dec);
+
 // Reset the decoder so the same handle can decode a new, independent stream
 // without destroy()/create(). Drops the DPB and POC state and, when
 // clear_parameter_sets is non-zero, the stored VPS/SPS/PPS. The decoder's

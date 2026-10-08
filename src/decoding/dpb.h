@@ -156,6 +156,12 @@ public:
     // can keep more than that marked as reference; storage is capped anyway.
     static constexpr int kMaxDpbPictures = 16;
 
+    // Stream discontinuity (splice / seek / packet gap): every stored picture
+    // stops being a reference, so nothing decoded afterwards can predict from
+    // it, and every picture still awaiting output is bumped to the output
+    // queue. Storage, POC state and parameter sets are kept.
+    void discontinuity();
+
     // Reset all decode state to a freshly-constructed condition: drops every
     // stored picture (freeing pixel memory), clears the POC carry-over used by
     // §8.3.1 (prevTid0Pic) and the first-picture flag, and clears the cached

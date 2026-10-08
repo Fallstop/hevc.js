@@ -184,6 +184,16 @@ int hevc_decoder_flush(HEVCDecoder* dec) {
     }
 }
 
+int hevc_decoder_discontinuity(HEVCDecoder* dec) {
+    if (!dec) return HEVC_ERROR;
+    try {
+        dec->decoder.discontinuity();
+        return HEVC_OK;
+    } catch (...) {
+        return HEVC_ERROR;
+    }
+}
+
 int hevc_decoder_reset(HEVCDecoder* dec, int clear_parameter_sets) {
     if (!dec) return HEVC_ERROR;
 
