@@ -212,6 +212,35 @@ describe("HEVCDecoder (real WASM)", () => {
     dec.destroy();
   });
 
+  it("repeated input: one frame per access unit, a repeated still once per feed", async (ctx) => {
+    if (!available) ctx.skip();
+    const aus = accessUnits(fixture("multislice_qcif_8f.265"));
+    // Every access unit received twice in its own feed (a duplicating relay)
+    const doubled = aus.map((au) => {
+      const two = new Uint8Array(au.length * 2);
+      two.set(au);
+      two.set(au, au.length);
+      return two;
+    });
+    const { frames, stats } = await decodeTagged(doubled, (d) => d.setErrorPolicy({ concealSliceErrors: true }));
+    expect(frames).toHaveLength(aus.length);
+    expect(new Set(frames.map((f) => f.tag)).size).toBe(aus.length);
+    expect(frames.every((f) => f.flags === 0)).toBe(true);
+    expect(stats.nalErrors).toBeGreaterThan(0);
+    expect(stats.skippedError).toBe(0);
+
+    // The IDR fed again in later calls: a still image, one frame per feed
+    const dec = await HEVCDecoder.create();
+    const tags: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      dec.feed(aus[0]!, i);
+      tags.push(...dec.drain().map((f) => f.tag));
+    }
+    tags.push(...dec.flush().map((f) => f.tag));
+    expect(tags).toEqual([0, 1, 2]);
+    dec.destroy();
+  });
+
   it("flushViews() at a segment end hands over the frames held for reordering", async (ctx) => {
     if (!available) ctx.skip();
     const aus = accessUnits(fixture("opengop_qcif_12f.265"));
