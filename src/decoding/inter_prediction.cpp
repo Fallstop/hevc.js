@@ -16,20 +16,19 @@ namespace hevc {
 
 void store_pu_motion(DecodingContext& ctx, int xPb, int yPb,
                      int nPbW, int nPbH, const PUMotionInfo& mi) {
-    int minPuSize = ctx.sps->MinTbSizeY;  // 4x4 granularity
+    // 4x4 granularity (prediction blocks can be 4 samples wide or tall)
     int stride = ctx.motion_info_stride;
-    for (int y = 0; y < nPbH; y += minPuSize) {
-        for (int x = 0; x < nPbW; x += minPuSize) {
-            int idx = ((yPb + y) / minPuSize) * stride + ((xPb + x) / minPuSize);
+    for (int y = 0; y < nPbH; y += 4) {
+        for (int x = 0; x < nPbW; x += 4) {
+            int idx = ((yPb + y) >> 2) * stride + ((xPb + x) >> 2);
             ctx.motion_info[idx] = mi;
         }
     }
 }
 
 PUMotionInfo get_pu_motion(const DecodingContext& ctx, int x, int y) {
-    int minPuSize = ctx.sps->MinTbSizeY;
     int stride = ctx.motion_info_stride;
-    int idx = (y / minPuSize) * stride + (x / minPuSize);
+    int idx = (y >> 2) * stride + (x >> 2);
     return ctx.motion_info[idx];
 }
 
@@ -146,10 +145,9 @@ static bool derive_collocated_mv_at(const DecodingContext& ctx,
                                      Picture* colPic, int xCol, int yCol,
                                      int refIdxLX, int listX,
                                      MV& mvLXCol) {
-    int minPuSize = ctx.sps->MinTbSizeY;
     int xColQ = (xCol >> 4) << 4;
     int yColQ = (yCol >> 4) << 4;
-    int miIdx = (yColQ / minPuSize) * colPic->motion_info_stride + (xColQ / minPuSize);
+    int miIdx = (yColQ >> 2) * colPic->motion_info_stride + (xColQ >> 2);
     if (miIdx < 0 || miIdx >= static_cast<int>(colPic->motion_info_buf.size())) return false;
     const auto& colMi = colPic->motion_info_buf[miIdx];
 

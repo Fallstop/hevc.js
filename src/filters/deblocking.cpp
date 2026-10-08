@@ -369,10 +369,9 @@ static int derive_bs(const DecodingContext& ctx, int xP, int yP, int xQ, int yQ,
         return 1;
 
     // Inter prediction comparison
-    int minTbLog2 = sps.MinTbLog2SizeY;
     int miStride = ctx.motion_info_stride;
-    auto& miP = ctx.motion_info[(yP >> minTbLog2) * miStride + (xP >> minTbLog2)];
-    auto& miQ = ctx.motion_info[(yQ >> minTbLog2) * miStride + (xQ >> minTbLog2)];
+    auto& miP = ctx.motion_info[(yP >> 2) * miStride + (xP >> 2)];
+    auto& miQ = ctx.motion_info[(yQ >> 2) * miStride + (xQ >> 2)];
 
     int nRefP = (miP.pred_flag[0] ? 1 : 0) + (miP.pred_flag[1] ? 1 : 0);
     int nRefQ = (miQ.pred_flag[0] ? 1 : 0) + (miQ.pred_flag[1] ? 1 : 0);

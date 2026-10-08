@@ -365,23 +365,28 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek) {
     chroma_mode_buf_.resize(modeGridW * modeGridH);
     std::fill(chroma_mode_buf_.begin(), chroma_mode_buf_.end(), 0); // Planar default
 
-    // Motion info grid at min-PU (4x4) granularity for inter MV storage
-    motion_info_buf_.resize(modeGridW * modeGridH);
+    // Motion info and filter grids are at 4x4 granularity whatever the
+    // minimum TB size: prediction blocks can be 4 samples tall/wide (AMP on a
+    // 16x16 CU) even when MinTbSizeY is 8, and the filter grids are indexed
+    // in 4-sample units. Sizing them by MinTbSizeY overran them.
+    const int grid4W = static_cast<int>(sps->pic_width_in_luma_samples) >> 2;
+    const int grid4H = static_cast<int>(sps->pic_height_in_luma_samples) >> 2;
+    motion_info_buf_.resize(grid4W * grid4H);
     std::fill(motion_info_buf_.begin(), motion_info_buf_.end(), PUMotionInfo{});
     // Allocate compact motion info in the Picture itself (for TMVP by future frames)
-    pic->motion_info_buf.resize(modeGridW * modeGridH);
+    pic->motion_info_buf.resize(grid4W * grid4H);
     std::fill(pic->motion_info_buf.begin(), pic->motion_info_buf.end(), Picture::PUMotionInfoCompact{});
-    pic->motion_info_stride = modeGridW;
+    pic->motion_info_stride = grid4W;
 
-    // Phase 6: filter grids at min-TB (4x4) granularity
-    cbf_luma_buf_.resize(modeGridW * modeGridH, 0);
+    // Phase 6: filter grids at 4x4 granularity
+    cbf_luma_buf_.resize(grid4W * grid4H, 0);
     std::fill(cbf_luma_buf_.begin(), cbf_luma_buf_.end(), 0);
-    log2_tu_size_buf_.resize(modeGridW * modeGridH, sps->CtbLog2SizeY);
+    log2_tu_size_buf_.resize(grid4W * grid4H, sps->CtbLog2SizeY);
     std::fill(log2_tu_size_buf_.begin(), log2_tu_size_buf_.end(),
               static_cast<uint8_t>(sps->CtbLog2SizeY));
-    edge_flags_v_buf_.resize(modeGridW * modeGridH, 0);
+    edge_flags_v_buf_.resize(grid4W * grid4H, 0);
     std::fill(edge_flags_v_buf_.begin(), edge_flags_v_buf_.end(), 0);
-    edge_flags_h_buf_.resize(modeGridW * modeGridH, 0);
+    edge_flags_h_buf_.resize(grid4W * grid4H, 0);
     std::fill(edge_flags_h_buf_.begin(), edge_flags_h_buf_.end(), 0);
 
     // Phase 6: SAO params per CTU
@@ -430,12 +435,12 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek) {
     ctx.intra_pred_mode_c = chroma_mode_buf_.data();
     ctx.intra_pred_mode_stride = modeGridW;
     ctx.motion_info = motion_info_buf_.data();
-    ctx.motion_info_stride = modeGridW;
+    ctx.motion_info_stride = grid4W;
     ctx.cbf_luma_grid = cbf_luma_buf_.data();
     ctx.log2_tu_size_grid = log2_tu_size_buf_.data();
     ctx.edge_flags_v = edge_flags_v_buf_.data();
     ctx.edge_flags_h = edge_flags_h_buf_.data();
-    ctx.filter_grid_stride = modeGridW;
+    ctx.filter_grid_stride = grid4W;
     ctx.sao_params = sao_params_buf_.data();
     ctx.sao_params_stride = sps->PicWidthInCtbsY;
     ctx.sao_backup = sao_backup_;
