@@ -143,6 +143,7 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
         tests/unit/test_tagged_output.cpp
         tests/unit/test_discontinuity.cpp
         tests/unit/test_error_policy.cpp
+        tests/unit/test_corruption_corpus.cpp
     )
 
     target_link_libraries(hevc_tests PRIVATE
@@ -154,9 +155,21 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
         FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/conformance/fixtures"
     )
 
+    # Fuzz smoke: thousands of mutated fixtures under every policy/feeding
+    # mode, in one ASan process (tests/fuzz/fuzz_smoke.cpp).
+    add_executable(hevc_fuzz_smoke tests/fuzz/fuzz_smoke.cpp)
+    target_link_libraries(hevc_fuzz_smoke PRIVATE hevc-decode-lib)
+    target_compile_definitions(hevc_fuzz_smoke PRIVATE
+        FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/conformance/fixtures")
+    add_test(NAME fuzz_smoke COMMAND hevc_fuzz_smoke --iterations 300 --quiet)
+    set_tests_properties(fuzz_smoke PROPERTIES LABELS "fuzz" TIMEOUT 900
+        ENVIRONMENT "HEVC_DEBUG_FILTER=none")
+
     include(GoogleTest)
     # A non-terminating decode loop must fail the suite, not stall it.
-    gtest_discover_tests(hevc_tests PROPERTIES TIMEOUT 300)
+    # HEVC_DEBUG_FILTER=none: Debug builds log every category by default, which
+    # dominates the suite's run time and output.
+    gtest_discover_tests(hevc_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "HEVC_DEBUG_FILTER=none")
 
     # Oracle tests — compare decoded YUV MD5 against reference
     # These tests require the decoder to produce YUV output (-o flag)
