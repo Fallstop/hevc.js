@@ -34,9 +34,11 @@ Module._hevc_decoder_decode(dec, ptr, data.length);
 const frames = Module._hevc_decoder_get_frame_count(dec);
 
 // HEVCFrame: y,cb,cr (3 ptrs) then width,height,stride_y,stride_c,chroma_width,
-// chroma_height,bit_depth,poc,bytes_per_sample (9 ints). 48 bytes in wasm32.
-const fp = Module._malloc(48);
-const I32 = (off) => Module.HEAP32[(fp + off) >> 2];
+// chroma_height,bit_depth,poc,bytes_per_sample (9 ints), then tag (f64) and
+// flags (int): 64 bytes in wasm32 (48 before the tag was added — over-allocating
+// is harmless for older builds).
+const fp = Module._malloc(64);
+const I32 = (off) => Module.getValue(fp + off, "i32");
 const hash = createHash('sha256');
 for (let i = 0; i < frames; i++) {
     Module._hevc_decoder_get_frame(dec, i, fp);

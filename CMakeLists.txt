@@ -73,13 +73,28 @@ if(BUILD_WASM)
         OUTPUT_NAME "hevc-decode"
         SUFFIX ".js"
     )
-    # Enable exceptions + SIMD 128-bit for the whole project in WASM mode.
+    # Exception handling. The decoder contains bitstream errors with C++
+    # exceptions (over-read, Exp-Golomb overflow, ...). Native WebAssembly
+    # exception handling (legacy proposal: Chrome 95+, Firefox 100+,
+    # Safari 15.2+ — below the SIMD floor this build already requires) makes a
+    # try block free until something throws; the JS-based emulation routes
+    # every call that may throw through an invoke_* trampoline into JS.
+    option(HEVC_WASM_NATIVE_EH "Use native WebAssembly exception handling" ON)
+    if(HEVC_WASM_NATIVE_EH)
+        set(HEVC_WASM_EH_COMPILE -fwasm-exceptions "SHELL:-s WASM_LEGACY_EXCEPTIONS=1")
+        set(HEVC_WASM_EH_LINK -fwasm-exceptions "SHELL:-s WASM_LEGACY_EXCEPTIONS=1")
+    else()
+        set(HEVC_WASM_EH_COMPILE -fexceptions)
+        set(HEVC_WASM_EH_LINK "SHELL:-s NO_DISABLE_EXCEPTION_CATCHING=1")
+    endif()
+    # SIMD 128-bit for the whole project in WASM mode.
     # -msse2 lets emscripten lower our portable SSE2 kernels (<emmintrin.h>) to
     # wasm128 — the same intrinsics compile natively on x86-64, so the oracle
     # tests verify the exact code that ships to WASM.
-    target_compile_options(hevc-decode-lib PRIVATE -fexceptions -msimd128 -msse2)
+    target_compile_options(hevc-decode-lib PRIVATE ${HEVC_WASM_EH_COMPILE} -msimd128 -msse2)
+    target_link_options(hevc-wasm PRIVATE ${HEVC_WASM_EH_LINK})
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-        target_compile_options(hevc-wasm PRIVATE -O0 -g -fexceptions -msimd128)
+        target_compile_options(hevc-wasm PRIVATE -O0 -g ${HEVC_WASM_EH_COMPILE} -msimd128)
         # Debug: keep emscripten runtime sanity checks (stack cookies, bounds).
         target_link_options(hevc-wasm PRIVATE "SHELL:-s ASSERTIONS=1")
     else()
@@ -88,7 +103,7 @@ if(BUILD_WASM)
         # Bit-exact (verified vs oracle); ~3% faster decode at 1080p and 4K.
         # NB: -flto was measured here and REGRESSED decode ~3% (emcc's cross-TU
         # inlining bloats the hot path / hurts I-cache), so it is intentionally off.
-        target_compile_options(hevc-wasm PRIVATE -O3 -fexceptions -msimd128)
+        target_compile_options(hevc-wasm PRIVATE -O3 ${HEVC_WASM_EH_COMPILE} -msimd128)
         target_link_options(hevc-wasm PRIVATE "SHELL:-s ASSERTIONS=0")
     endif()
     target_link_options(hevc-wasm PRIVATE
@@ -97,7 +112,6 @@ if(BUILD_WASM)
         "SHELL:-s MODULARIZE=1"
         "SHELL:-s EXPORT_NAME=HEVCDecoderModule"
         "SHELL:-s STACK_SIZE=4194304"
-        "SHELL:-s NO_DISABLE_EXCEPTION_CATCHING=1"
         "SHELL:-s EXPORTED_FUNCTIONS=[_hevc_decoder_create,_hevc_decoder_destroy,_hevc_decoder_decode,_hevc_decoder_get_frame_count,_hevc_decoder_get_frame,_hevc_decoder_get_info,_hevc_decoder_get_recovery_point,_hevc_decoder_feed,_hevc_decoder_feed_tagged,_hevc_decoder_get_stats,_hevc_decoder_set_error_policy,_hevc_decoder_drain,_hevc_decoder_get_drained_frame,_hevc_decoder_flush,_hevc_decoder_reset,_hevc_decoder_discontinuity,_malloc,_free]"
         "SHELL:-s EXPORTED_RUNTIME_METHODS=[ccall,cwrap,getValue,HEAPU8,HEAPU16]"
     )
