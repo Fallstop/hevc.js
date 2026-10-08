@@ -66,27 +66,18 @@ void Decoder::process_nal(const NalUnit& nal) {
     switch (type) {
     case NalUnitType::VPS_NUT:
     case NalUnitType::SPS_NUT:
-    case NalUnitType::PPS_NUT: {
-        // A parameter set starts a new access unit (§7.4.2.4.4); the picture
-        // being assembled can receive no further slices, and must not see its
-        // parameter sets change under it.
-        finish_picture();
-        // A corrupt or truncated parameter set must not throw out of feed()
-        // and lose the rest of the buffer. The manager only stores a set that
-        // parsed completely, so the previous valid one stays in force.
-        bool ok = false;
-        try {
-            ok = ps_mgr_.process_nal(nal);
-        } catch (...) {
-            ok = false;
+    case NalUnitType::PPS_NUT:
+        // §7.4.2.4.4 allows parameter sets between the slices of a picture
+        // (§7.4.3.3: a repeated PPS, same content). The picture being
+        // assembled must not see its parameter sets change under it: hold the
+        // set back until that picture is finished.
+        if (pend_.mode != PendingMode::NONE) {
+            if (deferred_ps_.size() < kMaxDeferredParameterSets) deferred_ps_.push_back(nal);
+            else stats_.nal_errors++;
+            break;
         }
-        if (!ok) {
-            stats_.nal_errors++;
-            HEVC_LOG(PARSE, "Parameter set NAL type %d rejected; keeping the previous one",
-                     static_cast<int>(type));
-        }
+        process_parameter_set(nal);
         break;
-    }
     case NalUnitType::AUD_NUT:
         finish_picture();
         break;
@@ -95,6 +86,7 @@ void Decoder::process_nal(const NalUnit& nal) {
         // §8.1: after an end of sequence the next CRA is the first picture of a
         // CVS (NoRaslOutputFlag == 1, RASL discarded). EOB behaves the same.
         finish_picture();
+        done_sigs_.clear();
         handle_cra_as_first_ = true;
         break;
     case NalUnitType::PREFIX_SEI:
@@ -124,9 +116,40 @@ void Decoder::process_nal(const NalUnit& nal) {
     }
 }
 
+void Decoder::process_parameter_set(const NalUnit& nal) {
+    // A corrupt or truncated parameter set must not throw out of feed() and
+    // lose the rest of the buffer. The manager only stores a set that parsed
+    // completely, so the previous valid one stays in force.
+    bool ok = false;
+    try {
+        ok = ps_mgr_.process_nal(nal);
+    } catch (...) {
+        ok = false;
+    }
+    if (!ok) {
+        stats_.nal_errors++;
+        HEVC_LOG(PARSE, "Parameter set NAL type %d rejected; keeping the previous one",
+                 static_cast<int>(nal.header.nal_unit_type));
+    }
+}
+
 // ============================================================
 // Picture assembly
 // ============================================================
+
+Decoder::SegmentSig Decoder::segment_sig(const NalUnit& nal) {
+    // FNV-1a over the NAL type and the first and last bytes of the payload:
+    // enough to tell a repeated NAL unit from another segment, at a cost
+    // independent of the slice size.
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](uint8_t b) { h = (h ^ b) * 1099511628211ull; };
+    mix(static_cast<uint8_t>(nal.header.nal_unit_type));
+    const size_t n = nal.rbsp.size();
+    const size_t head = std::min<size_t>(n, 64);
+    for (size_t i = 0; i < head; i++) mix(nal.rbsp[i]);
+    for (size_t i = std::max(head, n - std::min<size_t>(n, 64)); i < n; i++) mix(nal.rbsp[i]);
+    return SegmentSig{h, n};
+}
 
 bool Decoder::peek_slice(const NalUnit& nal, SlicePeek& out) const {
     if (nal.rbsp.empty()) return false;
@@ -166,74 +189,134 @@ bool Decoder::peek_slice(const NalUnit& nal, SlicePeek& out) const {
     return true;
 }
 
-void Decoder::process_vcl(const NalUnit& nal) {
-    SlicePeek pk;
-    bool peeked = false;
+bool Decoder::try_peek_slice(const NalUnit& nal, SlicePeek& out) const {
     try {
-        peeked = peek_slice(nal, pk);
+        return peek_slice(nal, out);
     } catch (...) {
-        peeked = false;
+        return false;
     }
+}
 
-    if (!peeked) {
-        // The slice header does not even parse far enough to tell which
-        // picture it belongs to. Inside a picture, count it as a lost slice
-        // of that picture; otherwise the picture it started is lost.
-        if (pend_.mode == PendingMode::DECODING) {
-            pend_.error = true;
-            pend_.prev_segment_ok = false;
-        } else if (pend_.mode == PendingMode::NONE) {
-            stats_.skipped_error++;
-            skip_to_next_irap_ = true;
-        }
-        return;
+Decoder::SliceFit Decoder::fit_pending(const SlicePeek& pk, NalUnitType nut,
+                                       const SegmentSig& sig) const {
+    // A NAL unit repeated (a retransmission, a duplicating relay) adds nothing
+    if (std::find(pend_.sigs.begin(), pend_.sigs.end(), sig) != pend_.sigs.end())
+        return SliceFit::STRAY;
+    const bool same_poc = pk.has_poc && pend_.has_poc && pk.poc_lsb == pend_.poc_lsb;
+    if (pk.first_slice) {
+        // §8.3.1: POC is unique within a CVS. A first slice naming the pending
+        // picture's POC is not another picture (a corrupt or repeated one).
+        return same_poc && pk.pps_id == pend_.pps_id && !is_irap(nut) ? SliceFit::STRAY
+                                                                       : SliceFit::NEW;
     }
+    // §7.4.2.4.5: the segments of a picture share its PPS and POC ...
+    if (pk.pps_id != pend_.pps_id) return SliceFit::NEW;
+    if (!pk.dependent && pk.has_poc != pend_.has_poc) return SliceFit::NEW;
+    if (pk.has_poc && pend_.has_poc && !same_poc) return SliceFit::NEW;
+    // ... and follow its first segment in increasing address order. A failed
+    // segment only claims its start, so the segment after it still fits.
+    if (pk.address_ts > pend_.last_start_ts) return SliceFit::SAME;
+    // Behind the last segment: with the picture's POC, an out-of-order or
+    // corrupt segment of it; without a POC to tell, the next picture (whose
+    // first segment was lost).
+    return same_poc ? SliceFit::STRAY : SliceFit::NEW;
+}
+
+void Decoder::drop_stray_segment(const SlicePeek& pk) {
+    HEVC_LOG(PARSE, "Repeated or stray slice segment dropped (addr=%u)", pk.address);
+    (void)pk;
+    stats_.nal_errors++;
+}
+
+void Decoder::process_vcl(const NalUnit& nal) {
+    const NalUnitType nut = nal.header.nal_unit_type;
+    const SegmentSig sig = segment_sig(nal);
+    SlicePeek pk;
+    bool peeked = try_peek_slice(nal, pk);
 
     if (pend_.mode != PendingMode::NONE) {
-        // §7.4.2.4.5: the segments of a picture follow its first segment in
-        // increasing address order and share its PPS and POC. Anything else
-        // starts a new picture — typically one whose first slice was lost.
-        const bool same_picture =
-            !pk.first_slice && pk.pps_id == pend_.pps_id &&
-            pk.address_ts >= pend_.next_ctb_ts &&
-            (!pk.has_poc || !pend_.has_poc || pk.poc_lsb == pend_.poc_lsb);
-        if (same_picture) {
-            if (pend_.mode == PendingMode::SKIPPING) {
-                pend_.next_ctb_ts = pk.address_ts + 1;
-            } else {
-                decode_slice(nal, pk, nullptr);
-                if (pend_.mode == PendingMode::DECODING && pend_.sps &&
-                    pend_.next_ctb_ts >= pend_.sps->PicSizeInCtbsY)
-                    finish_picture();
+        if (peeked) {
+            switch (fit_pending(pk, nut, sig)) {
+            case SliceFit::SAME:
+                add_segment(nal, pk, sig);
+                return;
+            case SliceFit::STRAY:
+                drop_stray_segment(pk);
+                return;
+            case SliceFit::NEW:
+                break;
+            }
+        } else if (deferred_ps_.empty()) {
+            // The slice header does not parse far enough to tell which
+            // picture it belongs to: count it as a lost slice of this one.
+            if (pend_.mode == PendingMode::DECODING) {
+                pend_.error = true;
+                pend_.prev_segment_ok = false;
             }
             return;
         }
+        // The pending picture is complete as far as it goes; parameter sets
+        // held back while it was assembled take effect now, and the slice
+        // may refer to them.
+        const bool sets_changed = !deferred_ps_.empty();
         finish_picture();
+        if (sets_changed) peeked = try_peek_slice(nal, pk);
+    } else if (peeked && !pk.first_slice &&
+               std::find(done_sigs_.begin(), done_sigs_.end(), sig) != done_sigs_.end()) {
+        // A repeat of a segment of the picture just completed
+        drop_stray_segment(pk);
+        return;
+    }
+
+    if (!peeked) {
+        // The picture this slice belongs to is lost.
+        stats_.skipped_error++;
+        skip_to_next_irap_ = true;
+        return;
     }
 
     if (pk.dependent) {
         // A dependent segment with no picture to continue: its independent
-        // segment (and the picture's POC/RPS) were lost.
+        // segment (and the picture's POC/RPS) were lost. Concealment
+        // substitutes the lost picture where it is referenced; otherwise
+        // resynchronize at the next IRAP.
         HEVC_LOG(PARSE, "Orphan dependent slice segment dropped (addr=%u)", pk.address);
         stats_.skipped_error++;
-        skip_to_next_irap_ = true;
-        begin_skip(pk, nal.header.nal_unit_type);
+        if (!policy_.conceal_slice_errors) skip_to_next_irap_ = true;
+        begin_skip(pk, nut, sig);
         return;
     }
-    start_picture(nal, pk);
+    start_picture(nal, pk, sig);
 }
 
-void Decoder::begin_skip(const SlicePeek& peek, NalUnitType nut) {
+void Decoder::add_segment(const NalUnit& nal, const SlicePeek& pk, const SegmentSig& sig) {
+    pend_.sigs.push_back(sig);
+    // Overlapping what an earlier segment decoded: that one ran past its end
+    if (pk.address_ts < pend_.next_ctb_ts) pend_.error = true;
+    pend_.last_start_ts = pk.address_ts;
+    if (pend_.mode == PendingMode::SKIPPING) {
+        pend_.next_ctb_ts = std::max(pend_.next_ctb_ts, pk.address_ts + 1);
+        return;
+    }
+    decode_slice(nal, pk, nullptr);
+    if (pend_.mode == PendingMode::DECODING && pend_.sps &&
+        pend_.next_ctb_ts >= pend_.sps->PicSizeInCtbsY)
+        finish_picture();
+}
+
+void Decoder::begin_skip(const SlicePeek& peek, NalUnitType nut, const SegmentSig& sig) {
     pend_.mode = PendingMode::SKIPPING;
     pend_.nut = nut;
     pend_.pps_id = peek.pps_id;
     pend_.has_poc = peek.has_poc;
     pend_.poc_lsb = peek.poc_lsb;
     pend_.next_ctb_ts = peek.address_ts + 1;
+    pend_.last_start_ts = peek.address_ts;
+    pend_.sigs.assign(1, sig);
     pend_.pic = nullptr;
 }
 
-void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek) {
+void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek, const SegmentSig& sig) {
     const NalUnitType nut = nal.header.nal_unit_type;
 
     SliceHeader first_sh;
@@ -251,12 +334,26 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek) {
         HEVC_LOG(PARSE, "First slice header undecodable — resyncing at next IRAP%s", "");
         stats_.skipped_error++;
         skip_to_next_irap_ = true;
-        begin_skip(peek, nut);
+        begin_skip(peek, nut, sig);
         return;
     }
 
-    // §8.1 — random access decisions, evaluated before touching the DPB.
+    // §8.3.1: POC is unique within a CVS. A picture whose first segment was
+    // lost and whose POC is already taken (within the CVS it continues) is a
+    // late, repeated or corrupt segment of that picture, not a picture.
     const bool isIRAP = is_irap(nut);
+    const bool opens_cvs = is_idr(nut) || is_bla(nut) ||
+                           (is_cra(nut) && (handle_cra_as_first_ || no_irap_yet_));
+    if (!first_sh.first_slice_segment_in_pic_flag && !opens_cvs) {
+        const int32_t taken = dpb_.derive_poc(first_sh, *sps, nut, nal.header.TemporalId(),
+                                              false, /*commit=*/false);
+        if (dpb_.holds_poc(cvs_id_, taken, last_picture_.get())) {
+            drop_stray_segment(peek);
+            return;
+        }
+    }
+
+    // §8.1 — random access decisions, evaluated before touching the DPB.
     if (isIRAP) {
         // NoRaslOutputFlag: 1 for IDR/BLA, and for a CRA that is the first
         // picture of the bitstream / first after EOS_NUT / first after reset().
@@ -282,7 +379,7 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek) {
         if (skip_to_next_irap_) {
             HEVC_LOG(PARSE, "Skipping non-IRAP VCL (resyncing after decode error)%s", "");
             stats_.skipped_error++;
-            begin_skip(peek, nut);
+            begin_skip(peek, nut, sig);
             return;
         }
         // §8.1 wait-for-random-access-point: until the first IRAP after a fresh
@@ -290,7 +387,7 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek) {
         if (no_irap_yet_) {
             HEVC_LOG(PARSE, "Skipping non-IRAP VCL (waiting for random access point)%s", "");
             stats_.skipped_wait_irap++;
-            begin_skip(peek, nut);
+            begin_skip(peek, nut, sig);
             return;
         }
     }
@@ -300,7 +397,7 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek) {
         if (is_rasl(nut) && prev_irap_no_rasl_output_) {
             HEVC_LOG(PARSE, "Skipping RASL (associated IRAP has NoRaslOutputFlag=1)%s", "");
             stats_.skipped_rasl++;
-            begin_skip(peek, nut);
+            begin_skip(peek, nut, sig);
             return;
         }
     }
@@ -435,6 +532,8 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek) {
     pend_.has_poc = peek.has_poc;
     pend_.poc_lsb = peek.poc_lsb;
     pend_.next_ctb_ts = 0;
+    pend_.last_start_ts = peek.address_ts;
+    pend_.sigs.assign(1, sig);
     pend_.pic = pic;
     pend_.sps = sps;
     pend_.pps = pps;
@@ -630,7 +729,9 @@ void Decoder::decode_slice_data(const NalUnit& nal, SliceHeader& sh, int slice_n
         if (!ctb_decoded_buf_[rs] || slice_idx_buf_[rs] != slice_number) break;
         end_ts++;
     }
-    pend_.next_ctb_ts = std::max(pend_.next_ctb_ts, std::max(end_ts, start_ts + 1));
+    // A failed segment claims only its start: what it decoded past the point
+    // of failure may belong to the segments that follow, which re-decode it.
+    pend_.next_ctb_ts = std::max(pend_.next_ctb_ts, ok ? std::max(end_ts, start_ts + 1) : start_ts + 1);
     pend_.prev_segment_ok = ok;
     if (!ok) {
         pend_.error = true;
@@ -648,12 +749,21 @@ void Decoder::fail_picture() {
 }
 
 void Decoder::finish_picture() {
-    if (pend_.mode == PendingMode::SKIPPING) {
+    if (pend_.mode == PendingMode::DECODING) complete_decoding();
+    if (pend_.mode != PendingMode::NONE || !pend_.sigs.empty()) {
         pend_.mode = PendingMode::NONE;
-        return;
+        pend_.pic = nullptr;
+        done_sigs_.swap(pend_.sigs);
+        pend_.sigs.clear();
     }
-    if (pend_.mode != PendingMode::DECODING) return;
+    if (!deferred_ps_.empty()) {
+        std::vector<NalUnit> sets;
+        sets.swap(deferred_ps_);
+        for (const NalUnit& ps : sets) process_parameter_set(ps);
+    }
+}
 
+void Decoder::complete_decoding() {
     const SPS* sps = pend_.sps;
     Picture* pic = pend_.pic;
     DecodingContext& ctx = pend_.ctx;
@@ -820,6 +930,8 @@ std::vector<Picture*> Decoder::drain() {
 
 std::vector<Picture*> Decoder::flush() {
     finish_picture();
+    // End of the input so far: whatever comes next is not a repeat
+    done_sigs_.clear();
     dpb_.bump_all();
     return dpb_.take_output();
 }
@@ -846,6 +958,7 @@ std::vector<Picture*> Decoder::output_pictures() {
 
 void Decoder::discontinuity() {
     finish_picture();
+    done_sigs_.clear();
     dpb_.discontinuity();
     // §8.1: the next IRAP opens a new CVS — a CRA takes NoRaslOutputFlag = 1
     no_irap_yet_ = true;
@@ -865,8 +978,15 @@ void Decoder::reset(bool clear_parameter_sets) {
     pend_.pic = nullptr;
     pend_.headers.clear();
     pend_.slices.clear();
+    pend_.sigs.clear();
     pend_.last_independent = nullptr;
+    done_sigs_.clear();
     dpb_.reset();
+    // Parameter sets held back for the abandoned picture still belong to the
+    // stream: keep them unless the stored sets are cleared anyway.
+    if (!clear_parameter_sets)
+        for (const NalUnit& ps : deferred_ps_) process_parameter_set(ps);
+    deferred_ps_.clear();
     if (clear_parameter_sets) ps_mgr_.reset();
     cvs_id_ = 0;
     // §8.1 random access: re-arm wait-for-IRAP and treat the next CRA as the

@@ -146,7 +146,10 @@ private:
     // A picture is assembled slice by slice and may span feed() calls: it is
     // finished when its slices cover the last CTB, when the next picture's
     // first slice (or a slice that cannot belong to it) arrives, at an
-    // AUD/EOS/EOB or parameter-set NAL, or at flush().
+    // AUD/EOS/EOB, or at flush(). A parameter set arriving while a picture is
+    // assembled is held back and applied once that picture is finished.
+    // Repeated slice segments, and segments behind the last one that carry
+    // the picture's POC, are dropped instead of splitting the picture.
 
     // First fields of a slice header, enough to decide which picture a slice
     // segment belongs to without activating parameter sets.
@@ -160,23 +163,44 @@ private:
         uint32_t poc_lsb = 0;
     };
     bool peek_slice(const NalUnit& nal, SlicePeek& out) const;
+    bool try_peek_slice(const NalUnit& nal, SlicePeek& out) const;
+
+    // Identity of a received slice segment NAL, to recognise a repeated one
+    struct SegmentSig {
+        uint64_t hash = 0;
+        size_t size = 0;
+        bool operator==(const SegmentSig& o) const { return hash == o.hash && size == o.size; }
+    };
+    static SegmentSig segment_sig(const NalUnit& nal);
+
+    // Where a slice segment goes relative to the picture being assembled
+    enum class SliceFit { SAME, STRAY, NEW };
+    SliceFit fit_pending(const SlicePeek& pk, NalUnitType nut, const SegmentSig& sig) const;
+    // Drop a repeated or stray slice segment
+    void drop_stray_segment(const SlicePeek& pk);
 
     void process_nal(const NalUnit& nal);
     void process_vcl(const NalUnit& nal);
     // Parse the first decodable slice of a picture and set it up (§8.1
     // random-access decisions, POC, RPS, output process, allocation).
-    void start_picture(const NalUnit& nal, const SlicePeek& peek);
+    void start_picture(const NalUnit& nal, const SlicePeek& peek, const SegmentSig& sig);
+    // Add a slice segment of the pending picture
+    void add_segment(const NalUnit& nal, const SlicePeek& peek, const SegmentSig& sig);
     // Decode one slice segment of the pending picture (`parsed`: its header,
     // when the caller already parsed it).
     void decode_slice(const NalUnit& nal, const SlicePeek& peek, SliceHeader* parsed);
     void decode_slice_data(const NalUnit& nal, SliceHeader& sh, int slice_number);
-    // Complete the pending picture: coverage check, in-loop filters, reference
-    // marking, output marking. Drops it if it cannot be completed.
+    // End the pending picture (decoded: coverage check, in-loop filters,
+    // reference and output marking — or dropped if it cannot be completed),
+    // then apply the parameter sets held back while it was assembled.
     void finish_picture();
+    void complete_decoding();
     // Drop the pending picture (decode error); arms skip-to-next-IRAP.
     void fail_picture();
     // Absorb the remaining slices of a picture that is not decoded.
-    void begin_skip(const SlicePeek& peek, NalUnitType nut);
+    void begin_skip(const SlicePeek& peek, NalUnitType nut, const SegmentSig& sig);
+    // Parse a VPS/SPS/PPS NAL into the parameter set manager (contained)
+    void process_parameter_set(const NalUnit& nal);
 
     enum class PendingMode { NONE, DECODING, SKIPPING };
     struct PendingPicture {
@@ -186,7 +210,9 @@ private:
         uint32_t pps_id = 0;
         bool has_poc = false;
         uint32_t poc_lsb = 0;
-        int next_ctb_ts = 0;        // tile-scan address just past the last segment
+        int next_ctb_ts = 0;        // tile-scan address just past the decoded segments
+        int last_start_ts = -1;     // tile-scan start of the last segment
+        std::vector<SegmentSig> sigs;  // every segment received
         // DECODING only
         Picture* pic = nullptr;
         const SPS* sps = nullptr;
@@ -202,6 +228,14 @@ private:
         CabacEngine cabac;
     };
     PendingPicture pend_;
+    // Segments of the picture finished last: a repeat of one of its non-first
+    // segments arriving after it completed is dropped, not started as a
+    // picture of its own. Cleared by flush(), discontinuity() and reset().
+    std::vector<SegmentSig> done_sigs_;
+    // Parameter sets that arrived while a picture was being assembled
+    // (§7.4.2.4.4 allows them between its slices); applied when it finishes.
+    std::vector<NalUnit> deferred_ps_;
+    static constexpr size_t kMaxDeferredParameterSets = 32;
 
     // Snapshot the reference lists just built for slice `slice_number`.
     void record_slice_refs(int slice_number);

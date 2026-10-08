@@ -960,6 +960,25 @@ bool decode_slice_segment_data(DecodingContext& ctx, BitstreamReader& bs,
 // ============================================================
 
 void decode_coding_tree_unit(DecodingContext& ctx, int xCtb, int yCtb) {
+    const int ctbRs = (yCtb >> ctx.sps->CtbLog2SizeY) * ctx.sps->PicWidthInCtbsY +
+                      (xCtb >> ctx.sps->CtbLog2SizeY);
+    if (ctx.ctb_decoded && ctx.ctb_decoded[ctbRs] && ctx.sao_params && ctx.edge_flags_v) {
+        // Decoded a second time: a failed slice ran on into the CTBs of the
+        // slice that follows it. Drop what the first decode left in the
+        // filter state; the grids it does not rewrite (SAO when this slice
+        // has none, edges inside its blocks) would otherwise survive.
+        ctx.sao_params[ctbRs] = DecodingContext::SaoParams{};
+        const int stride = ctx.filter_grid_stride;
+        const int ctbSize = 1 << ctx.sps->CtbLog2SizeY;
+        const int gx1 = std::min<int>(xCtb + ctbSize, static_cast<int>(ctx.sps->pic_width_in_luma_samples)) >> 2;
+        const int gy1 = std::min<int>(yCtb + ctbSize, static_cast<int>(ctx.sps->pic_height_in_luma_samples)) >> 2;
+        for (int gy = yCtb >> 2; gy < gy1; gy++)
+            for (int gx = xCtb >> 2; gx < gx1; gx++) {
+                ctx.edge_flags_v[gy * stride + gx] = 0;
+                ctx.edge_flags_h[gy * stride + gx] = 0;
+            }
+    }
+
     // SAO parsing (store params for Phase 6)
     if (ctx.sh->slice_sao_luma_flag || ctx.sh->slice_sao_chroma_flag) {
         int rx = xCtb >> ctx.sps->CtbLog2SizeY;

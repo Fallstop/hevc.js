@@ -117,8 +117,9 @@ pictures must not be output (§8.1). Generated upstream by `tools/gen_open_gop_f
 ## JCT-VC conformance streams (ITU-T H.265.1)
 
 Unmodified bitstreams from the JCT-VC HEVC_v1 conformance suite, except
-`jctvc_MAXBINS_B_TI_5_2f.265`: its first two access units, cut with
-`ffmpeg -i MAXBINS_B_TI_5.bit -c copy -frames:v 2 -f hevc`. Each MD5 is the
+`jctvc_MAXBINS_B_TI_5_2f.265` and `jctvc_DSLICE_A_HHI_5_1f.265`: their first
+two / first access units, cut with
+`ffmpeg -i <stream> -c copy -frames:v <n> -f hevc`. Each MD5 is the
 ffmpeg decode, which matches the suite's reference YUV where one is shipped.
 
 | Fichier | Taille | Resolution | Frames | Guards | MD5 (YUV decode) |
@@ -129,6 +130,7 @@ ffmpeg decode, which matches the suite's reference YUV where one is shipped.
 | `jctvc_CIP_A_Panasonic_3.265` | 12K | 416x240 | 2 | constrained intra prediction | `4cbf601ba98d63f642defab5eaa12c8d` |
 | `jctvc_POC_A_Bossen_3.265` | 83K | 416x240 | 5 | prevTid0Pic excludes TRAIL_N at TemporalId 0 | `faf33bec64d3e58c426ed2772903a0bf` |
 | `jctvc_MAXBINS_B_TI_5_2f.265` | 220K | 416x240 | 2 | merge pruning ignores the unused list after the 8x4 restriction | `7522b8154651a696e053057f440cd11f` |
+| `jctvc_DSLICE_A_HHI_5_1f.265` | 36K | 1920x1080 | 1 | WPP with dependent slice segments; slice grouping after a failed segment (unit tests) | `7a7bedeed541f7f5185d33139b378fb1` |
 
 ## Robustness bitstreams
 

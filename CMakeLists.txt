@@ -306,6 +306,11 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
             7522b8154651a696e053057f440cd11f $<TARGET_FILE:hevc-decode>)
     set_tests_properties(oracle_jctvc_MAXBINS_B_TI_5_2f PROPERTIES LABELS "oracle;conformance"
         SKIP_RETURN_CODE 2)
+    add_test(NAME oracle_jctvc_DSLICE_A_HHI_5_1f
+        COMMAND ${ORACLE_SCRIPT} ${FIXTURES_DIR}/jctvc_DSLICE_A_HHI_5_1f.265 1920 1080
+            7a7bedeed541f7f5185d33139b378fb1 $<TARGET_FILE:hevc-decode>)
+    set_tests_properties(oracle_jctvc_DSLICE_A_HHI_5_1f PROPERTIES LABELS "oracle;conformance"
+        SKIP_RETURN_CODE 2)
 
     # Recovery-point SEI (gradual decoding refresh, feature F2). An intra-refresh
     # clip with x265 idr-recovery-sei: the IDR carries a recovery_point PREFIX_SEI.

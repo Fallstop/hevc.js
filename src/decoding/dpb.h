@@ -44,9 +44,10 @@ public:
     // at decoder level (it depends on bitstream/EOS/reset position, not just the
     // NAL type — a mid-stream CRA has NoRaslOutputFlag == 0). Ignored for
     // non-IRAP pictures.
+    // commit = false computes the POC without updating the prevTid0Pic state.
     int32_t derive_poc(const SliceHeader& sh, const SPS& sps,
                        NalUnitType nal_type, uint8_t nuh_temporal_id,
-                       bool no_rasl_output_flag);
+                       bool no_rasl_output_flag, bool commit = true);
 
     // ============================================================
     // §8.3.2 — RPS derivation + picture marking
@@ -238,6 +239,10 @@ public:
     // LtCurr) by concealment_source() for the POC it names. Returns the
     // number of entries that remain missing.
     int substitute_missing_refs(const Picture& cur, Picture* fallback);
+
+    // A decoded picture of CVS `cvs_id` with POC `poc` is still held — a
+    // reference, awaiting output, or `also` (kept alive outside the DPB).
+    bool holds_poc(int32_t cvs_id, int32_t poc, const Picture* also) const;
 
     // Shared ownership of a stored picture (to keep it alive past eviction)
     std::shared_ptr<Picture> share(const Picture* pic) const;

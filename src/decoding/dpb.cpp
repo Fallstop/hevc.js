@@ -14,7 +14,7 @@ namespace hevc {
 
 int32_t DPB::derive_poc(const SliceHeader& sh, const SPS& sps,
                          NalUnitType nal_type, uint8_t nuh_temporal_id,
-                         bool no_rasl_output_flag) {
+                         bool no_rasl_output_flag, bool commit) {
     int32_t MaxPicOrderCntLsb = 1 << (sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
     int32_t PicOrderCntMsb;
 
@@ -55,7 +55,7 @@ int32_t DPB::derive_poc(const SliceHeader& sh, const SPS& sps,
     bool isRASL = (nal_type == NalUnitType::RASL_R || nal_type == NalUnitType::RASL_N);
     bool isRADL = (nal_type == NalUnitType::RADL_R || nal_type == NalUnitType::RADL_N);
     bool isSLNR = t <= 14 && (t % 2) == 0;
-    if (nuh_temporal_id == 0 && !isRASL && !isRADL && !isSLNR) {
+    if (commit && nuh_temporal_id == 0 && !isRASL && !isRADL && !isSLNR) {
         prev_poc_lsb_ = static_cast<int32_t>(sh.slice_pic_order_cnt_lsb);
         prev_poc_msb_ = PicOrderCntMsb;
     }
@@ -783,6 +783,15 @@ int DPB::substitute_missing_refs(const Picture& cur, Picture* fallback) {
     fill(ref_pic_set_st_curr_after_, poc_st_curr_after_, sub_st_curr_after_);
     fill(ref_pic_set_lt_curr_, poc_lt_curr_, sub_lt_curr_);
     return still_missing;
+}
+
+bool DPB::holds_poc(int32_t cvs_id, int32_t poc, const Picture* also) const {
+    auto match = [&](const Picture* p) {
+        return p && p->cvs_id == cvs_id && p->poc == poc;
+    };
+    for (const auto& pic : pictures_)
+        if ((pic->is_reference() || pic->needed_for_output) && match(pic.get())) return true;
+    return match(also);
 }
 
 std::shared_ptr<Picture> DPB::share(const Picture* pic) const {
