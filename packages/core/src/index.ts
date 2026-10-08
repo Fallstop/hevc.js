@@ -1,8 +1,15 @@
 export { HEVCDecoder } from "./decoder.js";
+export {
+  HEVC_FRAME_CORRUPT,
+  HEVC_FRAME_MISSING_REF,
+  HEVC_FRAME_PRE_RECOVERY,
+} from "./frame-flags.js";
 export type {
   HEVCFrame,
   HEVCFrameView,
   HEVCStreamInfo,
+  HEVCDecodeStats,
+  HEVCErrorPolicy,
   DecodeResult,
   DecoderOptions,
   WorkerRequest,

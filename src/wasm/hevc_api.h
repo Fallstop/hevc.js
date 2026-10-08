@@ -31,7 +31,29 @@ typedef struct {
                            // 2 = uint16 planes. The y/cb/cr fields are typed
                            // uint16_t* as an ABI placeholder; reinterpret the raw
                            // pointer per bytes_per_sample.
+    double tag;            // Tag of the hevc_decoder_feed_tagged() call that
+                           // delivered the picture's first slice segment; NaN
+                           // for hevc_decoder_feed() / hevc_decoder_decode().
+    int flags;             // HEVC_FRAME_* bits describing how the picture decoded
 } HEVCFrame;
+
+// HEVCFrame.flags
+#define HEVC_FRAME_CORRUPT       0x1  // decode errors in the picture were concealed
+#define HEVC_FRAME_MISSING_REF   0x2  // predicted from an unavailable (generated
+                                      // or substituted) reference picture
+#define HEVC_FRAME_PRE_RECOVERY  0x4  // decoded before the stream reached a clean
+                                      // random access point
+
+// Decode counters since create / reset (see hevc_decoder_get_stats)
+typedef struct {
+    uint32_t pictures_decoded;   // pictures decoded (cleanly or concealed)
+    uint32_t pictures_output;    // pictures released by the output process
+    uint32_t skipped_wait_irap;  // non-IRAP pictures skipped waiting for the first IRAP
+    uint32_t skipped_rasl;       // RASL pictures skipped (associated IRAP opened decoding)
+    uint32_t skipped_error;      // pictures dropped or skipped because of decode errors
+    uint32_t concealed;          // pictures output with concealed errors (HEVC_FRAME_CORRUPT)
+    uint32_t nal_errors;         // non-VCL NAL units rejected and contained
+} HEVCDecodeStats;
 
 // Stream info — available after first frame is decoded
 typedef struct {
@@ -83,8 +105,19 @@ int hevc_decoder_get_recovery_point(HEVCDecoder* dec, int* recovery_poc);
 
 // Feed a chunk of data (one or more complete NAL units with start codes)
 // The decoder accumulates parameter sets and decodes pictures incrementally.
+// The slices of a picture may be split across calls.
 // Returns HEVC_OK on success, HEVC_ERROR on failure
 int hevc_decoder_feed(HEVCDecoder* dec, const uint8_t* data, size_t size);
+
+// hevc_decoder_feed() with a caller tag (e.g. the access unit's timestamp):
+// every picture whose first slice segment arrives in this call carries `tag`
+// in HEVCFrame.tag when it is output. Frames are thereby labelled exactly, even
+// when the decoder skips, drops or reorders pictures.
+int hevc_decoder_feed_tagged(HEVCDecoder* dec, const uint8_t* data, size_t size, double tag);
+
+// Copy the decode counters into *stats. Returns HEVC_OK, or HEVC_ERROR on a
+// null argument.
+int hevc_decoder_get_stats(HEVCDecoder* dec, HEVCDecodeStats* stats);
 
 // Drain newly output-ready pictures (§C.5.2 bumping process)
 // Outputs pictures in display order, only when ready per DPB constraints.

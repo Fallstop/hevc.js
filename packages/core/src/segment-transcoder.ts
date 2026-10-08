@@ -169,6 +169,8 @@ export class SegmentTranscoder {
       chromaHeight: ch,
       bitDepth: 8,
       poc: 0,
+      tag: Number.NaN,
+      flags: 0,
     };
 
     warmup.onChunk = () => { /* warmup discard */ };

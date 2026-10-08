@@ -243,3 +243,31 @@ against ffmpeg (`tools/jctvc_conformance.py`): 58/147 → 67/147 matching, no
 regression; the baseline hung (≥900 s) on CONFWIN_A, FILLER_A, INITQP_A/B and
 WPP_D, all of which now complete. The remaining mismatches predate this work
 and are outside it (see the report accompanying this branch).
+
+## AD-014 : Tagged output — the caller labels frames, the decoder carries the label
+
+**Context**: callers paired output frames with input timestamps by counting.
+Every picture the decoder skips (waiting for an IRAP, RASL, error resync), drops
+(decode error) or does not output (`pic_output_flag = 0`) shifts every later
+frame onto the wrong timestamp. Upstream answered with a report of suppressed
+(cvs_id, poc) pairs the caller must replay (its AD-009); that still leaves the
+caller re-deriving the decoder's decisions.
+
+**Decision**: `hevc_decoder_feed_tagged(dec, data, size, double tag)` — every
+picture whose first slice segment arrives in that call carries `tag` to output
+(`HEVCFrame.tag`, after `poc`/`bytes_per_sample`, at offset 48 on wasm32; the
+struct grows from 48 to 64 bytes). `hevc_decoder_feed` keeps working and tags
+NaN. Frames also carry `flags` (`HEVC_FRAME_CORRUPT`, `_MISSING_REF`,
+`_PRE_RECOVERY`), and `hevc_decoder_get_stats` exposes running counters
+(decoded, output, skipped waiting for IRAP / RASL / error, concealed, contained
+non-VCL errors). The JS wrapper's `feed(data, tag?)` always goes through the
+tagged entry point; frames and views gain readonly `tag` and `flags`.
+
+**Rationale**: the tag is a double so a JS timestamp (µs, 90 kHz ticks or
+seconds) round-trips exactly. A picture spanning feed calls is tagged by the call
+that carried its first slice — the one whose sample/AU it belongs to. Counters
+are cumulative `uint32` (reset by `reset()`); the caller diffs them.
+
+**Consequence**: `MISSING_REF` is now visible under the default policy too: a
+picture whose RPS names a picture the decoder never saw (a whole access unit
+lost) is decoded with neutral-grey prediction where it references it, and says so.

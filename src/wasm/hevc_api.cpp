@@ -4,7 +4,9 @@
 #include "decoding/decoder.h"
 #include "common/types.h"
 
+#include <cstddef>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 struct HEVCDecoder {
@@ -13,6 +15,17 @@ struct HEVCDecoder {
     std::vector<hevc::Picture*> drained;  // incremental mode
     const hevc::SPS* last_sps = nullptr;
 };
+
+// The JS wrapper reads HEVCFrame by byte offsets (packages/core/src/frame-layout.ts).
+#ifdef __EMSCRIPTEN__
+static_assert(sizeof(HEVCFrame) == 64, "HEVCFrame layout changed — update frame-layout.ts");
+static_assert(offsetof(HEVCFrame, tag) == 48, "HEVCFrame.tag moved — update frame-layout.ts");
+static_assert(offsetof(HEVCFrame, flags) == 56, "HEVCFrame.flags moved — update frame-layout.ts");
+static_assert(sizeof(HEVCDecodeStats) == 28, "HEVCDecodeStats layout changed — update decoder.ts");
+#endif
+static_assert(HEVC_FRAME_CORRUPT == hevc::PICTURE_CORRUPT, "flag mismatch");
+static_assert(HEVC_FRAME_MISSING_REF == hevc::PICTURE_MISSING_REF, "flag mismatch");
+static_assert(HEVC_FRAME_PRE_RECOVERY == hevc::PICTURE_PRE_RECOVERY, "flag mismatch");
 
 namespace {
 
@@ -42,6 +55,8 @@ void fill_frame(const hevc::Picture* pic, HEVCFrame* frame) {
     frame->bit_depth = pic->bit_depth_luma;
     frame->poc = pic->poc;
     frame->bytes_per_sample = pic->bytes_per_sample;
+    frame->tag = pic->tag;
+    frame->flags = static_cast<int>(pic->flags);
 
     if (monochrome) {
         // 4:0:0 has no chroma planes — the chroma buffers are zero-length, so the
@@ -117,6 +132,10 @@ int hevc_decoder_get_frame(HEVCDecoder* dec, int index, HEVCFrame* frame) {
 // --- Incremental API ---
 
 int hevc_decoder_feed(HEVCDecoder* dec, const uint8_t* data, size_t size) {
+    return hevc_decoder_feed_tagged(dec, data, size, std::numeric_limits<double>::quiet_NaN());
+}
+
+int hevc_decoder_feed_tagged(HEVCDecoder* dec, const uint8_t* data, size_t size, double tag) {
     if (!dec || !data || size == 0) return HEVC_ERROR;
 
     // Frames from the previous drain are only valid until the next feed: the
@@ -125,7 +144,7 @@ int hevc_decoder_feed(HEVCDecoder* dec, const uint8_t* data, size_t size) {
     dec->drained.clear();
 
     try {
-        auto status = dec->decoder.feed(data, size);
+        auto status = dec->decoder.feed(data, size, tag);
         return (status == hevc::DecodeStatus::OK) ? HEVC_OK : HEVC_ERROR;
     } catch (...) {
         return HEVC_ERROR;
@@ -192,6 +211,19 @@ int hevc_decoder_get_info(HEVCDecoder* dec, HEVCStreamInfo* info) {
     info->profile = 0;
     info->level = 0;
 
+    return HEVC_OK;
+}
+
+int hevc_decoder_get_stats(HEVCDecoder* dec, HEVCDecodeStats* stats) {
+    if (!dec || !stats) return HEVC_ERROR;
+    const hevc::DecodeStats s = dec->decoder.stats();
+    stats->pictures_decoded = s.pictures_decoded;
+    stats->pictures_output = s.pictures_output;
+    stats->skipped_wait_irap = s.skipped_wait_irap;
+    stats->skipped_rasl = s.skipped_rasl;
+    stats->skipped_error = s.skipped_error;
+    stats->concealed = s.concealed;
+    stats->nal_errors = s.nal_errors;
     return HEVC_OK;
 }
 

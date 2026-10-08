@@ -626,6 +626,14 @@ void DPB::evict_unused() {
 // Helpers
 // ============================================================
 
+bool DPB::has_missing_curr_refs() const {
+    for (const auto* list : {&ref_pic_set_st_curr_before_, &ref_pic_set_st_curr_after_,
+                             &ref_pic_set_lt_curr_})
+        for (const Picture* p : *list)
+            if (!p) return true;
+    return false;
+}
+
 Picture* DPB::find_short_term_by_poc(int32_t poc) const {
     for (auto& pic : pictures_) {
         if (pic.get() != current_pic_ && pic->used_for_short_term_ref && pic->poc == poc)

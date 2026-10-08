@@ -330,6 +330,8 @@ void Decoder::start_picture(const NalUnit& nal, const SlicePeek& peek) {
         static_cast<int>(sps->pic_height_in_luma_samples),
         fmt, sps->BitDepthY, sps->BitDepthC);
     pic->poc = poc;
+    pic->tag = feed_tag_;
+    pic->flags = 0;
     // Marked "needed for output" only once the picture is decoded (§C.5.2.3)
     pic->needed_for_output = false;
 
@@ -533,6 +535,8 @@ void Decoder::decode_slice(const NalUnit& nal, const SlicePeek& peek, SliceHeade
         dpb_.construct_ref_pic_lists(sh, *sps, *pps);
         dpb_.derive_colpic(sh);
         record_slice_refs(slice_number);
+        if (sh.slice_type != SliceType::I && dpb_.has_missing_curr_refs())
+            pend_.pic->flags |= PICTURE_MISSING_REF;
     }
 
     // Under the default policy a picture with an error is dropped anyway; do
@@ -679,7 +683,14 @@ DecodeStats Decoder::stats() const {
 }
 
 DecodeStatus Decoder::feed(const uint8_t* data, size_t size) {
-    return decode(data, size);
+    return feed(data, size, std::numeric_limits<double>::quiet_NaN());
+}
+
+DecodeStatus Decoder::feed(const uint8_t* data, size_t size, double tag) {
+    feed_tag_ = tag;
+    DecodeStatus status = decode(data, size);
+    feed_tag_ = std::numeric_limits<double>::quiet_NaN();
+    return status;
 }
 
 std::vector<Picture*> Decoder::drain() {

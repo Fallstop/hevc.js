@@ -1,10 +1,12 @@
 /**
  * Single source of truth for the WASM `HEVCFrame` struct ABI and the shared
- * plane-copy helper. The C++ side writes a 48-byte struct; the byte offsets and
+ * plane-copy helper. The C++ side writes a 64-byte struct; the byte offsets and
  * copy logic were previously duplicated across {@link ./decoder.ts} (three read
  * sites) and {@link ./worker.ts}. Keeping them here means the ABI is defined
  * once — change the struct layout in one place when the C++ side changes.
  */
+
+import type { HEVCDecodeStats } from "./types.js";
 
 /** Minimal Emscripten heap surface needed to read the frame struct and planes. */
 export interface FrameHeap {
@@ -14,13 +16,14 @@ export interface FrameHeap {
 }
 
 /**
- * Byte offsets of each field within the 48-byte WASM `HEVCFrame` struct.
- * Pointers (`y`/`cb`/`cr`) are 32-bit; the rest are `i32`. Must match the C++
- * struct layout exactly.
+ * Byte offsets of each field within the 64-byte WASM `HEVCFrame` struct.
+ * Pointers (`y`/`cb`/`cr`) are 32-bit, `tag` is an f64 (8-byte aligned), the
+ * rest are `i32`; 4 bytes of tail padding round the struct to 64. Must match
+ * the C++ struct layout exactly (hevc_api.cpp static_asserts the same).
  */
 export const FRAME_STRUCT = {
   /** Total struct size in bytes (used for `_malloc`). */
-  SIZE: 48,
+  SIZE: 64,
   Y_PTR: 0,
   CB_PTR: 4,
   CR_PTR: 8,
@@ -34,6 +37,10 @@ export const FRAME_STRUCT = {
   POC: 40,
   /** Plane storage width in bytes (1 = uint8 planes, 2 = uint16 planes). */
   BYTES_PER_SAMPLE: 44,
+  /** f64: the caller's tag from `feed(data, tag)`; NaN when untagged. */
+  TAG: 48,
+  /** i32: `HEVC_FRAME_*` bit flags. */
+  FLAGS: 56,
 } as const;
 
 /** Decoded view of the raw WASM frame struct (pointers + geometry). */
@@ -50,9 +57,11 @@ export interface FrameStruct {
   bitDepth: number;
   poc: number;
   bytesPerSample: 1 | 2;
+  tag: number;
+  flags: number;
 }
 
-/** Read the 48-byte frame struct at `framePtr` into a typed object. */
+/** Read the 64-byte frame struct at `framePtr` into a typed object. */
 export function readFrameStruct(m: FrameHeap, framePtr: number): FrameStruct {
   return {
     yPtr:           m.getValue(framePtr + FRAME_STRUCT.Y_PTR, "*"),
@@ -67,6 +76,36 @@ export function readFrameStruct(m: FrameHeap, framePtr: number): FrameStruct {
     bitDepth:       m.getValue(framePtr + FRAME_STRUCT.BIT_DEPTH, "i32"),
     poc:            m.getValue(framePtr + FRAME_STRUCT.POC, "i32"),
     bytesPerSample: (m.getValue(framePtr + FRAME_STRUCT.BYTES_PER_SAMPLE, "i32") === 1 ? 1 : 2),
+    tag:            m.getValue(framePtr + FRAME_STRUCT.TAG, "double"),
+    flags:          m.getValue(framePtr + FRAME_STRUCT.FLAGS, "i32"),
+  };
+}
+
+/**
+ * Byte layout of the WASM `HEVCDecodeStats` struct: seven `uint32_t` counters.
+ */
+export const STATS_STRUCT = {
+  SIZE: 28,
+  PICTURES_DECODED: 0,
+  PICTURES_OUTPUT: 4,
+  SKIPPED_WAIT_IRAP: 8,
+  SKIPPED_RASL: 12,
+  SKIPPED_ERROR: 16,
+  CONCEALED: 20,
+  NAL_ERRORS: 24,
+} as const;
+
+/** Read the `HEVCDecodeStats` struct at `ptr` (counters are unsigned). */
+export function readDecodeStats(m: FrameHeap, ptr: number): HEVCDecodeStats {
+  const u32 = (off: number) => m.getValue(ptr + off, "i32") >>> 0;
+  return {
+    picturesDecoded: u32(STATS_STRUCT.PICTURES_DECODED),
+    picturesOutput:  u32(STATS_STRUCT.PICTURES_OUTPUT),
+    skippedWaitIrap: u32(STATS_STRUCT.SKIPPED_WAIT_IRAP),
+    skippedRasl:     u32(STATS_STRUCT.SKIPPED_RASL),
+    skippedError:    u32(STATS_STRUCT.SKIPPED_ERROR),
+    concealed:       u32(STATS_STRUCT.CONCEALED),
+    nalErrors:       u32(STATS_STRUCT.NAL_ERRORS),
   };
 }
 

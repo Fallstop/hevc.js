@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <deque>
+#include <limits>
 #include <vector>
 
 #include "common/picture.h"
@@ -45,6 +46,12 @@ public:
     // Feed a chunk of data (incremental mode — one or more complete NAL units)
     // Same as decode() but named for clarity in streaming context.
     DecodeStatus feed(const uint8_t* data, size_t size);
+
+    // feed() with a caller tag: every picture whose first slice segment is in
+    // this chunk carries `tag` (Picture::tag) through to output, so the caller
+    // can label output frames exactly (e.g. with the sample's timestamp)
+    // instead of pairing them with inputs by counting. Untagged feeds use NaN.
+    DecodeStatus feed(const uint8_t* data, size_t size, double tag);
 
     // Drain newly output-ready pictures (§C.5.2 bumping process)
     // Returns pictures in display order. Only returns pictures that are
@@ -167,6 +174,8 @@ private:
     DPB dpb_;
     DPB::OutputLimits output_limits_;
     DecodeStats stats_;
+    // Tag of the feed() call in progress
+    double feed_tag_ = std::numeric_limits<double>::quiet_NaN();
 
     // Output pictures (accumulated across all decoded pictures)
     std::vector<Picture*> output_pics_;

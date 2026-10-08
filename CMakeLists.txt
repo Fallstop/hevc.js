@@ -98,7 +98,7 @@ if(BUILD_WASM)
         "SHELL:-s EXPORT_NAME=HEVCDecoderModule"
         "SHELL:-s STACK_SIZE=4194304"
         "SHELL:-s NO_DISABLE_EXCEPTION_CATCHING=1"
-        "SHELL:-s EXPORTED_FUNCTIONS=[_hevc_decoder_create,_hevc_decoder_destroy,_hevc_decoder_decode,_hevc_decoder_get_frame_count,_hevc_decoder_get_frame,_hevc_decoder_get_info,_hevc_decoder_get_recovery_point,_hevc_decoder_feed,_hevc_decoder_drain,_hevc_decoder_get_drained_frame,_hevc_decoder_flush,_hevc_decoder_reset,_malloc,_free]"
+        "SHELL:-s EXPORTED_FUNCTIONS=[_hevc_decoder_create,_hevc_decoder_destroy,_hevc_decoder_decode,_hevc_decoder_get_frame_count,_hevc_decoder_get_frame,_hevc_decoder_get_info,_hevc_decoder_get_recovery_point,_hevc_decoder_feed,_hevc_decoder_feed_tagged,_hevc_decoder_get_stats,_hevc_decoder_drain,_hevc_decoder_get_drained_frame,_hevc_decoder_flush,_hevc_decoder_reset,_malloc,_free]"
         "SHELL:-s EXPORTED_RUNTIME_METHODS=[ccall,cwrap,getValue,HEAPU8,HEAPU16]"
     )
     # Don't build the native CLI in WASM mode
@@ -140,6 +140,7 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
         tests/unit/test_validation.cpp
         tests/unit/test_nonvcl_tolerance.cpp
         tests/unit/test_picture_assembly.cpp
+        tests/unit/test_tagged_output.cpp
     )
 
     target_link_libraries(hevc_tests PRIVATE

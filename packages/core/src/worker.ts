@@ -105,6 +105,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
           width: s.width, height: s.height,
           chromaWidth: s.chromaWidth, chromaHeight: s.chromaHeight,
           bitDepth: s.bitDepth, poc: s.poc,
+          tag: s.tag, flags: s.flags,
         };
         const frame: HEVCFrame = s.bytesPerSample === 1
           ? { ...meta, bytesPerSample: 1, y: y as Uint8Array, cb: cb as Uint8Array, cr: cr as Uint8Array }

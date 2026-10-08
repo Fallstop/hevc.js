@@ -1,11 +1,22 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "common/types.h"
 
 namespace hevc {
+
+// Per-picture decode flags (mirrored by HEVC_FRAME_* in wasm/hevc_api.h)
+enum PictureFlags : uint32_t {
+    // The picture had decode errors that were concealed
+    PICTURE_CORRUPT = 1u << 0,
+    // Predicted from a reference that was unavailable (concealed or substituted)
+    PICTURE_MISSING_REF = 1u << 1,
+    // Decoded before the stream reached a clean random access point
+    PICTURE_PRE_RECOVERY = 1u << 2,
+};
 
 // Picture buffer — planar YUV layout (AD-002)
 // Spec ref: §6.1 (source, coded, decoded picture formats)
@@ -31,6 +42,11 @@ struct Picture {
     int conf_win_right = 0;
     int conf_win_top = 0;
     int conf_win_bottom = 0;
+
+    // Caller tag of the feed() call that delivered the picture's first slice
+    // segment (NaN when untagged), and PictureFlags describing how it decoded.
+    double tag = std::numeric_limits<double>::quiet_NaN();
+    uint32_t flags = 0;
 
     // Picture Order Count
     int32_t poc = 0;

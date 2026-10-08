@@ -16,6 +16,20 @@ interface HEVCFrameBase {
   bitDepth: number;
   /** Picture Order Count (display order) */
   poc: number;
+  /**
+   * The `tag` passed to `feed(data, tag)` for the chunk that carried this
+   * picture's first slice segment — use it to label the frame (e.g. with the
+   * access unit's timestamp) instead of pairing outputs with inputs by count.
+   * `NaN` when the picture arrived untagged (`feed(data)` / `decode()`).
+   */
+  readonly tag: number;
+  /**
+   * `HEVC_FRAME_*` bit flags: `HEVC_FRAME_CORRUPT` (decode errors were
+   * concealed), `HEVC_FRAME_MISSING_REF` (predicted from an unavailable
+   * reference), `HEVC_FRAME_PRE_RECOVERY` (decoded before a clean random
+   * access point). `0` for a cleanly decoded picture.
+   */
+  readonly flags: number;
 }
 
 /**
@@ -143,6 +157,48 @@ export interface HEVCStreamInfo {
   profile: number;
   /** Level IDC (e.g. 93 = Level 3.1) */
   level: number;
+}
+
+/** Decode counters since the decoder was created or last `reset()`. */
+export interface HEVCDecodeStats {
+  /** Pictures decoded (cleanly or with concealment). */
+  picturesDecoded: number;
+  /** Pictures released by the output process (drained, flushed or batch). */
+  picturesOutput: number;
+  /** Non-IRAP pictures skipped while waiting for the first IRAP. */
+  skippedWaitIrap: number;
+  /** RASL pictures skipped (their IRAP opened decoding, references never decoded). */
+  skippedRasl: number;
+  /** Pictures dropped or skipped because of decode errors. */
+  skippedError: number;
+  /** Pictures output with concealed errors (`HEVC_FRAME_CORRUPT`). */
+  concealed: number;
+  /** Non-VCL NAL units (parameter sets, SEI, corrupt headers) rejected and contained. */
+  nalErrors: number;
+}
+
+/**
+ * How the decoder handles damaged input. Both default to `false`, which keeps
+ * the conformant behaviour: a picture with an error is dropped and decoding
+ * resumes at the next IRAP; non-IRAP pictures before the first IRAP are skipped.
+ */
+export interface HEVCErrorPolicy {
+  /**
+   * Conceal instead of dropping: when a slice fails after the picture's first
+   * slice header decoded (or slices are missing), the undecoded CTUs are
+   * filled from the nearest reference picture and the picture is output and
+   * kept as a reference, flagged `HEVC_FRAME_CORRUPT`. A missing reference is
+   * substituted by the nearest available picture (`HEVC_FRAME_MISSING_REF`).
+   * Only an undecodable first slice header still waits for the next IRAP.
+   */
+  concealSliceErrors?: boolean;
+  /**
+   * Decode non-IRAP pictures at stream start / after `reset()` /
+   * `discontinuity()` instead of waiting for an IRAP (missing references are
+   * concealed); such pictures are flagged `HEVC_FRAME_PRE_RECOVERY` until an
+   * IRAP or the recovery point is reached.
+   */
+  decodeBeforeIrap?: boolean;
 }
 
 /** Result of a decode call */

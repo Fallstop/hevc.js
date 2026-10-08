@@ -192,6 +192,10 @@ public:
     // Current picture being decoded
     Picture* current_pic() const { return current_pic_; }
 
+    // An entry of RefPicSetStCurrBefore/After or LtCurr is "no reference
+    // picture" — inter prediction of the current picture reads a missing ref.
+    bool has_missing_curr_refs() const;
+
     // Forget the current-picture pointer before a new picture's RPS is
     // derived: the RPS marking loops skip current_pic_, and the previous
     // picture is an ordinary DPB entry by then.

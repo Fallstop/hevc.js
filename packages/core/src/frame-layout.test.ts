@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { FRAME_STRUCT, copyPlane, readFrameStruct, type FrameHeap } from "./frame-layout.js";
+import {
+  FRAME_STRUCT,
+  STATS_STRUCT,
+  copyPlane,
+  readDecodeStats,
+  readFrameStruct,
+  type FrameHeap,
+} from "./frame-layout.js";
 
 /**
  * Tests for the single-source-of-truth WASM frame-layout module. These guard
@@ -11,8 +18,8 @@ import { FRAME_STRUCT, copyPlane, readFrameStruct, type FrameHeap } from "./fram
 
 describe("HEVCFrame struct ABI guard", () => {
   it("pins the total struct size", () => {
-    // The C++ side writes a 48-byte struct (used for _malloc on the JS side).
-    expect(FRAME_STRUCT.SIZE).toBe(48);
+    // The C++ side writes a 64-byte struct (used for _malloc on the JS side).
+    expect(FRAME_STRUCT.SIZE).toBe(64);
   });
 
   it("pins every field offset (catches native struct drift)", () => {
@@ -31,19 +38,27 @@ describe("HEVCFrame struct ABI guard", () => {
     expect(FRAME_STRUCT.BIT_DEPTH).toBe(36);
     expect(FRAME_STRUCT.POC).toBe(40);
     expect(FRAME_STRUCT.BYTES_PER_SAMPLE).toBe(44);
+    // f64 tag on its natural 8-byte alignment, then the i32 flags.
+    expect(FRAME_STRUCT.TAG).toBe(48);
+    expect(FRAME_STRUCT.FLAGS).toBe(56);
   });
 
-  it("every field fits within the declared struct size", () => {
-    // The last field (4-byte i32 at offset 44) must end exactly at SIZE.
-    const offsets = Object.entries(FRAME_STRUCT)
+  it("every field fits within the declared struct size, without overlap", () => {
+    const width = (k: string) => (k === "TAG" ? 8 : 4);
+    const fields = Object.entries(FRAME_STRUCT)
       .filter(([k]) => k !== "SIZE")
-      .map(([, v]) => v);
-    const lastFieldEnd = Math.max(...offsets) + 4;
-    expect(lastFieldEnd).toBe(FRAME_STRUCT.SIZE);
-    for (const off of offsets) {
-      expect(off).toBeGreaterThanOrEqual(0);
-      expect(off + 4).toBeLessThanOrEqual(FRAME_STRUCT.SIZE);
+      .sort((a, b) => a[1] - b[1]);
+    for (let i = 0; i < fields.length; i++) {
+      const [k, off] = fields[i]!;
+      expect(off % width(k)).toBe(0);
+      expect(off + width(k)).toBeLessThanOrEqual(FRAME_STRUCT.SIZE);
+      if (i > 0) {
+        const [pk, poff] = fields[i - 1]!;
+        expect(off).toBeGreaterThanOrEqual(poff + width(pk));
+      }
     }
+    // The struct is padded to a multiple of its 8-byte alignment.
+    expect(FRAME_STRUCT.SIZE % 8).toBe(0);
   });
 });
 
@@ -63,6 +78,8 @@ describe("readFrameStruct", () => {
       [framePtr + FRAME_STRUCT.BIT_DEPTH]: 8,
       [framePtr + FRAME_STRUCT.POC]: 7,
       [framePtr + FRAME_STRUCT.BYTES_PER_SAMPLE]: 1,
+      [framePtr + FRAME_STRUCT.TAG]: 123456.25,
+      [framePtr + FRAME_STRUCT.FLAGS]: 3,
     };
     const m: FrameHeap = {
       getValue: (ptr: number) => values[ptr]!,
@@ -77,7 +94,21 @@ describe("readFrameStruct", () => {
       chromaWidth: 960, chromaHeight: 540,
       bitDepth: 8, poc: 7,
       bytesPerSample: 1,
+      tag: 123456.25,
+      flags: 3,
     });
+  });
+
+  it("reads the tag as an f64 and the flags as an i32", () => {
+    const types: Record<number, string> = {};
+    const m: FrameHeap = {
+      getValue: (ptr: number, type: string) => { types[ptr] = type; return 0; },
+      HEAPU8: new Uint8Array(0),
+      HEAPU16: new Uint16Array(0),
+    };
+    readFrameStruct(m, 1000);
+    expect(types[1000 + FRAME_STRUCT.TAG]).toBe("double");
+    expect(types[1000 + FRAME_STRUCT.FLAGS]).toBe("i32");
   });
 
   it("normalizes bytesPerSample: 2 for any value other than 1", () => {
@@ -157,5 +188,36 @@ describe("copyPlane", () => {
     const HEAPU16 = new Uint16Array([500, 600, 700, 800]);
     const u16 = copyPlane(heapOnly({ HEAPU16 }), 0, 2, 2, 2, 2);
     expect(Array.from(u16)).toEqual([500, 600, 700, 800]);
+  });
+});
+
+describe("readDecodeStats", () => {
+  it("reads the seven uint32 counters from their offsets", () => {
+    expect(STATS_STRUCT.SIZE).toBe(28);
+    const ptr = 400;
+    const values: Record<number, number> = {
+      [ptr + STATS_STRUCT.PICTURES_DECODED]: 10,
+      [ptr + STATS_STRUCT.PICTURES_OUTPUT]: 9,
+      [ptr + STATS_STRUCT.SKIPPED_WAIT_IRAP]: 3,
+      [ptr + STATS_STRUCT.SKIPPED_RASL]: 2,
+      [ptr + STATS_STRUCT.SKIPPED_ERROR]: 1,
+      [ptr + STATS_STRUCT.CONCEALED]: 4,
+      // i32 view of a counter past 2^31 must come back unsigned
+      [ptr + STATS_STRUCT.NAL_ERRORS]: -1,
+    };
+    const m: FrameHeap = {
+      getValue: (p: number) => values[p]!,
+      HEAPU8: new Uint8Array(0),
+      HEAPU16: new Uint16Array(0),
+    };
+    expect(readDecodeStats(m, ptr)).toEqual({
+      picturesDecoded: 10,
+      picturesOutput: 9,
+      skippedWaitIrap: 3,
+      skippedRasl: 2,
+      skippedError: 1,
+      concealed: 4,
+      nalErrors: 4294967295,
+    });
   });
 });

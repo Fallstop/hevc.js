@@ -1,5 +1,18 @@
-import type { HEVCFrame, HEVCFrameView, HEVCStreamInfo, DecodeResult, DecoderOptions } from "./types.js";
-import { FRAME_STRUCT, copyPlane, readFrameStruct } from "./frame-layout.js";
+import type {
+  HEVCFrame,
+  HEVCFrameView,
+  HEVCStreamInfo,
+  HEVCDecodeStats,
+  DecodeResult,
+  DecoderOptions,
+} from "./types.js";
+import {
+  FRAME_STRUCT,
+  STATS_STRUCT,
+  copyPlane,
+  readDecodeStats,
+  readFrameStruct,
+} from "./frame-layout.js";
 
 /**
  * Emscripten module interface (subset we use)
@@ -20,7 +33,8 @@ interface DecoderAPI {
   getFrameCount: (dec: number) => number;
   getFrame: (dec: number, index: number, framePtr: number) => number;
   getInfo: (dec: number, infoPtr: number) => number;
-  feed: (dec: number, ptr: number, size: number) => number;
+  feedTagged: (dec: number, ptr: number, size: number, tag: number) => number;
+  getStats: (dec: number, statsPtr: number) => number;
   drain: (dec: number, countPtr: number) => number;
   getDrainedFrame: (dec: number, index: number, framePtr: number) => number;
   flush: (dec: number) => number;
@@ -60,7 +74,8 @@ export class HEVCDecoder {
       getFrameCount: module.cwrap("hevc_decoder_get_frame_count", "number", ["number"]) as (dec: number) => number,
       getFrame: module.cwrap("hevc_decoder_get_frame", "number", ["number", "number", "number"]) as (dec: number, index: number, framePtr: number) => number,
       getInfo: module.cwrap("hevc_decoder_get_info", "number", ["number", "number"]) as (dec: number, infoPtr: number) => number,
-      feed: module.cwrap("hevc_decoder_feed", "number", ["number", "number", "number"]) as (dec: number, ptr: number, size: number) => number,
+      feedTagged: module.cwrap("hevc_decoder_feed_tagged", "number", ["number", "number", "number", "number"]) as (dec: number, ptr: number, size: number, tag: number) => number,
+      getStats: module.cwrap("hevc_decoder_get_stats", "number", ["number", "number"]) as (dec: number, statsPtr: number) => number,
       drain: module.cwrap("hevc_decoder_drain", "number", ["number", "number"]) as (dec: number, countPtr: number) => number,
       getDrainedFrame: module.cwrap("hevc_decoder_get_drained_frame", "number", ["number", "number", "number"]) as (dec: number, index: number, framePtr: number) => number,
       flush: module.cwrap("hevc_decoder_flush", "number", ["number"]) as (dec: number) => number,
@@ -170,7 +185,7 @@ export class HEVCDecoder {
         cr: copyPlane(m, s.crPtr, s.chromaWidth, s.chromaHeight, s.strideC, 1) as Uint8Array,
         width: s.width, height: s.height,
         chromaWidth: s.chromaWidth, chromaHeight: s.chromaHeight,
-        bitDepth: s.bitDepth, poc: s.poc,
+        bitDepth: s.bitDepth, poc: s.poc, tag: s.tag, flags: s.flags,
       };
     }
     return {
@@ -180,7 +195,7 @@ export class HEVCDecoder {
       cr: copyPlane(m, s.crPtr, s.chromaWidth, s.chromaHeight, s.strideC, 2) as Uint16Array,
       width: s.width, height: s.height,
       chromaWidth: s.chromaWidth, chromaHeight: s.chromaHeight,
-      bitDepth: s.bitDepth, poc: s.poc,
+      bitDepth: s.bitDepth, poc: s.poc, tag: s.tag, flags: s.flags,
     };
   }
 
@@ -207,17 +222,39 @@ export class HEVCDecoder {
 
   /**
    * Feed a chunk of data containing one or more complete NAL units.
-   * The decoder accumulates parameter sets and decodes pictures incrementally.
+   * The decoder accumulates parameter sets and decodes pictures incrementally;
+   * the slices of one picture may be split across calls.
    * Call drain() after each feed() to retrieve output-ready frames.
+   *
+   * @param tag Optional label — typically the access unit's timestamp. Every
+   *   picture whose first slice segment is in this chunk is output with
+   *   `frame.tag === tag`, whatever pictures the decoder skips, drops or
+   *   reorders in between; untagged pictures carry `NaN`.
    */
-  feed(data: Uint8Array): void {
+  feed(data: Uint8Array, tag?: number): void {
     this._gen++; // allocation + decode-in-feed can grow/overwrite the heap
     const m = this._m;
     const ptr = m._malloc(data.length);
     try {
       m.HEAPU8.set(data, ptr);
-      const ret = this._api.feed(this._dec, ptr, data.length);
+      const ret = this._api.feedTagged(this._dec, ptr, data.length, tag ?? Number.NaN);
       if (ret !== 0) throw new Error(`Feed failed (code ${ret})`);
+    } finally {
+      m._free(ptr);
+    }
+  }
+
+  /**
+   * Decode counters since the decoder was created or last `reset()`: pictures
+   * decoded and output, pictures skipped (waiting for an IRAP, RASL, errors),
+   * pictures output with concealment, and contained non-VCL errors.
+   */
+  get stats(): HEVCDecodeStats {
+    const m = this._m;
+    const ptr = m._malloc(STATS_STRUCT.SIZE);
+    try {
+      if (this._api.getStats(this._dec, ptr) !== 0) throw new Error("Failed to read decoder stats");
+      return readDecodeStats(m, ptr);
     } finally {
       m._free(ptr);
     }
@@ -359,7 +396,7 @@ export class HEVCDecoder {
         width: s.width, height: s.height,
         chromaWidth: s.chromaWidth, chromaHeight: s.chromaHeight,
         strideY: s.strideY, strideC: s.strideC,
-        bitDepth: s.bitDepth, poc: s.poc,
+        bitDepth: s.bitDepth, poc: s.poc, tag: s.tag, flags: s.flags,
       };
     }
     const yBase = s.yPtr >> 1, cbBase = s.cbPtr >> 1, crBase = s.crPtr >> 1;
@@ -372,7 +409,7 @@ export class HEVCDecoder {
       width: s.width, height: s.height,
       chromaWidth: s.chromaWidth, chromaHeight: s.chromaHeight,
       strideY: s.strideY, strideC: s.strideC,
-      bitDepth: s.bitDepth, poc: s.poc,
+      bitDepth: s.bitDepth, poc: s.poc, tag: s.tag, flags: s.flags,
     };
   }
 
