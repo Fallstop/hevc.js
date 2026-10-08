@@ -114,7 +114,9 @@ int hevc_decoder_feed(HEVCDecoder* dec, const uint8_t* data, size_t size);
 // hevc_decoder_feed() with a caller tag (e.g. the access unit's timestamp):
 // every picture whose first slice segment arrives in this call carries `tag`
 // in HEVCFrame.tag when it is output. Frames are thereby labelled exactly, even
-// when the decoder skips, drops or reorders pictures.
+// when the decoder skips, drops or reorders pictures. Give each access unit its
+// own tag: within one tagged unit, slices that cannot belong to the picture it
+// carries (corrupt or repeated) are dropped, not started as a second picture.
 int hevc_decoder_feed_tagged(HEVCDecoder* dec, const uint8_t* data, size_t size, double tag);
 
 // Copy the decode counters into *stats. Returns HEVC_OK, or HEVC_ERROR on a

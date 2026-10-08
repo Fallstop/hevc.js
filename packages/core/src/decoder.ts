@@ -238,7 +238,10 @@ export class HEVCDecoder {
    * @param tag Optional label — typically the access unit's timestamp. Every
    *   picture whose first slice segment is in this chunk is output with
    *   `frame.tag === tag`, whatever pictures the decoder skips, drops or
-   *   reorders in between; untagged pictures carry `NaN`.
+   *   reorders in between; untagged pictures carry `NaN`. Give each access
+   *   unit its own tag: within one tagged unit, slices that cannot belong to
+   *   the picture it carries (a corrupt or repeated slice) are dropped rather
+   *   than started as a second picture with the same tag.
    */
   feed(data: Uint8Array, tag?: number): void {
     this._gen++; // allocation + decode-in-feed can grow/overwrite the heap
