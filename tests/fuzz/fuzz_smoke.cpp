@@ -1,8 +1,9 @@
 // Fuzz smoke: decode thousands of randomly mutated fixtures under every error
 // policy and feeding mode, in one process. Built with the Debug (ASan)
 // configuration, any memory error aborts with a report; hangs abort through a
-// watchdog; contract violations (feed() error, unbounded DPB, invented tags)
-// abort with the reproducing seed. Exit 0 means every input was contained.
+// watchdog; contract violations (feed() error, unbounded DPB or heap, a heap
+// leak, invented tags) abort with the reproducing seed. Exit 0 means every
+// input was contained.
 //
 //   hevc_fuzz_smoke [--iterations N] [--seed S] [--fixtures DIR] [--quiet]
 //
@@ -22,9 +23,35 @@
 #include "decoding/decoder.h"
 #include "mutate.h"
 
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define HEVC_FUZZ_HEAP_STATS 1
+#endif
+#elif defined(__SANITIZE_ADDRESS__)
+#define HEVC_FUZZ_HEAP_STATS 1
+#endif
+#ifdef HEVC_FUZZ_HEAP_STATS
+#include <sanitizer/allocator_interface.h>
+#endif
+
 using namespace hevc;
 
 namespace {
+
+// Bytes the program currently has allocated (ASan builds; 0 otherwise)
+size_t live_heap() {
+#ifdef HEVC_FUZZ_HEAP_STATS
+    return __sanitizer_get_current_allocated_bytes();
+#else
+    return 0;
+#endif
+}
+
+size_t picture_bytes(const Picture& p) {
+    size_t n = p.motion_info_buf.capacity() * sizeof(Picture::PUMotionInfoCompact);
+    for (const auto& plane : p.plane_bytes) n += plane.capacity();
+    return n;
+}
 
 const char* kFixtures[] = {
     "p_qcif_10f.265", "b_qcif_10f.265", "full_qcif_10f.265", "full_qcif_10f_10bit.265",
@@ -48,10 +75,30 @@ std::vector<uint8_t> read_file(const std::string& path) {
 
 struct Totals {
     uint64_t frames = 0, concealed = 0, skipped_error = 0, nal_errors = 0, bytes = 0;
+    size_t peak_heap = 0;
 };
 
 void run_case(const std::vector<uint8_t>& data, uint32_t seed, const std::string& desc,
               int policy_bits, int feed_mode, Totals& t) {
+    const size_t heap_before = live_heap();
+    {
+    size_t vcl = 0;
+    for (const auto& n : hevc_fuzz::find_nals(data))
+        if (n.payload_begin < data.size() && ((data[n.payload_begin] >> 1) & 0x3F) < 32) vcl++;
+    size_t max_picture = 0;
+    // Heap held by the decoder: its pictures (at most the DPB, the picture
+    // being decoded, the recycling pool and the pictures bumped since the
+    // last drain — with one chunk, every picture of the stream) plus scratch
+    // grids and copies of the input, which scale with it.
+    auto check_heap = [&](const Decoder& d) {
+        if (!live_heap()) return;
+        for (const auto& p : d.dpb().pictures()) max_picture = std::max(max_picture, picture_bytes(*p));
+        const size_t held = live_heap() - std::min(live_heap(), heap_before);
+        t.peak_heap = std::max(t.peak_heap, held);
+        const size_t pictures = static_cast<size_t>(DPB::kMaxDpbPictures) + 4 + (feed_mode == 0 ? vcl : 0);
+        if (held > pictures * max_picture * 3 / 2 + 16 * data.size() + (16u << 20))
+            fail("heap grew past its bound", seed, desc);
+    };
     Decoder dec;
     ErrorPolicy policy;
     policy.conceal_slice_errors = policy_bits & 1;
@@ -86,14 +133,22 @@ void run_case(const std::vector<uint8_t>& data, uint32_t seed, const std::string
         check(dec.drain(), i + 1);
         if (dec.dpb().pictures().size() > static_cast<size_t>(DPB::kMaxDpbPictures + 2) && feed_mode != 0)
             fail("DPB grew past its bound", seed, desc);
+        check_heap(dec);
         if (i % 7 == 3 && (seed & 1)) dec.discontinuity();
     }
     check(dec.flush(), chunks.size());
+    check_heap(dec);
     const DecodeStats s = dec.stats();
     t.concealed += s.concealed;
     t.skipped_error += s.skipped_error;
     t.nal_errors += s.nal_errors;
     t.bytes += data.size();
+    }
+    // The decoder is gone: everything it allocated is freed
+    if (live_heap() > heap_before) {
+        std::fprintf(stderr, "%zu bytes still allocated\n", live_heap() - heap_before);
+        fail("heap leak", seed, desc);
+    }
 }
 
 }  // namespace
@@ -132,6 +187,21 @@ int main(int argc, char** argv) {
         }
     });
 
+    // Warm-up: one-time allocations of the runtime (the first exception, the
+    // first worker thread) must not count as a leak of the first case.
+    {
+        for (size_t i = 0; i < fixtures.size(); i++)
+            for (int mode = 0; mode < 3; mode++) {
+                std::mt19937 rng(static_cast<uint32_t>(i));
+                auto data = fixtures[i];
+                hevc_fuzz::apply(hevc_fuzz::Mutation::TruncateNal, data, rng);
+                Decoder dec;
+                dec.decode(fixtures[i].data(), fixtures[i].size());
+                dec.decode(data.data(), data.size());
+                dec.flush();
+            }
+    }
+
     Totals t;
     const auto t0 = std::chrono::steady_clock::now();
     for (uint32_t it = 0; it < iterations; it++) {
@@ -152,10 +222,11 @@ int main(int argc, char** argv) {
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::printf("fuzz smoke: %u mutated inputs (seeds %u..%u), 0 failures; %llu frames out, "
                 "%llu concealed, %llu pictures skipped for errors, %llu NAL errors contained, "
-                "%.1f MB decoded in %.1fs\n",
+                "%.1f MB decoded in %.1fs; peak decoder heap %.1f MB%s\n",
                 iterations, seed0, seed0 + iterations - 1,
                 static_cast<unsigned long long>(t.frames), static_cast<unsigned long long>(t.concealed),
                 static_cast<unsigned long long>(t.skipped_error), static_cast<unsigned long long>(t.nal_errors),
-                static_cast<double>(t.bytes) / 1e6, secs);
+                static_cast<double>(t.bytes) / 1e6, secs, static_cast<double>(t.peak_heap) / 1e6,
+                live_heap() ? "" : " (not measured: no ASan)");
     return 0;
 }

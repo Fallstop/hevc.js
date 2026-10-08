@@ -7,12 +7,24 @@
 // tags that were actually fed, flag every concealed picture, and give the same
 // frames whether the caller drains after every chunk or only at the end.
 // Across the corpus, concealment must drop strictly fewer pictures than
-// skip-to-IRAP.
+// skip-to-IRAP. A separate test checks the heap levels off on a decoder fed
+// corrupt input for a long time.
 
 #include <gtest/gtest.h>
 
 #include <map>
 #include <set>
+
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define HEVC_TEST_HEAP_STATS 1
+#endif
+#elif defined(__SANITIZE_ADDRESS__)
+#define HEVC_TEST_HEAP_STATS 1
+#endif
+#ifdef HEVC_TEST_HEAP_STATS
+#include <sanitizer/allocator_interface.h>
+#endif
 
 #include "../fuzz/mutate.h"
 #include "test_util.h"
@@ -224,6 +236,56 @@ TEST(CorruptionCorpusTags, CorruptionInsideAccessUnitsKeepsTagsUnique) {
             }
         }
     }
+}
+
+// A long-running decoder fed corrupt input over and over (a camera that
+// keeps sending a damaged stream): the heap it holds levels off — nothing
+// accumulates per picture, per error or per discontinuity. Measured with
+// ASan's allocator statistics, so only in the Debug (ASan) build.
+TEST(CorruptionCorpusHeap, RepeatedCorruptInputDoesNotGrowTheHeap) {
+#ifndef HEVC_TEST_HEAP_STATS
+    GTEST_SKIP() << "needs the ASan allocator statistics";
+#else
+    ErrorPolicy both;
+    both.conceal_slice_errors = true;
+    both.decode_before_irap = true;
+    for (const char* name : {"multislice_wpp_qcif_8f.265", "b_qcif_10f.265", "camera_qcif_12f.265"}) {
+        const auto clean = read_file(fixture(name));
+        for (uint32_t k = 0; k < 2; k++) {
+            std::mt19937 rng(9100 + k);
+            auto data = clean;
+            const std::string desc = hevc_fuzz::mutate(data, rng);
+            SCOPED_TRACE(std::string(name) + " seed " + std::to_string(9100 + k) + " " + desc);
+            const auto chunks = hevc_fuzz::split_chunks(data);
+            std::vector<size_t> level;
+            level.reserve(30);
+            auto loops = [&](int n, size_t base) {
+                Decoder dec;
+                dec.set_error_policy(both);
+                double tag = 0;
+                for (int loop = 0; loop < n; loop++) {
+                    for (const auto& c : chunks) {
+                        dec.feed(c.data(), c.size(), tag++);
+                        dec.drain();
+                    }
+                    if (loop % 3 == 0) dec.discontinuity();
+                    if (loop % 3 == 1) dec.flush();
+                    dec.drain();
+                    if (base) level.push_back(__sanitizer_get_current_allocated_bytes() - base);
+                }
+            };
+            // The first pass through a code path may allocate runtime state
+            // once per process (exception globals and the like): not ours.
+            loops(3, 0);
+            const size_t base = __sanitizer_get_current_allocated_bytes();
+            loops(30, base);
+            const size_t early = *std::max_element(level.begin() + 5, level.begin() + 10);
+            const size_t late = *std::max_element(level.begin() + 20, level.end());
+            EXPECT_LE(late, early + (64u << 10)) << "early " << early << " late " << late;
+            EXPECT_EQ(__sanitizer_get_current_allocated_bytes(), base) << "leaked " << (__sanitizer_get_current_allocated_bytes() - base);
+        }
+    }
+#endif
 }
 
 INSTANTIATE_TEST_SUITE_P(Fixtures, CorruptionCorpus,

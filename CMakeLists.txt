@@ -176,7 +176,7 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
     target_link_libraries(hevc_fuzz_smoke PRIVATE hevc-decode-lib)
     target_compile_definitions(hevc_fuzz_smoke PRIVATE
         FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/conformance/fixtures")
-    add_test(NAME fuzz_smoke COMMAND hevc_fuzz_smoke --iterations 300 --quiet)
+    add_test(NAME fuzz_smoke COMMAND hevc_fuzz_smoke --iterations 2000 --quiet)
     set_tests_properties(fuzz_smoke PROPERTIES LABELS "fuzz" TIMEOUT 900
         ENVIRONMENT "HEVC_DEBUG_FILTER=none")
 
