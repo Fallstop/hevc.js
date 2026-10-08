@@ -181,10 +181,11 @@ TEST(CabacDecode, DecodeTerminate_EndOfSlice) {
     // 508 = 0b111111100 => let's use 0b111111111 = 511
     // Bytes: 0xFF, 0x80 (first 9 bits = 111111110 = 510... let's be precise)
 
-    // ivlOffset = read_bits(9). To get 510: binary 111111110
-    // byte 0: 0xFF = 11111111, byte 1: MSB = 0 => 0b111111110 = 510
-    // decode_terminate: range -= 2 -> 508. offset=510 >= 508 -> return 1
-    std::vector<uint8_t> data = { 0xFF, 0x00 };
+    // ivlOffset = read_bits(9). 510 and 511 are forbidden initial values
+    // (§9.3.2.5, rejected by init_decoder), so use 509: binary 111111101
+    // byte 0: 0xFE = 11111110, byte 1: MSB = 1 => 0b111111101 = 509
+    // decode_terminate: range -= 2 -> 508. offset=509 >= 508 -> return 1
+    std::vector<uint8_t> data = { 0xFE, 0x80 };
     auto bs = make_bs(data);
 
     CabacEngine engine;

@@ -163,7 +163,10 @@ bool BitstreamReader::eof() const {
 }
 
 void BitstreamReader::seek_to_byte(size_t pos) {
-    assert(pos <= size_);
+    // A corrupt entry-point offset or SEI payloadSize can point past the end.
+    // That is a data error, not a programmer error: clamp to the end so the
+    // next read fails the normal (catchable) way instead of asserting.
+    if (pos > size_) pos = size_;
     bit_pos_ = pos * 8;
     byte_pos_ = pos;
     cache_ = 0;

@@ -1,4 +1,6 @@
 #include "decoding/cabac.h"
+
+#include <stdexcept>
 #include "common/debug.h"
 #include <cstdlib>
 #include <cstdio>
@@ -25,6 +27,11 @@ void CabacEngine::init_decoder(BitstreamReader& bs) {
     bs_ = &bs;
     ivlCurrRange_ = 510;
     ivlOffset_ = static_cast<uint16_t>(bs.read_bits(9));
+    // §9.3.2.5: a conforming bitstream never starts with ivlOffset 510 or 511.
+    // From that state every bypass bin decodes as 1 and the offset climbs past
+    // the range, so treat it as the corrupt slice data it is.
+    if (ivlOffset_ >= ivlCurrRange_)
+        throw std::runtime_error("CABAC: invalid initial ivlOffset");
     HEVC_LOG(CABAC, "init_decoder: ivlCurrRange=%d ivlOffset=%d", ivlCurrRange_, ivlOffset_);
 
 #ifdef HEVC_TRACE_CABAC

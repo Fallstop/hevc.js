@@ -8,6 +8,22 @@
 
 namespace hevc {
 
+// Reject a parameter set (or RPS) whose value is outside the range the spec
+// allows. Out-of-range values are what turns a corrupt header into a stack or
+// heap overrun downstream, so they are refused at parse time.
+#define REJECT_IF(cond, ...)                                       \
+    do {                                                            \
+        if (cond) {                                                 \
+            HEVC_LOG(PARSE, "SPS/RPS rejected: " __VA_ARGS__);      \
+            return false;                                           \
+        }                                                           \
+    } while (0)
+
+// §A.4.1 Table A.8, level 6.2 (the highest defined): MaxLumaPs. With the
+// per-dimension cap below it bounds every per-picture allocation.
+static constexpr uint64_t kMaxLumaPs = 35651584;
+static constexpr uint32_t kMaxLumaDimension = 16384;
+
 // ---- Default scaling list matrices (spec Tables 7-3 to 7-5) ----
 
 static const uint8_t default_scaling_list_4x4[16] = {
@@ -80,6 +96,9 @@ bool ScalingListData::parse(BitstreamReader& bs) {
             if (!scaling_list_pred_mode_flag) {
                 // Copy from another matrix
                 uint32_t delta = bs.read_ue();
+                // §7.4.5: delta in 0..matrixId / (sizeId == 3 ? 3 : 1)
+                REJECT_IF(delta > static_cast<uint32_t>(matrixId / step),
+                          "scaling_list_pred_matrix_id_delta=%u", delta);
                 if (delta == 0) {
                     // Use default values (already set)
                 } else {
@@ -99,7 +118,11 @@ bool ScalingListData::parse(BitstreamReader& bs) {
                 int coefNum = std::min(64, 1 << (4 + (sizeId << 1)));
 
                 if (sizeId > 1) {
-                    int dc_coef = bs.read_se() + 8;
+                    int32_t dc_minus8 = bs.read_se();
+                    // §7.4.5: scaling_list_dc_coef_minus8 in -7..247
+                    REJECT_IF(dc_minus8 < -7 || dc_minus8 > 247,
+                              "scaling_list_dc_coef_minus8=%d", dc_minus8);
+                    int dc_coef = dc_minus8 + 8;
                     scaling_list_dc[sizeId - 2][matrixId] = static_cast<uint8_t>(dc_coef);
                     nextCoef = dc_coef;
                 }
@@ -113,6 +136,9 @@ bool ScalingListData::parse(BitstreamReader& bs) {
                 const int sbStride = (coefNum == 16) ? 4 : 8;
                 for (int i = 0; i < coefNum; i++) {
                     int delta_coef = bs.read_se();
+                    // §7.4.5: scaling_list_delta_coef in -128..127
+                    REJECT_IF(delta_coef < -128 || delta_coef > 127,
+                              "scaling_list_delta_coef=%d", delta_coef);
                     nextCoef = (nextCoef + delta_coef + 256) % 256;
                     int xC, yC;
                     if (sbStride == 4) {
@@ -149,14 +175,24 @@ bool ShortTermRefPicSet::parse(BitstreamReader& bs, int stRpsIdx,
         if (stRpsIdx == num_short_term_ref_pic_sets) {
             delta_idx_minus1 = bs.read_ue();
         }
+        // §7.4.8: delta_idx_minus1 in 0..stRpsIdx-1, so RefRpsIdx >= 0 and
+        // indexes an already-parsed set
+        REJECT_IF(stRpsIdx <= 0 || delta_idx_minus1 >= static_cast<uint32_t>(stRpsIdx) ||
+                  static_cast<size_t>(stRpsIdx) > rps_array.size(),
+                  "delta_idx_minus1=%u stRpsIdx=%d", delta_idx_minus1, stRpsIdx);
         bool delta_rps_sign = bs.read_flag();
         uint32_t abs_delta_rps_minus1 = bs.read_ue();
+        // §7.4.8: abs_delta_rps_minus1 in 0..2^15-1
+        REJECT_IF(abs_delta_rps_minus1 > 32767, "abs_delta_rps_minus1=%u", abs_delta_rps_minus1);
 
         int RefRpsIdx = stRpsIdx - 1 - static_cast<int>(delta_idx_minus1);
         int deltaRps = (1 - 2 * delta_rps_sign) * (static_cast<int>(abs_delta_rps_minus1) + 1);
 
         const auto& ref = rps_array[RefRpsIdx];
         int NumDeltaPocsRef = static_cast<int>(ref.NumDeltaPocs);
+        // DPB-bounded (<= 16): keeps the flag/dPoc arrays below in range
+        REJECT_IF(NumDeltaPocsRef > 16 || ref.NumNegativePics > 16 || ref.NumPositivePics > 16,
+                  "reference RPS has %d delta POCs", NumDeltaPocsRef);
 
         // Parse used_by_curr_pic_flag and use_delta_flag for each entry
         std::array<bool, 33> used_by_curr_pic_flag = {};
@@ -205,6 +241,7 @@ bool ShortTermRefPicSet::parse(BitstreamReader& bs, int stRpsIdx,
                 numEntries++;
             }
         }
+        REJECT_IF(numEntries > 16, "%d derived negative pictures", numEntries);
         NumNegativePics = numEntries;
         for (int k = 0; k < numEntries; k++) {
             DeltaPocS0[k] = dPoc[k];
@@ -234,18 +271,25 @@ bool ShortTermRefPicSet::parse(BitstreamReader& bs, int stRpsIdx,
                 numEntries++;
             }
         }
+        REJECT_IF(numEntries > 16, "%d derived positive pictures", numEntries);
         NumPositivePics = numEntries;
         for (int k = 0; k < numEntries; k++) {
             DeltaPocS1[k] = dPoc[k];
             UsedByCurrPicS1[k] = usedFlag[k];
         }
 
+        REJECT_IF(NumNegativePics + NumPositivePics > 16, "%u derived delta POCs",
+                  NumNegativePics + NumPositivePics);
         NumDeltaPocs = NumNegativePics + NumPositivePics;
         (void)i;
     } else {
         // Direct specification
         num_negative_pics = bs.read_ue();
         num_positive_pics = bs.read_ue();
+        // §7.4.8: both bounded by the DPB size; the delta_poc arrays hold 16
+        REJECT_IF(num_negative_pics > 16 || num_positive_pics > 16 ||
+                  num_negative_pics + num_positive_pics > 16,
+                  "num_negative_pics=%u num_positive_pics=%u", num_negative_pics, num_positive_pics);
 
         NumNegativePics = num_negative_pics;
         NumPositivePics = num_positive_pics;
@@ -254,6 +298,8 @@ bool ShortTermRefPicSet::parse(BitstreamReader& bs, int stRpsIdx,
         // S0 (negative delta POCs)
         for (uint32_t i = 0; i < num_negative_pics; i++) {
             uint32_t delta_poc_s0_minus1 = bs.read_ue();
+            // §7.4.8: 0..2^15-1 — keeps the running DeltaPocS0 sum in int range
+            REJECT_IF(delta_poc_s0_minus1 > 32767, "delta_poc_s0_minus1=%u", delta_poc_s0_minus1);
             used_by_curr_pic_s0[i] = bs.read_flag();
             UsedByCurrPicS0[i] = used_by_curr_pic_s0[i];
 
@@ -267,6 +313,7 @@ bool ShortTermRefPicSet::parse(BitstreamReader& bs, int stRpsIdx,
         // S1 (positive delta POCs)
         for (uint32_t i = 0; i < num_positive_pics; i++) {
             uint32_t delta_poc_s1_minus1 = bs.read_ue();
+            REJECT_IF(delta_poc_s1_minus1 > 32767, "delta_poc_s1_minus1=%u", delta_poc_s1_minus1);
             used_by_curr_pic_s1[i] = bs.read_flag();
             UsedByCurrPicS1[i] = used_by_curr_pic_s1[i];
 
@@ -369,13 +416,19 @@ static void skip_vui_parameters(BitstreamReader& bs) {
 bool SPS::parse(BitstreamReader& bs) {
     sps_video_parameter_set_id = bs.read_bits(4);
     sps_max_sub_layers_minus1 = bs.read_bits(3);
+    // §7.4.3.2.1: 0..6 — indexes sub_layer_ordering[7] and the PTL sub-layer arrays
+    REJECT_IF(sps_max_sub_layers_minus1 > 6, "sps_max_sub_layers_minus1=%u",
+              sps_max_sub_layers_minus1);
     sps_temporal_id_nesting_flag = bs.read_flag();
 
     // profile_tier_level(1, sps_max_sub_layers_minus1)
-    profile_tier_level.parse(bs, true, sps_max_sub_layers_minus1);
+    if (!profile_tier_level.parse(bs, true, sps_max_sub_layers_minus1)) return false;
 
     sps_seq_parameter_set_id = bs.read_ue();
     chroma_format_idc = bs.read_ue();
+    // §7.4.3.2.1: sps id 0..15 (indexes the 16-entry store), chroma_format_idc 0..3
+    REJECT_IF(sps_seq_parameter_set_id > 15 || chroma_format_idc > 3,
+              "id=%u chroma_format_idc=%u", sps_seq_parameter_set_id, chroma_format_idc);
 
     if (chroma_format_idc == 3) {
         separate_colour_plane_flag = bs.read_flag();
@@ -395,15 +448,31 @@ bool SPS::parse(BitstreamReader& bs) {
     bit_depth_luma_minus8 = bs.read_ue();
     bit_depth_chroma_minus8 = bs.read_ue();
     log2_max_pic_order_cnt_lsb_minus4 = bs.read_ue();
+    // §7.4.3.2.1 allows bit depths up to 16, but past 12 bits the
+    // interpolation/weighting shifts go negative without
+    // extended_precision_processing, which this decoder does not implement.
+    REJECT_IF(bit_depth_luma_minus8 > 4 || bit_depth_chroma_minus8 > 4,
+              "bit depth %u/%u unsupported", bit_depth_luma_minus8 + 8, bit_depth_chroma_minus8 + 8);
+    // §7.4.3.2.1: log2_max_pic_order_cnt_lsb_minus4 in 0..12
+    REJECT_IF(log2_max_pic_order_cnt_lsb_minus4 > 12, "log2_max_poc_lsb_minus4=%u",
+              log2_max_pic_order_cnt_lsb_minus4);
 
     // Sub-layer ordering
     sps_sub_layer_ordering_info_present_flag = bs.read_flag();
     int start = sps_sub_layer_ordering_info_present_flag ? 0 : sps_max_sub_layers_minus1;
     for (int i = start; i <= sps_max_sub_layers_minus1; i++) {
-        sub_layer_ordering[i].max_dec_pic_buffering_minus1 = bs.read_ue();
-        sub_layer_ordering[i].max_num_reorder_pics = bs.read_ue();
-        sub_layer_ordering[i].max_latency_increase_plus1 = bs.read_ue();
+        auto& o = sub_layer_ordering[i];
+        o.max_dec_pic_buffering_minus1 = bs.read_ue();
+        o.max_num_reorder_pics = bs.read_ue();
+        o.max_latency_increase_plus1 = bs.read_ue();
+        // §7.4.3.2.1 bounds these by MaxDpbSize (16). They only steer output
+        // timing, so a camera that overstates them is clamped, not rejected.
+        if (o.max_dec_pic_buffering_minus1 > 15) o.max_dec_pic_buffering_minus1 = 15;
+        if (o.max_num_reorder_pics > o.max_dec_pic_buffering_minus1)
+            o.max_num_reorder_pics = o.max_dec_pic_buffering_minus1;
     }
+    // §7.4.3.2.1: when not present, lower sub-layers take the highest one's values
+    for (int i = 0; i < start; i++) sub_layer_ordering[i] = sub_layer_ordering[start];
 
     // Quad-tree config
     log2_min_luma_coding_block_size_minus3 = bs.read_ue();
@@ -413,12 +482,31 @@ bool SPS::parse(BitstreamReader& bs) {
     max_transform_hierarchy_depth_inter = bs.read_ue();
     max_transform_hierarchy_depth_intra = bs.read_ue();
 
+    // Coarse bounds first, so the derived sums below cannot overflow
+    REJECT_IF(log2_min_luma_coding_block_size_minus3 > 3 ||
+              log2_diff_max_min_luma_coding_block_size > 3 ||
+              log2_min_luma_transform_block_size_minus2 > 3 ||
+              log2_diff_max_min_luma_transform_block_size > 3,
+              "log2 block size field out of range%s", "");
+    {
+        // §7.4.3.2.1 + §A.4.1: CTB 16..64, TB smaller than the min CB, TB <= 32
+        const int minCbLog2 = static_cast<int>(log2_min_luma_coding_block_size_minus3) + 3;
+        const int ctbLog2 = minCbLog2 + static_cast<int>(log2_diff_max_min_luma_coding_block_size);
+        const int minTbLog2 = static_cast<int>(log2_min_luma_transform_block_size_minus2) + 2;
+        const int maxTbLog2 = minTbLog2 + static_cast<int>(log2_diff_max_min_luma_transform_block_size);
+        REJECT_IF(ctbLog2 < 4 || ctbLog2 > 6 || minTbLog2 >= minCbLog2 ||
+                  maxTbLog2 > std::min(ctbLog2, 5) ||
+                  max_transform_hierarchy_depth_inter > static_cast<uint32_t>(ctbLog2 - minTbLog2) ||
+                  max_transform_hierarchy_depth_intra > static_cast<uint32_t>(ctbLog2 - minTbLog2),
+                  "block sizes ctb=%d mincb=%d tb=[%d,%d]", ctbLog2, minCbLog2, minTbLog2, maxTbLog2);
+    }
+
     // Scaling lists
     scaling_list_enabled_flag = bs.read_flag();
     if (scaling_list_enabled_flag) {
         sps_scaling_list_data_present_flag = bs.read_flag();
         if (sps_scaling_list_data_present_flag) {
-            scaling_list_data.parse(bs);
+            if (!scaling_list_data.parse(bs)) return false;
         } else {
             // Use default (non-flat) scaling lists
             scaling_list_data.set_defaults();
@@ -436,21 +524,41 @@ bool SPS::parse(BitstreamReader& bs) {
         log2_min_pcm_luma_coding_block_size_minus3 = bs.read_ue();
         log2_diff_max_min_pcm_luma_coding_block_size = bs.read_ue();
         pcm_loop_filter_disabled_flag = bs.read_flag();
+
+        // §7.4.3.2.1: PCM sizes within [8, min(CtbSizeY, 32)], PCM depth <= bit depth
+        REJECT_IF(log2_min_pcm_luma_coding_block_size_minus3 > 2 ||
+                  log2_diff_max_min_pcm_luma_coding_block_size > 2,
+                  "PCM log2 size out of range%s", "");
+        const int ctbLog2 = static_cast<int>(log2_min_luma_coding_block_size_minus3) + 3 +
+                            static_cast<int>(log2_diff_max_min_luma_coding_block_size);
+        const int maxIpcmLog2 = static_cast<int>(log2_min_pcm_luma_coding_block_size_minus3) + 3 +
+                                static_cast<int>(log2_diff_max_min_pcm_luma_coding_block_size);
+        REJECT_IF(maxIpcmLog2 > std::min(ctbLog2, 5) ||
+                  pcm_sample_bit_depth_luma_minus1 + 1u > 8u + bit_depth_luma_minus8 ||
+                  pcm_sample_bit_depth_chroma_minus1 + 1u > 8u + bit_depth_chroma_minus8,
+                  "PCM config out of range%s", "");
     }
 
     // Short-term reference picture sets
     num_short_term_ref_pic_sets = bs.read_ue();
+    // §7.4.3.2.1: 0..64 — bounds the resize below
+    REJECT_IF(num_short_term_ref_pic_sets > 64, "num_short_term_ref_pic_sets=%u",
+              num_short_term_ref_pic_sets);
     st_ref_pic_sets.resize(num_short_term_ref_pic_sets);
     for (uint32_t i = 0; i < num_short_term_ref_pic_sets; i++) {
-        st_ref_pic_sets[i].parse(bs, static_cast<int>(i),
-                                  static_cast<int>(num_short_term_ref_pic_sets),
-                                  st_ref_pic_sets);
+        if (!st_ref_pic_sets[i].parse(bs, static_cast<int>(i),
+                                      static_cast<int>(num_short_term_ref_pic_sets),
+                                      st_ref_pic_sets))
+            return false;
     }
 
     // Long-term reference pictures
     long_term_ref_pics_present_flag = bs.read_flag();
     if (long_term_ref_pics_present_flag) {
         num_long_term_ref_pics_sps = bs.read_ue();
+        // §7.4.3.2.1: 0..32 — bounds the lt_ref_pic_poc_lsb_sps[32] writes
+        REJECT_IF(num_long_term_ref_pics_sps > 32, "num_long_term_ref_pics_sps=%u",
+                  num_long_term_ref_pics_sps);
         for (uint32_t i = 0; i < num_long_term_ref_pics_sps; i++) {
             // lt_ref_pic_poc_lsb_sps[i] — u(v) where v = log2_max_pic_order_cnt_lsb_minus4 + 4
             int poc_lsb_bits = static_cast<int>(log2_max_pic_order_cnt_lsb_minus4) + 4;
@@ -574,7 +682,7 @@ bool SPS::validate() const {
 
     // Sane upper bound on picture dimensions (well above any real profile/level
     // and the 16-bit allocator stride this decoder uses).
-    constexpr uint32_t kMaxDim = 16384;
+    constexpr uint32_t kMaxDim = kMaxLumaDimension;
 
     // Width/height must be non-zero, within the cap, and (spec §A.3.2 /
     // conformance) an integer multiple of MinCbSizeY.
@@ -586,6 +694,11 @@ bool SPS::validate() const {
     }
     if (pic_width_in_luma_samples % static_cast<uint32_t>(MinCbSizeY) != 0 ||
         pic_height_in_luma_samples % static_cast<uint32_t>(MinCbSizeY) != 0) {
+        return false;
+    }
+    // §A.4.1 level 6.2 MaxLumaPs: bounds the per-picture allocation (16384x16384
+    // would be ~400 MB per picture, times the DPB).
+    if (static_cast<uint64_t>(pic_width_in_luma_samples) * pic_height_in_luma_samples > kMaxLumaPs) {
         return false;
     }
 

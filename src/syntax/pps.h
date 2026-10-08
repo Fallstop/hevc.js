@@ -62,6 +62,15 @@ struct PPS {
     uint32_t log2_parallel_merge_level_minus2 = 0;
     bool slice_segment_header_extension_present_flag = false;
 
+    // pps_range_extension() — parsed so a PPS using tools this decoder does not
+    // implement is refused (PPS::parse) rather than mis-decoded.
+    bool pps_range_extension_flag = false;
+    uint32_t log2_max_transform_skip_block_size_minus2 = 0;
+    bool cross_component_prediction_enabled_flag = false;
+    bool chroma_qp_offset_list_enabled_flag = false;
+    uint32_t log2_sao_offset_scale_luma = 0;
+    uint32_t log2_sao_offset_scale_chroma = 0;
+
     // ---- Derived values ----
     int Log2MinCuQpDeltaSize = 0;
 
@@ -70,11 +79,17 @@ struct PPS {
     std::vector<int> CtbAddrTsToRs;  // tile scan -> raster scan
     std::vector<int> TileId;         // CTB address -> tile ID
 
-    // Parse from bitstream
+    // True once derive() succeeded for the SPS it was last run against.
+    bool derived_valid = false;
+
+    // Parse from bitstream (syntax + range checks), then derive() against sps.
     bool parse(BitstreamReader& bs, const SPS& sps);
 
-    // Compute tile scan tables
-    void derive_tile_scan(const SPS& sps);
+    // SPS-dependent range checks and derived tables (QG size, tile scan).
+    bool derive(const SPS& sps);
+
+    // Compute tile scan tables; false if the tile layout does not fit the SPS.
+    bool derive_tile_scan(const SPS& sps);
 };
 
 } // namespace hevc

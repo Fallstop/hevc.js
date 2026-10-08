@@ -1,5 +1,30 @@
 #include "decoding/syntax_elements.h"
 
+#include <cstdint>
+#include <stdexcept>
+
+namespace {
+
+// Exp-Golomb prefixes are unary runs of bypass bins; a corrupt slice can make
+// them arbitrarily long, and 1 << k is undefined past 30. The HEVC binarizations
+// never need a prefix this long (a conforming TransCoeffLevel fits 16 bits), so
+// a longer run is a data error: throw, which fails the slice like an over-read.
+constexpr int kMaxEgkPrefix = 32;
+
+[[noreturn]] void egk_overflow() {
+    throw std::runtime_error("CABAC: Exp-Golomb prefix too long");
+}
+
+// k fixed-length bypass bins, MSB first, for any k <= kMaxEgkPrefix + 5
+inline int64_t decode_bypass_bins_wide(hevc::CabacEngine& cabac, int k) {
+    if (k <= 24) return cabac.decode_bypass_bins(k);
+    int64_t v = 0;
+    for (int i = 0; i < k; i++) v = (v << 1) | cabac.decode_bypass();
+    return v;
+}
+
+}  // namespace
+
 namespace hevc {
 
 // §7.3.8.5 — sao_type_idx: TU cMax=2, 1 context + 1 bypass
@@ -135,10 +160,14 @@ int decode_cu_qp_delta(CabacEngine& cabac) {
     if (prefix >= 5) {
         // Suffix: EG0 bypass
         int k = 0;
-        int suffix = 0;
-        while (cabac.decode_bypass()) k++;
-        suffix = (1 << k) - 1 + cabac.decode_bypass_bins(k);
-        val = prefix + suffix;
+        while (cabac.decode_bypass()) {
+            if (++k > kMaxEgkPrefix) egk_overflow();
+        }
+        int64_t suffix = (int64_t(1) << k) - 1 + decode_bypass_bins_wide(cabac, k);
+        // |CuQpDeltaVal| <= 26 + QpBdOffsetY / 2 (the caller checks the exact
+        // bound); anything this large is corrupt
+        if (suffix > (1 << 16)) egk_overflow();
+        val = prefix + static_cast<int>(suffix);
     }
 
     if (val == 0) return 0;
@@ -240,12 +269,19 @@ int decode_coeff_abs_level_remaining(CabacEngine& cabac, int cRiceParam) {
         // §9.3.3.3: read 1's incrementing k, then 0, then k bits
         int kStart = cRiceParam + 1;
         int k = kStart;
-        while (cabac.decode_bypass()) k++;
-        int suffix = cabac.decode_bypass_bins(k);
+        int prefixLen = 4;
+        while (cabac.decode_bypass()) {
+            if (++prefixLen > kMaxEgkPrefix) egk_overflow();
+            k++;
+        }
+        int64_t suffix = decode_bypass_bins_wide(cabac, k);
         // Reconstruct: sum of (1<<k_j) for each '1' read + final k bits
         // = (1 << k) - (1 << kStart) + suffix
-        suffix += (1 << k) - (1 << kStart);
-        return (4 << cRiceParam) + suffix;
+        suffix += (int64_t(1) << k) - (int64_t(1) << kStart);
+        const int64_t value = (int64_t(4) << cRiceParam) + suffix;
+        // §7.4.9.11: TransCoeffLevel fits in 16 bits without extended precision
+        if (value > (1 << 22)) egk_overflow();
+        return static_cast<int>(value);
     }
 }
 
@@ -295,14 +331,15 @@ MV decode_mvd(CabacEngine& cabac) {
     // §9.3.3.3 eq 9-13: k-th order Exp-Golomb with k=1 (Table 9-43)
     auto decode_eg1 = [&cabac]() -> int {
         int k = 1;
-        int absV = 0;
+        int64_t absV = 0;
         while (cabac.decode_bypass()) {
-            absV += (1 << k);
-            k++;
+            absV += (int64_t(1) << k);
+            if (++k > kMaxEgkPrefix) egk_overflow();
         }
-        if (k > 0)
-            absV += cabac.decode_bypass_bins(k);
-        return absV;
+        absV += decode_bypass_bins_wide(cabac, k);
+        // §7.4.9.9: abs_mvd_minus2 + 2 <= 2^15
+        if (absV > (1 << 16)) egk_overflow();
+        return static_cast<int>(absV);
     };
 
     // abs_mvd_greater0_flag[0], abs_mvd_greater0_flag[1]

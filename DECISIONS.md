@@ -128,3 +128,36 @@ tests, and record the disposition of every upstream item:
 NoRaslOutputFlag = 1, whatever `no_output_of_prior_pics_flag` says — every frame
 the caller fed comes back out (upstream and the previous code behaved the same).
 `DPB` storage is additionally capped at 16 pictures (P0).
+
+## AD-011 : Spec-range validation — refuse the NAL, never index with it
+
+**Context**: A 720-run fuzz smoke found stack/heap overflows from header values
+the parser trusted (inline RPS with more than 16 pictures, `slice_segment_address
+>= PicSizeInCtbsY`, `sps_max_sub_layers_minus1 == 7`), unbounded `resize()` on
+ue(v) counts, Exp-Golomb prefixes shifted past 31 bits, and `seek_to_byte`
+asserts on corrupt entry points.
+
+**Decision**: Every syntax element that sizes an allocation, indexes a
+fixed-size array, or feeds a shift is range-checked against its §7.4 bound
+where it is parsed, and the parameter set / slice header is refused (`return
+false`). Data errors met inside slice data (Exp-Golomb prefix over 32 bins, a
+`CuQpDeltaVal` outside ±(26 + QpBdOffsetY/2), an initial CABAC offset of 510/511)
+throw, which fails the slice exactly like a bitstream over-read.
+
+**Rationale / boundaries**:
+- Refusing is the memory-safe default; whether the picture is then dropped or
+  concealed is the error policy's business (AD-016), not the parser's.
+- Fields that only steer output timing are clamped instead (the SPS
+  `max_dec_pic_buffering_minus1` to 15 and `max_num_reorder_pics` to it): a
+  camera that overstates them still decodes.
+- Bit depths above 12 are refused: without extended_precision_processing the
+  interpolation/weighting shifts go negative. Range-extension PPS tools this
+  decoder does not implement (cross-component prediction, chroma QP offset
+  lists, transform skip above 4x4, SAO offset scaling) are refused rather than
+  silently mis-decoded.
+- `seek_to_byte` clamps to the end of the buffer; the next read throws.
+- The DPB never stores more than 16 pictures: §C.5.2.2 bumping runs first, and
+  if a corrupt RPS still pins more than 16 references the oldest are unmarked.
+- `NumPicTotalCurr == 0` on a P/B slice is *not* refused (upstream refuses it):
+  the list builder already terminates and the PUs conceal, which keeps the
+  picture.

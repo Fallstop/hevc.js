@@ -136,6 +136,7 @@ if(BUILD_TESTS AND NOT BUILD_WASM)
         tests/unit/test_sei.cpp
         tests/unit/test_monochrome_output.cpp
         tests/unit/test_output_process.cpp
+        tests/unit/test_validation.cpp
     )
 
     target_link_libraries(hevc_tests PRIVATE

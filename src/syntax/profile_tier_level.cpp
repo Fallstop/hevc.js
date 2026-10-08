@@ -81,6 +81,13 @@ bool ProfileTierLevel::parse(BitstreamReader& bs, bool profilePresentFlag, int m
 
     general_level_idc = bs.read_bits(8);
 
+    // §7.4.3.2.1 / §7.4.3.1: max_sub_layers_minus1 is 0..6, and the
+    // sub_layer_* arrays hold 6 entries. Callers reject 7 before getting here;
+    // refuse it again rather than write past the arrays.
+    if (maxNumSubLayersMinus1 < 0 ||
+        maxNumSubLayersMinus1 > static_cast<int>(sub_layer_profile_present_flag.size()))
+        return false;
+
     // Sub-layer flags
     for (int i = 0; i < maxNumSubLayersMinus1; i++) {
         sub_layer_profile_present_flag[i] = bs.read_flag();

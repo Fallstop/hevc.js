@@ -1,4 +1,6 @@
 #include "decoding/coding_tree.h"
+
+#include <stdexcept>
 #include "decoding/syntax_elements.h"
 #include "decoding/cabac_tables.h"
 #include "decoding/interpolation.h"
@@ -6,6 +8,7 @@
 #include "common/debug.h"
 
 #include <cstring>
+#include <stdexcept>
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -1485,6 +1488,11 @@ void decode_transform_unit(DecodingContext& ctx, int x0, int y0,
         pps.cu_qp_delta_enabled_flag && !ctx.IsCuQpDeltaCoded) {
         ctx.CuQpDeltaVal = decode_cu_qp_delta(cabac);
         ctx.IsCuQpDeltaCoded = true;
+        // §7.4.9.14: -(26 + QpBdOffsetY/2)..+(25 + QpBdOffsetY/2). Out of range
+        // drives a negative QP into the dequant tables — fail the slice instead.
+        if (ctx.CuQpDeltaVal < -(26 + sps.QpBdOffsetY / 2) ||
+            ctx.CuQpDeltaVal > 25 + sps.QpBdOffsetY / 2)
+            throw std::runtime_error("CuQpDeltaVal out of range");
     }
 
     // §8.6.1: QP derivation uses CU position (xCb, yCb), not TU position

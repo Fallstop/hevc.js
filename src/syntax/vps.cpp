@@ -11,13 +11,15 @@ bool VPS::parse(BitstreamReader& bs) {
     vps_base_layer_available_flag = bs.read_flag();
     vps_max_layers_minus1 = bs.read_bits(6);
     vps_max_sub_layers_minus1 = bs.read_bits(3);
+    // §7.4.3.1: 0..6 — indexes sub_layer_ordering[7] and the PTL arrays
+    if (vps_max_sub_layers_minus1 > 6) return false;
     vps_temporal_id_nesting_flag = bs.read_flag();
 
     // vps_reserved_0xffff_16bits
     bs.read_bits(16);
 
     // profile_tier_level(1, vps_max_sub_layers_minus1)
-    profile_tier_level.parse(bs, true, vps_max_sub_layers_minus1);
+    if (!profile_tier_level.parse(bs, true, vps_max_sub_layers_minus1)) return false;
 
     // Sub-layer ordering info
     vps_sub_layer_ordering_info_present_flag = bs.read_flag();
@@ -29,7 +31,10 @@ bool VPS::parse(BitstreamReader& bs) {
     }
 
     vps_max_layer_id = bs.read_bits(6);
-    vps_num_layer_sets_minus1 = bs.read_ue();
+    const uint32_t num_layer_sets_minus1 = bs.read_ue();
+    // §7.4.3.1: 0..1023
+    if (num_layer_sets_minus1 > 1023) return false;
+    vps_num_layer_sets_minus1 = static_cast<uint16_t>(num_layer_sets_minus1);
 
     // layer_id_included_flag — skip (single-layer decoder)
     for (int i = 1; i <= vps_num_layer_sets_minus1; i++) {
