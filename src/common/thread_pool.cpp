@@ -70,8 +70,13 @@ void ThreadPool::worker_loop() {
         } catch (...) {
             // Intentionally swallowed — see above.
         }
-        if (active_jobs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            jobs_done_.notify_one();
+        // Decrement and notify under the mutex: wait_all() evaluates its
+        // predicate under it, and a notification sent between that check and
+        // the wait would be lost — wait_all() then blocks forever.
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (active_jobs_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                jobs_done_.notify_all();
         }
     }
 }
