@@ -265,3 +265,103 @@ TEST(ErrorPolicy, CleanStreamsAreUnaffected) {
         }
     }
 }
+
+namespace {
+
+int bits_for(int x) {
+    int b = 0;
+    while ((1 << b) < x) b++;
+    return b;
+}
+
+// The stream with the short-term RPS of every non-IDR first slice segment of
+// picture `from` on (decoding order) replaced by an empty inline one: a P/B
+// slice with NumPicTotalCurr == 0, which §7.4.7.1 forbids.
+std::vector<uint8_t> empty_rps_from(const std::vector<uint8_t>& data, size_t from) {
+    NalParser parser;
+    ParameterSetManager ps;
+    std::vector<uint8_t> out;
+    size_t pic = 0;
+    for (const auto& nal : parser.parse(data.data(), data.size())) {
+        const auto chunk = nal_chunk(data, nal);
+        const NalUnitType t = nal.header.nal_unit_type;
+        if (!is_vcl(t)) {
+            ps.process_nal(nal);
+            out.insert(out.end(), chunk.begin(), chunk.end());
+            continue;
+        }
+        const bool first = nal.rbsp[0] & 0x80;
+        SliceHeader sh;
+        const bool keep = !first || pic++ < from || is_idr(t) || !ps.parse_slice_header(sh, nal);
+        if (keep) {
+            out.insert(out.end(), chunk.begin(), chunk.end());
+            continue;
+        }
+        const SPS& sps = *ps.active_sps();
+        const PPS& pps = *ps.active_pps();
+        const int num_sets = static_cast<int>(sps.num_short_term_ref_pic_sets);
+        BitstreamReader bs(nal.rbsp.data(), nal.rbsp.size());
+        bs.read_flag();                      // first_slice_segment_in_pic_flag
+        if (is_irap(t)) bs.read_flag();      // no_output_of_prior_pics_flag
+        bs.read_ue();                        // slice_pic_parameter_set_id
+        for (int i = 0; i < pps.num_extra_slice_header_bits; i++) bs.read_flag();
+        bs.read_ue();                        // slice_type
+        if (pps.output_flag_present_flag) bs.read_flag();
+        if (sps.separate_colour_plane_flag) bs.read_bits(2);
+        bs.read_bits(static_cast<int>(sps.log2_max_pic_order_cnt_lsb_minus4) + 4);
+        const size_t rps_start = bs.bits_read();
+        if (bs.read_flag()) {
+            if (num_sets > 1) bs.read_bits(bits_for(num_sets));
+        } else {
+            ShortTermRefPicSet st;
+            EXPECT_TRUE(st.parse(bs, num_sets, num_sets, sps.st_ref_pic_sets));
+        }
+        const size_t rps_end = bs.bits_read();
+        size_t stop = sh.slice_data_byte_offset * 8 - 1;
+        while (!get_bit(nal.rbsp, stop)) stop--;  // byte_alignment()'s one bit
+
+        BitWriter w;
+        w.copy_bits(nal.rbsp, 0, rps_start);
+        w.put_bit(0);                 // short_term_ref_pic_set_sps_flag
+        if (num_sets > 0) w.put_bit(0);  // inter_ref_pic_set_prediction_flag
+        w.put_ue(0);                  // num_negative_pics
+        w.put_ue(0);                  // num_positive_pics
+        w.copy_bits(nal.rbsp, rps_end, stop);
+        w.trailing();
+        auto rbsp = w.take();
+        rbsp.insert(rbsp.end(), nal.rbsp.begin() + static_cast<long>(sh.slice_data_byte_offset), nal.rbsp.end());
+        const auto rewritten = make_nal(data[nal.offset], data[nal.offset + 1], rbsp);
+        out.insert(out.end(), rewritten.begin(), rewritten.end());
+    }
+    return out;
+}
+
+}  // namespace
+
+// P slices whose RPS names nothing (NumPicTotalCurr == 0): every list entry
+// is "no reference picture". Such pictures are flagged MISSING_REF under
+// either policy; with concealment the previous picture stands in for the
+// missing references (entry i taken to name POC - 1 - i, which is what this
+// low-delay stream's RPS named) instead of mid-grey prediction.
+TEST(ErrorPolicy, InterSliceWithNoReferencesIsFlaggedAndSubstituted) {
+    const auto data = read_file(fixture("p_qcif_10f.265"));
+    const auto broken = split_access_units(empty_rps_from(data, 5));
+    const auto clean = decode_aus(split_access_units(data), ErrorPolicy{});
+    const auto def = decode_aus(broken, ErrorPolicy{});
+    const auto con = decode_aus(broken, conceal());
+    ASSERT_EQ(clean.size(), 10u);
+    ASSERT_EQ(def.size(), 10u);
+    ASSERT_EQ(con.size(), 10u);
+    for (size_t i = 0; i < 10; i++) {
+        SCOPED_TRACE("POC " + std::to_string(clean[i].poc));
+        const uint32_t want = i >= 5 ? PICTURE_MISSING_REF : 0u;
+        EXPECT_EQ(def[i].flags, want);
+        EXPECT_EQ(con[i].flags, want);
+        if (i < 5) {
+            EXPECT_EQ(def[i].luma, clean[i].luma);
+            EXPECT_EQ(con[i].luma, clean[i].luma);
+        }
+    }
+    // Predicted from the picture before it rather than from mid-grey
+    EXPECT_LT(sad(con[5].luma, clean[5].luma), sad(def[5].luma, clean[5].luma));
+}

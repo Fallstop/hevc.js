@@ -242,6 +242,17 @@ public:
     // number of entries that remain missing.
     int substitute_missing_refs(const Picture& cur, Picture* fallback);
 
+    // An entry of the reference picture lists just built is "no reference
+    // picture": a P/B slice whose RPS names nothing current (NumPicTotalCurr
+    // 0), or a list_entry past the candidate list.
+    bool has_missing_list_entries() const;
+
+    // Replace every such entry by concealment_source(): entry i of list 0
+    // (1) is taken to name the POC i+1 before (after) the current picture,
+    // and is marked substituted unless the picture found has that POC.
+    // Returns the number of entries that remain missing.
+    int substitute_missing_list_entries(const Picture& cur, Picture* fallback);
+
     // Shared ownership of a stored picture (to keep it alive past eviction)
     std::shared_ptr<Picture> share(const Picture* pic) const;
 

@@ -667,10 +667,17 @@ void Decoder::decode_slice(const NalUnit& nal, const SlicePeek& peek, SliceHeade
         // (slices of a picture share the RPS but may size or reorder their
         // lists differently).
         dpb_.construct_ref_pic_lists(sh, *sps, *pps);
+        if (sh.slice_type != SliceType::I) {
+            // A list entry with no picture (an RPS naming nothing current, a
+            // list_entry past the candidates) predicts from mid-grey; with
+            // concealment the nearest picture stands in instead.
+            const bool empty_entries = dpb_.has_missing_list_entries();
+            if (empty_entries && policy_.conceal_slice_errors)
+                dpb_.substitute_missing_list_entries(*pend_.pic, last_picture_.get());
+            if (empty_entries || pend_.missing_refs) pend_.pic->flags |= PICTURE_MISSING_REF;
+        }
         dpb_.derive_colpic(sh);
         record_slice_refs(slice_number);
-        if (sh.slice_type != SliceType::I && pend_.missing_refs)
-            pend_.pic->flags |= PICTURE_MISSING_REF;
     }
 
     // Under the default policy a picture with an error is dropped anyway; do

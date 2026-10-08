@@ -789,6 +789,41 @@ int DPB::substitute_missing_refs(const Picture& cur, Picture* fallback) {
     return still_missing;
 }
 
+bool DPB::has_missing_list_entries() const {
+    for (const auto* list : {&ref_pic_list0_, &ref_pic_list1_})
+        for (const RefPicListEntry& e : *list)
+            if (!e.pic) return true;
+    return false;
+}
+
+int DPB::substitute_missing_list_entries(const Picture& cur, Picture* fallback) {
+    int still_missing = 0;
+    for (int l = 0; l < 2; l++) {
+        auto& list = l == 0 ? ref_pic_list0_ : ref_pic_list1_;
+        for (size_t i = 0; i < list.size(); i++) {
+            RefPicListEntry& e = list[i];
+            if (e.pic) continue;
+            // Nothing names this entry. Assume the most common structure —
+            // entry i of list 0 (1) is the (i+1)-th picture before (after)
+            // the current one — and give it that POC, so motion vectors scale
+            // as the encoder most likely intended.
+            const int32_t step = static_cast<int32_t>(i) + 1;
+            const int32_t named = l == 0 ? cur.poc - step : cur.poc + step;
+            Picture* src = concealment_source(cur, named, fallback);
+            if (!src) {
+                still_missing++;
+                continue;
+            }
+            e.pic = src;
+            e.poc = named;
+            e.is_long_term = false;
+            // The nearest picture may be the very picture the guess names
+            e.substituted = !(src->poc == named && src->cvs_id == cur.cvs_id);
+        }
+    }
+    return still_missing;
+}
+
 std::shared_ptr<Picture> DPB::share(const Picture* pic) const {
     for (const auto& p : pictures_)
         if (p.get() == pic) return p;
