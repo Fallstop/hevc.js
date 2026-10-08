@@ -4,6 +4,9 @@
 The bitstreams are not committed (~150 MB). This script downloads them once
 into a cache directory, decodes each with the given hevc-decode CLI and with
 ffmpeg (the reference, as for every oracle in tests/), and reports which match.
+Where the output differs from ffmpeg but matches the whole-YUV MD5 that the
+suite ships with the stream, the status is "pass-suite" (ffmpeg is wrong or
+does not support the stream).
 
 Usage:
   tools/jctvc_conformance.py <hevc-decode> [--cache DIR] [--out results.json]
@@ -35,28 +38,55 @@ def md5_file(path):
     return h.hexdigest()
 
 
+def wanted(member):
+    base = os.path.basename(member).lower()
+    if '__MACOSX' in member or not base:
+        return False
+    return base.endswith(('.bit', '.bin')) or 'md5' in base
+
+
+def extract(zpath, dest_dir):
+    with zipfile.ZipFile(zpath) as z:
+        for member in z.namelist():
+            # bitstreams and MD5 files only, never paths outside dest_dir
+            if not wanted(member):
+                continue
+            base = os.path.basename(member)
+            with z.open(member) as src, open(os.path.join(dest_dir, base), 'wb') as dst:
+                dst.write(src.read())
+    open(os.path.join(dest_dir, '.extracted'), 'w').close()
+
+
 def fetch(cache):
     os.makedirs(cache, exist_ok=True)
     listing = urllib.request.urlopen(BASE, timeout=60).read().decode('utf-8', 'replace')
     names = sorted(set(re.findall(r'HEVC_v1/([^"/]+\.zip)"', listing)))
     for name in names:
         dest_dir = os.path.join(cache, name[:-4])
-        if os.path.isdir(dest_dir):
-            continue
         zpath = os.path.join(cache, name)
+        if os.path.exists(os.path.join(dest_dir, '.extracted')):
+            continue
         if not os.path.exists(zpath):
             print('download', name, file=sys.stderr)
             urllib.request.urlretrieve(BASE + name, zpath)
         os.makedirs(dest_dir, exist_ok=True)
-        with zipfile.ZipFile(zpath) as z:
-            for member in z.namelist():
-                # extract bitstreams only, never paths outside dest_dir
-                base = os.path.basename(member)
-                if '__MACOSX' in member or not base.lower().endswith(('.bit', '.bin')):
-                    continue
-                with z.open(member) as src, open(os.path.join(dest_dir, base), 'wb') as dst:
-                    dst.write(src.read())
+        extract(zpath, dest_dir)
     return sorted(d for d in os.listdir(cache) if os.path.isdir(os.path.join(cache, d)))
+
+
+def suite_md5(cache, name):
+    """The suite's MD5 of the whole decoded YUV, when it ships exactly one."""
+    files = [p for p in glob.glob(os.path.join(cache, name, '*'))
+             if 'md5' in os.path.basename(p).lower() and os.path.getsize(p) <= 4096]
+    yuv = [p for p in files if 'yuv' in os.path.basename(p).lower()]
+    digests = set()
+    for path in yuv or files:
+        with open(path, 'rb') as f:
+            for line in f.read().splitlines():
+                if re.search(rb'\.(bit|bin)\b', line, re.I):
+                    continue  # the MD5 of the bitstream itself
+                digests.update(d.lower() for d in re.findall(rb'\b[0-9a-fA-F]{32}\b', line))
+    return digests.pop().decode() if len(digests) == 1 else None
 
 
 def bitstream(cache, name):
@@ -97,7 +127,12 @@ def run_one(args, refs, name):
     size = os.path.getsize(tmp) if os.path.exists(tmp) else 0
     if os.path.exists(tmp):
         os.remove(tmp)
-    status = 'pass' if got and got == ref['md5'] else ('crash' if rc < 0 else 'fail')
+    if got and got == ref['md5']:
+        status = 'pass'
+    elif got and got == suite_md5(args.cache, name):
+        status = 'pass-suite'
+    else:
+        status = 'crash' if rc < 0 else 'fail'
     return name, {'status': status, 'rc': rc, 'size': size, 'ref_size': ref['size']}
 
 
